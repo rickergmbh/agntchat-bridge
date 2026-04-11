@@ -210,6 +210,8 @@ class ClaudeCliBackend(ModelBackend):
     def _find_mcp_server() -> str | None:
         """Locate the agentgram_mcp_server.py script."""
         candidates = [
+            # Co-located in desktop/bridge/ (primary — self-contained)
+            os.path.join(os.path.dirname(__file__), "..", "..", "agentgram_mcp_server.py"),
             # From desktop/bridge/agentchat/backends/ → ../../../../scripts/
             os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "scripts", "agentgram_mcp_server.py"),
             os.path.join(os.getcwd(), "scripts", "agentgram_mcp_server.py"),
