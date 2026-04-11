@@ -372,8 +372,11 @@ def extract_agent_config(profile: dict[str, Any] | None) -> dict[str, Any]:
         config["max_turns"] = int(settings["max_turns"])
     if settings.get("max_concurrent_tasks"):
         config["max_concurrent"] = int(settings["max_concurrent_tasks"])
-    if model_config.get("execution_mode"):
-        config["execution_mode"] = model_config["execution_mode"]
+    # execution_mode: settings takes priority over modelConfig
+    # (matches the priority chain in behavioral_directives.ex resolve_execution_mode)
+    execution_mode = settings.get("execution_mode") or model_config.get("execution_mode")
+    if execution_mode:
+        config["execution_mode"] = execution_mode
 
     return config
 
