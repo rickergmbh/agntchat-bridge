@@ -425,18 +425,22 @@ class ExecutorClient:
     async def _heartbeat_loop(self) -> None:
         """Send periodic heartbeats with process metrics to keep the executor online."""
         import os
-        import resource
+        import sys
 
         while self._running:
             try:
                 await asyncio.sleep(self._heartbeat_interval)
                 if self._executor_id and self._running:
                     # Collect process metrics
-                    usage = resource.getrusage(resource.RUSAGE_SELF)
+                    memory_mb = None
+                    if sys.platform != "win32":
+                        import resource
+                        usage = resource.getrusage(resource.RUSAGE_SELF)
+                        memory_mb = round(usage.ru_maxrss / (1024 * 1024), 1)
                     metrics = {
                         "pid": os.getpid(),
                         "uptime_seconds": int(time.monotonic() - self._start_time),
-                        "memory_mb": round(usage.ru_maxrss / (1024 * 1024), 1) if hasattr(usage, "ru_maxrss") else None,
+                        "memory_mb": memory_mb,
                         "current_activity": self._current_activity,
                     }
                     # Remove None values
