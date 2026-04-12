@@ -1081,6 +1081,89 @@ def _is_outgoing_filler(reply: str) -> bool:
     return any(lowered.startswith(p) for p in _OUTGOING_FILLER_PREFIXES)
 
 
+# --- Self-task heuristic ---
+
+# Keywords that signal substantial work (coding, analysis, multi-step).
+# Checked against lowered message content.
+_TASK_KEYWORDS = [
+    "implement", "build", "create a", "write a", "write me",
+    "can you write", "can you build", "can you create",
+    "can you implement", "can you add", "can you fix",
+    "can you update", "can you change", "can you review",
+    "can you evaluate", "can you check", "can you investigate",
+    "can you look", "can you dig", "can you research",
+    "add a feature", "add a",
+    "fix the", "fix this", "fix a",
+    "debug", "refactor", "migrate",
+    "deploy", "set up", "configure", "investigate", "analyze",
+    "evaluate", "review the", "review our", "audit", "research",
+    "dig into", "look into", "look at the", "look at our",
+    "check the", "check our", "please check",
+    "update the", "update our", "change the", "modify", "redesign",
+    "write tests", "add tests", "test the",
+    "please report", "report back", "and report",
+]
+
+# Short messages that should NOT be tasked (greetings, confirmations, follow-ups).
+_SKIP_TASK_PATTERNS = [
+    "try again", "yes", "no", "ok", "thanks", "thank you",
+    "hey", "hi", "hello", "sure", "got it", "sounds good",
+    "what do you think", "how are you", "do it",
+]
+
+
+def _should_self_task(content: str) -> bool:
+    """Heuristic: return True if a human message looks like substantial work.
+
+    No LLM call — pure text analysis. Checks message length and keywords.
+    Biased toward false negatives (missing a task is better than tasking
+    a greeting). The prompt guidance is the backup for borderline cases.
+    """
+    if not content:
+        return False
+
+    stripped = content.strip()
+    lowered = stripped.lower()
+
+    # Very short messages are never tasks
+    if len(stripped) < 40:
+        return False
+
+    # Skip obvious non-task messages (only exact match or very short messages)
+    for skip in _SKIP_TASK_PATTERNS:
+        if lowered == skip or (len(stripped) < 60 and lowered.startswith(skip)):
+            return False
+
+    has_keyword = any(kw in lowered for kw in _TASK_KEYWORDS)
+
+    # Messages >120 chars with a task keyword → task
+    # This catches most real requests ("can you evaluate...", "please dig into...")
+    if len(stripped) > 120 and has_keyword:
+        return True
+
+    # Medium messages (>60 chars) with keyword + structure indicators → task
+    if len(stripped) > 60 and has_keyword:
+        has_structure = (
+            stripped.count("\n") > 1
+            or stripped.count(". ") > 2
+            or "```" in stripped
+        )
+        if has_structure:
+            return True
+
+    # Messages with code blocks or file references + keyword → task
+    if has_keyword and (
+        "```" in stripped
+        or ".ex" in lowered
+        or ".py" in lowered
+        or ".ts" in lowered
+        or ".tsx" in lowered
+    ):
+        return True
+
+    return False
+
+
 def _parse_dm_blocks(reply: str) -> tuple[str, list[dict[str, str]]]:
     """Parse <dm target="AgentName">content</dm> blocks from LLM response.
 
@@ -3179,11 +3262,41 @@ def run_single_agent(
                 status="started", phase="thinking",
             ))
 
-        # Self-task triage REMOVED — the separate Haiku LLM call added 3-6 seconds
-        # of latency to every DM message just to classify TASK vs REPLY. The LLM can
-        # decide inline via <task_request> tags if work is substantial. This eliminates
-        # the biggest latency bottleneck in the message handling pipeline.
+        # Self-task triage: heuristic-based (no LLM call, ~0ms latency).
+        # If the message looks like substantial work, create a self-task BEFORE
+        # calling the LLM. The task handler gets focused context (just the task
+        # title + description) instead of the full conversation history, which
+        # gives the agent dramatically more working memory for complex work.
+        # The old LLM-based triage was removed for adding 3-6s latency.
         self_task_id = None
+        self_task_allowed = directives.get("selfTaskAllowed", True)
+
+        if self_task_allowed and task_creation_allowed and msg.is_human and msg.content:
+            if _should_self_task(msg.content):
+                try:
+                    task_title = msg.content[:80].strip()
+                    if len(msg.content) > 80:
+                        task_title = task_title[:77] + "..."
+                    self_task_id = await executor.create_task(
+                        msg.conversation_id,
+                        task_title,
+                        msg.content,
+                        assigned_to=[my_participant_id],
+                        metadata={"source": "message_self_task"},
+                    )
+                    logger.info("[%s] Created self-task %s for substantial message", executor_key, self_task_id)
+
+                    # Send brief ack and return — the task handler will do the actual work
+                    await _stream_cb.cancel()
+                    ack_msg = "On it — I've created a task to handle this. You'll see progress as I work through it."
+                    msg_meta: dict[str, str] = {}
+                    if effective_backend:
+                        msg_meta["backend"] = effective_backend
+                    await executor.send_message(msg.conversation_id, ack_msg, metadata=msg_meta)
+                    return None
+                except Exception as e:
+                    logger.warning("[%s] Failed to create self-task, handling inline: %s", executor_key, e)
+                    self_task_id = None
 
         # --- Fetch conversation history + location in parallel ---
         # Use pre-loaded messages from gateway response (tier 2) when available,
