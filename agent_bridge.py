@@ -3271,7 +3271,7 @@ def run_single_agent(
         self_task_id = None
         self_task_allowed = directives.get("selfTaskAllowed", True)
 
-        if self_task_allowed and task_creation_allowed and msg.is_human and msg.content:
+        if self_task_allowed and task_creation_allowed and msg.content:
             if _should_self_task(msg.content):
                 try:
                     task_title = msg.content[:80].strip()
