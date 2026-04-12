@@ -3282,14 +3282,25 @@ def run_single_agent(
             )
 
         # --- LLM-based message triage (backend/model agnostic) ---
-        # Calls the backend triage endpoint which uses a fast model (Haiku)
-        # to classify the message + conversation context as REPLY or TASK.
-        # Fails open: if triage errors or times out, handles inline.
+        # The backend preloader computes triage alongside directives and includes
+        # it in the gateway payload as `messageTriage`. If the preloader timed out
+        # or the payload doesn't include it, fall back to the triage endpoint.
+        # Fails open: if triage fails entirely, handles inline.
         if self_task_allowed and task_creation_allowed and msg.content:
-            triage = await _triage_message(
-                AGENTGRAM_API_URL, agent_id, api_key,
-                msg.conversation_id, msg.content, chat_messages, executor_key,
-            )
+            # Check if triage was pre-computed by the preloader
+            preloaded_triage = getattr(msg, "message_triage", None) or (msg.raw or {}).get("messageTriage")
+            if preloaded_triage and preloaded_triage.get("classification") == "TASK" and preloaded_triage.get("title"):
+                triage = (preloaded_triage["title"], msg.content)
+                logger.info("[%s] Using preloaded triage: TASK — %s", executor_key, preloaded_triage["title"])
+            elif preloaded_triage and preloaded_triage.get("classification") == "REPLY":
+                triage = None
+                logger.info("[%s] Using preloaded triage: REPLY", executor_key)
+            else:
+                # Preloader didn't include triage — call the endpoint as fallback
+                triage = await _triage_message(
+                    AGENTGRAM_API_URL, agent_id, api_key,
+                    msg.conversation_id, msg.content, chat_messages, executor_key,
+                )
             if triage:
                 try:
                     task_title, task_desc = triage
