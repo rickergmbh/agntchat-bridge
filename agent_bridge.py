@@ -1081,10 +1081,9 @@ def _is_outgoing_filler(reply: str) -> bool:
     return any(lowered.startswith(p) for p in _OUTGOING_FILLER_PREFIXES)
 
 
-# --- Self-task heuristic ---
+# --- Context-aware self-task triage ---
 
-# Keywords that signal substantial work (coding, analysis, multi-step).
-# Checked against lowered message content.
+# Keywords that signal the message itself is a substantial request.
 _TASK_KEYWORDS = [
     "implement", "build", "create a", "write a", "write me",
     "can you write", "can you build", "can you create",
@@ -1104,64 +1103,133 @@ _TASK_KEYWORDS = [
     "please report", "report back", "and report",
 ]
 
-# Short messages that should NOT be tasked (greetings, confirmations, follow-ups).
-_SKIP_TASK_PATTERNS = [
-    "try again", "yes", "no", "ok", "thanks", "thank you",
-    "hey", "hi", "hello", "sure", "got it", "sounds good",
-    "what do you think", "how are you", "do it",
+# Short follow-up messages that signal "go ahead with the substantial work
+# we just discussed." These ONLY trigger a task when the conversation context
+# shows recent substantial agent output (proposals, analyses, options).
+_FOLLOWUP_TRIGGERS = [
+    "do it", "do that", "go ahead", "go for it", "proceed",
+    "yes do it", "yes please", "yes go ahead", "yep", "yep do it",
+    "do a", "do b", "do c", "do option", "option a", "option b", "option c",
+    "do 1", "do 2", "do 3", "go with",
+    "let's do", "let's go", "make it so", "ship it",
+    "execute", "run it", "start",
+    "try again", "retry", "try that again",
+    "please do", "do b please", "do a please",
+]
+
+# Patterns that should never be tasked regardless of context.
+_NEVER_TASK = [
+    "thanks", "thank you", "thx",
+    "hey", "hi", "hello",
+    "what do you think", "how are you", "how's it going",
+    "sounds good", "looks good", "nice", "cool", "great",
 ]
 
 
-def _should_self_task(content: str) -> bool:
-    """Heuristic: return True if a human message looks like substantial work.
+def _should_self_task(
+    content: str,
+    chat_history: list | None = None,
+    my_participant_id: str = "",
+) -> tuple[str, str] | None:
+    """Context-aware triage: should this message become a self-task?
 
-    No LLM call — pure text analysis. Checks message length and keywords.
-    Biased toward false negatives (missing a task is better than tasking
-    a greeting). The prompt guidance is the backup for borderline cases.
+    Checks the message AND the recent conversation context. Returns
+    (title, description) if a task should be created, or None.
+
+    Three paths to a task:
+    1. Message itself is clearly substantial (long + keywords)
+    2. Short follow-up ("do B", "try again") after a substantial agent proposal
+    3. Retry of a recently failed request
     """
     if not content:
-        return False
+        return None
 
     stripped = content.strip()
     lowered = stripped.lower()
 
-    # Very short messages are never tasks
-    if len(stripped) < 40:
-        return False
+    # Never task these regardless of context
+    for skip in _NEVER_TASK:
+        if lowered == skip or lowered.rstrip("!.? ") == skip:
+            return None
 
-    # Skip obvious non-task messages (only exact match or very short messages)
-    for skip in _SKIP_TASK_PATTERNS:
-        if lowered == skip or (len(stripped) < 60 and lowered.startswith(skip)):
-            return False
-
+    # --- Path 1: Message itself is clearly substantial ---
     has_keyword = any(kw in lowered for kw in _TASK_KEYWORDS)
 
-    # Messages >120 chars with a task keyword → task
-    # This catches most real requests ("can you evaluate...", "please dig into...")
     if len(stripped) > 120 and has_keyword:
-        return True
+        title = stripped[:80].strip()
+        if len(stripped) > 80:
+            title = title[:77] + "..."
+        return (title, stripped)
 
-    # Medium messages (>60 chars) with keyword + structure indicators → task
     if len(stripped) > 60 and has_keyword:
-        has_structure = (
-            stripped.count("\n") > 1
-            or stripped.count(". ") > 2
-            or "```" in stripped
-        )
+        has_structure = stripped.count("\n") > 1 or stripped.count(". ") > 2 or "```" in stripped
         if has_structure:
-            return True
+            title = stripped[:80].strip()
+            if len(stripped) > 80:
+                title = title[:77] + "..."
+            return (title, stripped)
 
-    # Messages with code blocks or file references + keyword → task
-    if has_keyword and (
-        "```" in stripped
-        or ".ex" in lowered
-        or ".py" in lowered
-        or ".ts" in lowered
-        or ".tsx" in lowered
-    ):
-        return True
+    if has_keyword and ("```" in stripped or ".ex" in lowered or ".py" in lowered or ".ts" in lowered):
+        title = stripped[:80].strip()
+        return (title, stripped)
 
-    return False
+    # --- Path 2 & 3: Short follow-up with context ---
+    # Need conversation history for these
+    if not chat_history or len(chat_history) < 2:
+        return None
+
+    is_followup = any(lowered.startswith(t) or lowered == t for t in _FOLLOWUP_TRIGGERS)
+    if not is_followup:
+        return None
+
+    # Look at recent assistant (agent) messages for substantial context
+    recent_agent_msgs = []
+    for msg in reversed(chat_history[:-1]):  # exclude the current message
+        if msg.role == "assistant":
+            recent_agent_msgs.append(msg)
+            if len(recent_agent_msgs) >= 3:
+                break
+
+    if not recent_agent_msgs:
+        return None
+
+    last_agent = recent_agent_msgs[0]
+    last_content = last_agent.content if isinstance(last_agent.content, str) else str(last_agent.content)
+
+    # Path 3: Retry after a failure
+    is_retry = any(lowered.startswith(t) for t in ("try again", "retry", "try that"))
+    if is_retry:
+        # Check if the agent's last message was an error
+        error_indicators = [
+            "ran into an issue",
+            "error", "failed",
+            "tool loop aborted",
+            "couldn't complete",
+        ]
+        if any(ind in last_content.lower() for ind in error_indicators):
+            # Find the original request (the user message before the error)
+            for msg in reversed(chat_history[:-1]):
+                if msg.role == "user" and msg.content != content:
+                    orig = msg.content if isinstance(msg.content, str) else str(msg.content)
+                    # Strip sender prefix like "[Ricker]: "
+                    if "]: " in orig[:30]:
+                        orig = orig.split("]: ", 1)[1]
+                    title = orig[:80].strip()
+                    if len(orig) > 80:
+                        title = title[:77] + "..."
+                    return (title, f"Retry: {orig}")
+            return ("Retry previous request", f"Retry: {content}")
+
+    # Path 2: Follow-up to a substantial proposal/analysis
+    # Agent's last message was long (>400 chars) = substantial analysis/proposal
+    if len(last_content) > 400:
+        # Build a meaningful task title from the agent's proposal
+        # Look for option references in the follow-up
+        title = f"Execute: {content.strip()}"
+        desc = f"Follow-up to agent's analysis. User said: \"{content.strip()}\"\n\nAgent's prior response (summary): {last_content[:500]}"
+        return (title, desc)
+
+    return None
 
 
 def _parse_dm_blocks(reply: str) -> tuple[str, list[dict[str, str]]]:
@@ -3262,41 +3330,8 @@ def run_single_agent(
                 status="started", phase="thinking",
             ))
 
-        # Self-task triage: heuristic-based (no LLM call, ~0ms latency).
-        # If the message looks like substantial work, create a self-task BEFORE
-        # calling the LLM. The task handler gets focused context (just the task
-        # title + description) instead of the full conversation history, which
-        # gives the agent dramatically more working memory for complex work.
-        # The old LLM-based triage was removed for adding 3-6s latency.
         self_task_id = None
         self_task_allowed = directives.get("selfTaskAllowed", True)
-
-        if self_task_allowed and task_creation_allowed and msg.content:
-            if _should_self_task(msg.content):
-                try:
-                    task_title = msg.content[:80].strip()
-                    if len(msg.content) > 80:
-                        task_title = task_title[:77] + "..."
-                    self_task_id = await executor.create_task(
-                        msg.conversation_id,
-                        task_title,
-                        msg.content,
-                        assigned_to=[my_participant_id],
-                        metadata={"source": "message_self_task"},
-                    )
-                    logger.info("[%s] Created self-task %s for substantial message", executor_key, self_task_id)
-
-                    # Send brief ack and return — the task handler will do the actual work
-                    await _stream_cb.cancel()
-                    ack_msg = "On it — I've created a task to handle this. You'll see progress as I work through it."
-                    msg_meta: dict[str, str] = {}
-                    if effective_backend:
-                        msg_meta["backend"] = effective_backend
-                    await executor.send_message(msg.conversation_id, ack_msg, metadata=msg_meta)
-                    return None
-                except Exception as e:
-                    logger.warning("[%s] Failed to create self-task, handling inline: %s", executor_key, e)
-                    self_task_id = None
 
         # --- Fetch conversation history + location in parallel ---
         # Use pre-loaded messages from gateway response (tier 2) when available,
@@ -3327,6 +3362,35 @@ def run_single_agent(
             chat_messages.append(
                 ChatMessage(role="user", content=f"[{sender_label}]: {msg.content}")
             )
+
+        # --- Context-aware self-task triage (no LLM call, ~0ms) ---
+        # Now that history is loaded, we can check both the message AND the
+        # conversation context to decide if this needs a task.
+        if self_task_allowed and task_creation_allowed and msg.content:
+            triage = _should_self_task(msg.content, chat_messages, my_participant_id)
+            if triage:
+                try:
+                    task_title, task_desc = triage
+                    self_task_id = await executor.create_task(
+                        msg.conversation_id,
+                        task_title,
+                        task_desc,
+                        assigned_to=[my_participant_id],
+                        metadata={"source": "message_self_task"},
+                    )
+                    logger.info("[%s] Created self-task %s: %s", executor_key, self_task_id, task_title)
+
+                    # Send brief ack and return — the task handler will do the actual work
+                    await _stream_cb.cancel()
+                    ack_msg = "On it — I've created a task to handle this. You'll see progress as I work through it."
+                    msg_meta: dict[str, str] = {}
+                    if effective_backend:
+                        msg_meta["backend"] = effective_backend
+                    await executor.send_message(msg.conversation_id, ack_msg, metadata=msg_meta)
+                    return None
+                except Exception as e:
+                    logger.warning("[%s] Failed to create self-task, handling inline: %s", executor_key, e)
+                    self_task_id = None
 
         # --- Build system prompt from server directives ---
         msg_prompt = _build_system_prompt_from_directives(
