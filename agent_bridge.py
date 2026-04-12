@@ -377,6 +377,8 @@ def extract_agent_config(profile: dict[str, Any] | None) -> dict[str, Any]:
     execution_mode = settings.get("execution_mode") or model_config.get("execution_mode")
     if execution_mode:
         config["execution_mode"] = execution_mode
+    if model_config.get("effort"):
+        config["effort"] = model_config["effort"]
 
     return config
 
