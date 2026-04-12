@@ -1081,155 +1081,73 @@ def _is_outgoing_filler(reply: str) -> bool:
     return any(lowered.startswith(p) for p in _OUTGOING_FILLER_PREFIXES)
 
 
-# --- Context-aware self-task triage ---
+# --- LLM-based message triage (backend/model agnostic) ---
+#
+# Calls POST /api/gateway/triage on the backend, which uses a fast model
+# (Haiku) to classify the message as REPLY or TASK based on the message
+# AND conversation context. This is backend/model agnostic — every agent
+# gets the same triage regardless of their LLM provider.
+# Fails open: if triage fails or times out, message is handled inline.
 
-# Keywords that signal the message itself is a substantial request.
-_TASK_KEYWORDS = [
-    "implement", "build", "create a", "write a", "write me",
-    "can you write", "can you build", "can you create",
-    "can you implement", "can you add", "can you fix",
-    "can you update", "can you change", "can you review",
-    "can you evaluate", "can you check", "can you investigate",
-    "can you look", "can you dig", "can you research",
-    "add a feature", "add a",
-    "fix the", "fix this", "fix a",
-    "debug", "refactor", "migrate",
-    "deploy", "set up", "configure", "investigate", "analyze",
-    "evaluate", "review the", "review our", "audit", "research",
-    "dig into", "look into", "look at the", "look at our",
-    "check the", "check our", "please check",
-    "update the", "update our", "change the", "modify", "redesign",
-    "write tests", "add tests", "test the",
-    "please report", "report back", "and report",
-]
-
-# Short follow-up messages that signal "go ahead with the substantial work
-# we just discussed." These ONLY trigger a task when the conversation context
-# shows recent substantial agent output (proposals, analyses, options).
-_FOLLOWUP_TRIGGERS = [
-    "do it", "do that", "go ahead", "go for it", "proceed",
-    "yes do it", "yes please", "yes go ahead", "yep", "yep do it",
-    "do a", "do b", "do c", "do option", "option a", "option b", "option c",
-    "do 1", "do 2", "do 3", "go with",
-    "let's do", "let's go", "make it so", "ship it",
-    "execute", "run it", "start",
-    "try again", "retry", "try that again",
-    "please do", "do b please", "do a please",
-]
-
-# Patterns that should never be tasked regardless of context.
-_NEVER_TASK = [
-    "thanks", "thank you", "thx",
-    "hey", "hi", "hello",
-    "what do you think", "how are you", "how's it going",
-    "sounds good", "looks good", "nice", "cool", "great",
-]
+_TRIAGE_TIMEOUT = 8  # seconds — fail open if triage times out
 
 
-def _should_self_task(
+async def _triage_message(
+    base_url: str,
+    agent_id: str,
+    api_key: str,
+    conversation_id: str,
     content: str,
-    chat_history: list | None = None,
-    my_participant_id: str = "",
+    chat_history: list,
+    executor_key: str,
 ) -> tuple[str, str] | None:
-    """Context-aware triage: should this message become a self-task?
+    """Call backend triage endpoint to classify message as REPLY or TASK.
 
-    Checks the message AND the recent conversation context. Returns
-    (title, description) if a task should be created, or None.
-
-    Three paths to a task:
-    1. Message itself is clearly substantial (long + keywords)
-    2. Short follow-up ("do B", "try again") after a substantial agent proposal
-    3. Retry of a recently failed request
+    Returns (title, description) if TASK, or None for REPLY.
+    Fails open — any error returns None (handle inline).
     """
-    if not content:
-        return None
+    import httpx
 
-    stripped = content.strip()
-    lowered = stripped.lower()
+    # Build compact context from last few messages
+    context_msgs: list[dict[str, str]] = []
+    for msg in chat_history[-8:]:
+        role = "user" if msg.role == "user" else "assistant"
+        msg_text = msg.content if isinstance(msg.content, str) else str(msg.content)
+        # Truncate long messages to keep triage payload small
+        if len(msg_text) > 400:
+            msg_text = msg_text[:400] + "..."
+        context_msgs.append({"role": role, "content": msg_text})
 
-    # Never task these regardless of context
-    for skip in _NEVER_TASK:
-        if lowered == skip or lowered.rstrip("!.? ") == skip:
+    try:
+        tm = TokenManager(base_url, agent_id, api_key)
+        token = await tm.get_token()
+        async with httpx.AsyncClient(timeout=_TRIAGE_TIMEOUT) as client:
+            resp = await client.post(
+                f"{base_url.rstrip('/')}/api/gateway/triage",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "conversation_id": conversation_id,
+                    "message": content,
+                    "context": context_msgs,
+                },
+            )
+        if resp.status_code != 200:
+            logger.warning("[%s] Triage endpoint returned %d, handling inline", executor_key, resp.status_code)
             return None
 
-    # --- Path 1: Message itself is clearly substantial ---
-    has_keyword = any(kw in lowered for kw in _TASK_KEYWORDS)
+        data = resp.json()
+        classification = data.get("classification", "REPLY").upper()
+        title = data.get("title", "")
 
-    if len(stripped) > 120 and has_keyword:
-        title = stripped[:80].strip()
-        if len(stripped) > 80:
-            title = title[:77] + "..."
-        return (title, stripped)
+        logger.info("[%s] Triage: %s (title=%s)", executor_key, classification, title[:60] if title else "n/a")
 
-    if len(stripped) > 60 and has_keyword:
-        has_structure = stripped.count("\n") > 1 or stripped.count(". ") > 2 or "```" in stripped
-        if has_structure:
-            title = stripped[:80].strip()
-            if len(stripped) > 80:
-                title = title[:77] + "..."
-            return (title, stripped)
-
-    if has_keyword and ("```" in stripped or ".ex" in lowered or ".py" in lowered or ".ts" in lowered):
-        title = stripped[:80].strip()
-        return (title, stripped)
-
-    # --- Path 2 & 3: Short follow-up with context ---
-    # Need conversation history for these
-    if not chat_history or len(chat_history) < 2:
+        if classification == "TASK" and title:
+            return (title, content)
         return None
 
-    is_followup = any(lowered.startswith(t) or lowered == t for t in _FOLLOWUP_TRIGGERS)
-    if not is_followup:
+    except Exception as e:
+        logger.warning("[%s] Triage failed, handling inline: %s", executor_key, e)
         return None
-
-    # Look at recent assistant (agent) messages for substantial context
-    recent_agent_msgs = []
-    for msg in reversed(chat_history[:-1]):  # exclude the current message
-        if msg.role == "assistant":
-            recent_agent_msgs.append(msg)
-            if len(recent_agent_msgs) >= 3:
-                break
-
-    if not recent_agent_msgs:
-        return None
-
-    last_agent = recent_agent_msgs[0]
-    last_content = last_agent.content if isinstance(last_agent.content, str) else str(last_agent.content)
-
-    # Path 3: Retry after a failure
-    is_retry = any(lowered.startswith(t) for t in ("try again", "retry", "try that"))
-    if is_retry:
-        # Check if the agent's last message was an error
-        error_indicators = [
-            "ran into an issue",
-            "error", "failed",
-            "tool loop aborted",
-            "couldn't complete",
-        ]
-        if any(ind in last_content.lower() for ind in error_indicators):
-            # Find the original request (the user message before the error)
-            for msg in reversed(chat_history[:-1]):
-                if msg.role == "user" and msg.content != content:
-                    orig = msg.content if isinstance(msg.content, str) else str(msg.content)
-                    # Strip sender prefix like "[Ricker]: "
-                    if "]: " in orig[:30]:
-                        orig = orig.split("]: ", 1)[1]
-                    title = orig[:80].strip()
-                    if len(orig) > 80:
-                        title = title[:77] + "..."
-                    return (title, f"Retry: {orig}")
-            return ("Retry previous request", f"Retry: {content}")
-
-    # Path 2: Follow-up to a substantial proposal/analysis
-    # Agent's last message was long (>400 chars) = substantial analysis/proposal
-    if len(last_content) > 400:
-        # Build a meaningful task title from the agent's proposal
-        # Look for option references in the follow-up
-        title = f"Execute: {content.strip()}"
-        desc = f"Follow-up to agent's analysis. User said: \"{content.strip()}\"\n\nAgent's prior response (summary): {last_content[:500]}"
-        return (title, desc)
-
-    return None
 
 
 def _parse_dm_blocks(reply: str) -> tuple[str, list[dict[str, str]]]:
@@ -3363,11 +3281,15 @@ def run_single_agent(
                 ChatMessage(role="user", content=f"[{sender_label}]: {msg.content}")
             )
 
-        # --- Context-aware self-task triage (no LLM call, ~0ms) ---
-        # Now that history is loaded, we can check both the message AND the
-        # conversation context to decide if this needs a task.
+        # --- LLM-based message triage (backend/model agnostic) ---
+        # Calls the backend triage endpoint which uses a fast model (Haiku)
+        # to classify the message + conversation context as REPLY or TASK.
+        # Fails open: if triage errors or times out, handles inline.
         if self_task_allowed and task_creation_allowed and msg.content:
-            triage = _should_self_task(msg.content, chat_messages, my_participant_id)
+            triage = await _triage_message(
+                AGENTGRAM_API_URL, agent_id, api_key,
+                msg.conversation_id, msg.content, chat_messages, executor_key,
+            )
             if triage:
                 try:
                     task_title, task_desc = triage
