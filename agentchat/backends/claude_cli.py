@@ -536,9 +536,11 @@ class ClaudeCliBackend(ModelBackend):
         _accumulated_text = ""
         _detected_sections: set[str] = set()
 
+        _result_error_subtype = ""  # populated from result event if is_error=True
+
         try:
             async def read_stream():
-                nonlocal result_text, _last_delta_time, _accumulated_text
+                nonlocal result_text, _last_delta_time, _accumulated_text, _result_error_subtype
                 assert proc.stdout is not None
                 while True:
                     line = await asyncio.wait_for(
@@ -562,6 +564,14 @@ class ClaudeCliBackend(ModelBackend):
                     # Final result event — capture the text
                     if event_type == "result":
                         result_text = event.get("result", "")
+                        # Detect error results (max_turns, permission denied, etc.)
+                        if event.get("is_error"):
+                            _result_error_subtype = event.get("subtype", "unknown_error")
+                            _terminal = event.get("terminal_reason", "")
+                            logger.warning(
+                                "CLI result is_error=True: subtype=%s terminal_reason=%s num_turns=%s",
+                                _result_error_subtype, _terminal, event.get("num_turns"),
+                            )
                         # Emit final text_delta with complete text
                         await on_progress({"type": "text_delta", "accumulated": result_text, "final": True})
                         await on_progress(event)
@@ -633,14 +643,16 @@ class ClaudeCliBackend(ModelBackend):
         if proc.returncode != 0:
             stderr_bytes = await proc.stderr.read() if proc.stderr else b""
             err_msg = stderr_bytes.decode().strip() if stderr_bytes else ""
-            detail = err_msg or "unknown error"
+            # Use the result event's error subtype if available (more specific
+            # than stderr, which is often empty for max_turns/permission errors)
+            detail = _result_error_subtype or err_msg or "unknown error"
             # In streaming mode, result_text is empty until the final "result" event.
             # If the CLI crashes before that, _accumulated_text has the partial output.
             partial = result_text or _accumulated_text or "(empty)"
             logger.error(
-                "Claude CLI exit code %d | stderr=%s | accumulated_len=%d | last_500=%s",
-                proc.returncode, detail[:200], len(partial),
-                partial[-500:] if partial else "(empty)",
+                "Claude CLI exit code %d | reason=%s | stderr=%s | accumulated_len=%d | last_500=%s",
+                proc.returncode, detail, err_msg[:200] if err_msg else "(empty)",
+                len(partial), partial[-500:] if partial else "(empty)",
             )
             raise RuntimeError(
                 f"Claude CLI exited with code {proc.returncode}: {detail}"
