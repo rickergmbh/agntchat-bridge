@@ -1081,74 +1081,6 @@ def _is_outgoing_filler(reply: str) -> bool:
     return any(lowered.startswith(p) for p in _OUTGOING_FILLER_PREFIXES)
 
 
-# --- LLM-based message triage (backend/model agnostic) ---
-#
-# Calls POST /api/gateway/triage on the backend, which uses a fast model
-# (Haiku) to classify the message as REPLY or TASK based on the message
-# AND conversation context. This is backend/model agnostic — every agent
-# gets the same triage regardless of their LLM provider.
-# Fails open: if triage fails or times out, message is handled inline.
-
-_TRIAGE_TIMEOUT = 8  # seconds — fail open if triage times out
-
-
-async def _triage_message(
-    base_url: str,
-    agent_id: str,
-    api_key: str,
-    conversation_id: str,
-    content: str,
-    chat_history: list,
-    executor_key: str,
-) -> tuple[str, str] | None:
-    """Call backend triage endpoint to classify message as REPLY or TASK.
-
-    Returns (title, description) if TASK, or None for REPLY.
-    Fails open — any error returns None (handle inline).
-    """
-    import httpx
-
-    # Build compact context from last few messages
-    context_msgs: list[dict[str, str]] = []
-    for msg in chat_history[-8:]:
-        role = "user" if msg.role == "user" else "assistant"
-        msg_text = msg.content if isinstance(msg.content, str) else str(msg.content)
-        # Truncate long messages to keep triage payload small
-        if len(msg_text) > 400:
-            msg_text = msg_text[:400] + "..."
-        context_msgs.append({"role": role, "content": msg_text})
-
-    try:
-        tm = TokenManager(base_url, agent_id, api_key)
-        token = await tm.get_token()
-        async with httpx.AsyncClient(timeout=_TRIAGE_TIMEOUT) as client:
-            resp = await client.post(
-                f"{base_url.rstrip('/')}/api/gateway/triage",
-                headers={"Authorization": f"Bearer {token}"},
-                json={
-                    "conversation_id": conversation_id,
-                    "message": content,
-                    "context": context_msgs,
-                },
-            )
-        if resp.status_code != 200:
-            logger.warning("[%s] Triage endpoint returned %d, handling inline", executor_key, resp.status_code)
-            return None
-
-        data = resp.json()
-        classification = data.get("classification", "REPLY").upper()
-        title = data.get("title", "")
-
-        logger.info("[%s] Triage: %s (title=%s)", executor_key, classification, title[:60] if title else "n/a")
-
-        if classification == "TASK" and title:
-            return (title, content)
-        return None
-
-    except Exception as e:
-        logger.warning("[%s] Triage failed, handling inline: %s", executor_key, e)
-        return None
-
 
 def _parse_dm_blocks(reply: str) -> tuple[str, list[dict[str, str]]]:
     """Parse <dm target="AgentName">content</dm> blocks from LLM response.
@@ -3281,49 +3213,12 @@ def run_single_agent(
                 ChatMessage(role="user", content=f"[{sender_label}]: {msg.content}")
             )
 
-        # --- LLM-based message triage (backend/model agnostic) ---
-        # The backend preloader computes triage alongside directives and includes
-        # it in the gateway payload as `messageTriage`. If the preloader timed out
-        # or the payload doesn't include it, fall back to the triage endpoint.
-        # Fails open: if triage fails entirely, handles inline.
-        if self_task_allowed and task_creation_allowed and msg.content:
-            # Check if triage was pre-computed by the preloader
-            preloaded_triage = getattr(msg, "message_triage", None) or (msg.raw or {}).get("messageTriage")
-            if preloaded_triage and preloaded_triage.get("classification") == "TASK" and preloaded_triage.get("title"):
-                triage = (preloaded_triage["title"], msg.content)
-                logger.info("[%s] Using preloaded triage: TASK — %s", executor_key, preloaded_triage["title"])
-            elif preloaded_triage and preloaded_triage.get("classification") == "REPLY":
-                triage = None
-                logger.info("[%s] Using preloaded triage: REPLY", executor_key)
-            else:
-                # Preloader didn't include triage — call the endpoint as fallback
-                triage = await _triage_message(
-                    AGENTGRAM_API_URL, agent_id, api_key,
-                    msg.conversation_id, msg.content, chat_messages, executor_key,
-                )
-            if triage:
-                try:
-                    task_title, task_desc = triage
-                    self_task_id = await executor.create_task(
-                        msg.conversation_id,
-                        task_title,
-                        task_desc,
-                        assigned_to=[my_participant_id],
-                        metadata={"source": "message_self_task"},
-                    )
-                    logger.info("[%s] Created self-task %s: %s", executor_key, self_task_id, task_title)
-
-                    # Send brief ack and return — the task handler will do the actual work
-                    await _stream_cb.cancel()
-                    ack_msg = "On it — I've created a task to handle this. You'll see progress as I work through it."
-                    msg_meta: dict[str, str] = {}
-                    if effective_backend:
-                        msg_meta["backend"] = effective_backend
-                    await executor.send_message(msg.conversation_id, ack_msg, metadata=msg_meta)
-                    return None
-                except Exception as e:
-                    logger.warning("[%s] Failed to create self-task, handling inline: %s", executor_key, e)
-                    self_task_id = None
+        # --- Agent decides task vs reply inline ---
+        # The agent LLM sees the message and decides whether to create a
+        # self-task via <task_request> tags in its response. No server-side
+        # pre-classification — the agent makes the call based on its own
+        # assessment of the work required. Directives include guidance on
+        # when to self-task vs just reply.
 
         # --- Build system prompt from server directives ---
         msg_prompt = _build_system_prompt_from_directives(
