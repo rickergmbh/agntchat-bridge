@@ -522,6 +522,64 @@ _MEMORY_FORGET_TAG_RE = re.compile(
 _MEMORY_ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
 
 
+# --- Fast-path task detection (pure regex, no LLM, no network) ---
+# Mirrors the backend MessageTriage.classify_fast patterns. Only matches
+# OBVIOUS task signals — ambiguous messages fall through to the LLM.
+
+_TASK_SIGNAL_PATTERNS = [
+    re.compile(
+        r"\b(implement|build|create|write|deploy|fix|debug|refactor|migrate|add|remove|delete|update|change|modify|set up|configure|install)\b"
+        r".*\b(the|a|an|this|that|my|our|it|code|file|test|feature|bug|endpoint|function|module|component|page|screen|route|api|db|database|schema|migration)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bcan you (implement|build|create|write|deploy|fix|debug|refactor|add|update|change|set up|configure)\b", re.IGNORECASE),
+    re.compile(r"\bplease (implement|build|create|write|deploy|fix|debug|refactor|add|update|change|set up|configure)\b", re.IGNORECASE),
+    re.compile(r"\b(PR|pull request|commit|push|merge|rebase|branch|checkout)\b.*\b(for|the|this|that)\b", re.IGNORECASE),
+    re.compile(r"\bfly deploy\b", re.IGNORECASE),
+    re.compile(r"\bmix test\b", re.IGNORECASE),
+    re.compile(r"\bnpx tsc\b", re.IGNORECASE),
+    re.compile(r"\bgit (push|commit|merge|rebase)\b", re.IGNORECASE),
+]
+
+_REPLY_PATTERNS = [
+    re.compile(r"\A(hi|hey|hello|yo|sup|hola|howdy|morning|afternoon|evening)\s*[!?.,]*\Z", re.IGNORECASE),
+    re.compile(r"\A(thanks|thank you|thx|ty|cheers|ta|appreciated)\s*[!?.,]*\Z", re.IGNORECASE),
+    re.compile(r"\A(ok|okay|k|sure|yep|yup|yeah|yes|no|nah|nope|cool|nice|great|good|got it|roger|copy|ack|np|nw)\s*[!?.,]*\Z", re.IGNORECASE),
+    re.compile(r"\A(lol|haha|hah|ha|lmao)\s*[!?.,]*\Z", re.IGNORECASE),
+]
+
+
+def _fast_path_task_check(content: str) -> str | None:
+    """Check if a message is obviously a task using pure regex (no LLM).
+
+    Returns a short title string if the message matches task-signal patterns,
+    or None if it should fall through to the LLM for inline handling.
+    Only matches clear task signals — ambiguous messages return None.
+    """
+    text = content.strip()
+    if not text:
+        return None
+
+    # Short messages (≤4 words) without task signals → not a task
+    words = text.split()
+    if len(words) <= 4:
+        # But still check if it matches a reply pattern
+        if any(p.match(text) for p in _REPLY_PATTERNS):
+            return None
+        # Short and no task signal → ambiguous, let LLM decide
+        if not any(p.search(text) for p in _TASK_SIGNAL_PATTERNS):
+            return None
+
+    # Check for explicit task signal patterns
+    for pattern in _TASK_SIGNAL_PATTERNS:
+        if pattern.search(text):
+            # Generate a short title from the message
+            title = text[:80].rstrip(".,!?;: ").strip()
+            return title or "Requested task"
+
+    return None
+
+
 def _try_repair_json(text: str) -> dict[str, Any] | None:
     """Attempt to repair truncated JSON by closing unclosed brackets/braces."""
     text = text.rstrip().rstrip(",")
@@ -3162,6 +3220,33 @@ def run_single_agent(
             )
             if result_msg is not None:
                 return result_msg
+
+        # --- Fast-path: immediate self-task for obvious task messages ---
+        # Uses pure regex (no LLM, no network) to detect messages that clearly
+        # need substantial work. Creates a self-task immediately and defers to
+        # the task handler, giving the user ~2s feedback ("On it...") instead
+        # of waiting 10-12s for the LLM to start. For ambiguous messages, the
+        # agent decides inline via <task_request> tags.
+        if task_creation_allowed and msg.content and msg.is_human:
+            fast_task = _fast_path_task_check(msg.content)
+            if fast_task:
+                try:
+                    task_id = await executor.create_task(
+                        msg.conversation_id,
+                        fast_task,
+                        msg.content,
+                        assigned_to=[my_participant_id],
+                        metadata={"source": "fast_path_self_task"},
+                    )
+                    logger.info("[%s] Fast-path self-task %s: %s", executor_key, task_id, fast_task)
+                    ack_msg = "On it — working on this now."
+                    msg_meta: dict[str, str] = {}
+                    if effective_backend:
+                        msg_meta["backend"] = effective_backend
+                    await executor.send_message(msg.conversation_id, ack_msg, metadata=msg_meta)
+                    return None
+                except Exception as e:
+                    logger.warning("[%s] Fast-path task creation failed, handling inline: %s", executor_key, e)
 
         # --- Create stream early so StreamingBubble appears immediately ---
         # This fires before history/location loading, so the user sees feedback
