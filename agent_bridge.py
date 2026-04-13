@@ -2766,6 +2766,8 @@ def run_single_agent(
             task_directives = (conv_id and _cached_directives_by_conv.get(conv_id)) or _cached_directives_fallback or {}
         behavioral_config = task_directives.get("behavioralConfig")
 
+        task_meta = task.raw.get("task", {}).get("metadata", {})
+
         # Handle memory_flush tasks
         if task_meta.get("type") == "memory_flush":
             logger.info("[%s] Memory flush task for conversation %s", executor_key, task.conversation_id)
@@ -2805,7 +2807,6 @@ def run_single_agent(
             task_prompt += task_suffix
 
         # Extract structured input values from task metadata
-        task_meta = task.raw.get("task", {}).get("metadata", {})
         input_values = task_meta.get("input_values", {})
 
         # Always fetch live location for task context
