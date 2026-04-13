@@ -3170,8 +3170,8 @@ def run_single_agent(
                 return result_msg
 
         # --- Create stream early so StreamingBubble appears immediately ---
-        # This fires before triage/history/location, so the user sees feedback
-        # within ~200ms of sending their message instead of waiting 3-6 seconds.
+        # This fires before history/location loading, so the user sees feedback
+        # within ~200ms of sending their message.
         _msg_stream_id = str(uuid.uuid4())
         _stream_cb = make_stream_callback(executor, msg.conversation_id, _msg_stream_id)
         if msg.conversation_id:
@@ -3181,7 +3181,6 @@ def run_single_agent(
             ))
 
         self_task_id = None
-        self_task_allowed = directives.get("selfTaskAllowed", True)
 
         # --- Fetch conversation history + location in parallel ---
         # Use pre-loaded messages from gateway response (tier 2) when available,
