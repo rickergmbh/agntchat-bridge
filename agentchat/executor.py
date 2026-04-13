@@ -1386,6 +1386,111 @@ class ExecutorClient:
         return await self._delete(f"/api/agents/me/reminders/{reminder_id}")
 
     # ------------------------------------------------------------------
+    # Routines
+    # ------------------------------------------------------------------
+
+    async def list_routines(
+        self, status: str | None = None
+    ) -> dict[str, Any]:
+        """List the agent's scheduled routines, optionally filtered by status."""
+        params: dict[str, Any] = {}
+        if status:
+            params["status"] = status
+        return await self._get("/api/routines", params=params or None)
+
+    async def create_routine(
+        self,
+        name: str,
+        instructions: str,
+        schedule_type: str,
+        schedule_config: dict[str, Any],
+        *,
+        description: str | None = None,
+        report_to: str | None = None,
+        max_runs: int | None = None,
+        expires_at: str | None = None,
+        response_template: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a new scheduled routine.
+
+        Args:
+            name: Unique name for this routine.
+            instructions: Prompt/instructions to execute each run.
+            schedule_type: 'interval' or 'cron'.
+            schedule_config: E.g. {"every_minutes": 10} or {"expression": "0 8 * * *"}.
+            description: What this routine does.
+            report_to: Conversation ID for posting results.
+            max_runs: Max executions (None = unlimited).
+            expires_at: ISO 8601 expiration datetime.
+            response_template: Template name for formatting output.
+        """
+        body: dict[str, Any] = {
+            "name": name,
+            "instructions": instructions,
+            "schedule_type": schedule_type,
+            "schedule_config": schedule_config,
+        }
+        if description:
+            body["description"] = description
+        if report_to:
+            body["report_to"] = report_to
+        if max_runs is not None:
+            body["max_runs"] = max_runs
+        if expires_at:
+            body["expires_at"] = expires_at
+        if response_template:
+            body["response_template"] = response_template
+        return await self._post("/api/routines", json=body)
+
+    async def update_routine(
+        self,
+        routine_id: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        instructions: str | None = None,
+        schedule_type: str | None = None,
+        schedule_config: dict[str, Any] | None = None,
+        report_to: str | None = None,
+        max_runs: int | None = None,
+        expires_at: str | None = None,
+        response_template: str | None = None,
+    ) -> dict[str, Any]:
+        """Update an existing routine's settings."""
+        body: dict[str, Any] = {}
+        if name is not None:
+            body["name"] = name
+        if description is not None:
+            body["description"] = description
+        if instructions is not None:
+            body["instructions"] = instructions
+        if schedule_type is not None:
+            body["schedule_type"] = schedule_type
+        if schedule_config is not None:
+            body["schedule_config"] = schedule_config
+        if report_to is not None:
+            body["report_to"] = report_to
+        if max_runs is not None:
+            body["max_runs"] = max_runs
+        if expires_at is not None:
+            body["expires_at"] = expires_at
+        if response_template is not None:
+            body["response_template"] = response_template
+        return await self._patch(f"/api/routines/{routine_id}", json=body)
+
+    async def delete_routine(self, routine_id: str) -> dict[str, Any]:
+        """Delete a routine permanently."""
+        return await self._delete(f"/api/routines/{routine_id}")
+
+    async def pause_routine(self, routine_id: str) -> dict[str, Any]:
+        """Pause an active routine."""
+        return await self._post(f"/api/routines/{routine_id}/pause", json={})
+
+    async def resume_routine(self, routine_id: str) -> dict[str, Any]:
+        """Resume a paused routine."""
+        return await self._post(f"/api/routines/{routine_id}/resume", json={})
+
+    # ------------------------------------------------------------------
     # Canvas State
     # ------------------------------------------------------------------
 
