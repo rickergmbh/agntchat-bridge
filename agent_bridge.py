@@ -2697,12 +2697,6 @@ def run_single_agent(
     @executor.on_task
     async def handle_task(task: GatewayTask) -> dict[str, Any]:
         nonlocal _cached_memory_prompt, _cached_directives_by_conv, _cached_directives_fallback
-        task_meta = task.raw.get("task", {}).get("metadata", {})
-
-        # Skip message_ack tasks (handled by message handler)
-        if task_meta.get("source") == "message_ack":
-            logger.info("[%s] Skipping message_ack task %s", executor_key, task.task_id)
-            return {"summary": "Handled by message handler", "skipped": True}
 
         # Read behavioral config from server directives (with per-conversation cache fallback)
         task_directives = task.raw.get("directives") or {}
@@ -3180,8 +3174,6 @@ def run_single_agent(
                 status="started", phase="thinking",
             ))
 
-        self_task_id = None
-
         # --- Fetch conversation history + location in parallel ---
         # Use pre-loaded messages from gateway response (tier 2) when available,
         # eliminating a full HTTP round-trip (~300-1000ms saved).
@@ -3297,23 +3289,6 @@ def run_single_agent(
             else:
                 reply, _ = parse_task_requests(reply)
 
-            if self_task_id:
-                try:
-                    if _tu_failed:
-                        await executor.update_task_status(self_task_id, "cancelled",
-                            summary="Could not complete — model returned no usable response")
-                    else:
-                        summary_parts = []
-                        if reply:
-                            summary_parts.append(reply[:150])
-                        if _tu_task_requests:
-                            task_titles = [tr.get("title", "untitled") for tr in _tu_task_requests]
-                            summary_parts.append(f"Delegated: {', '.join(task_titles)}")
-                        await executor.update_task_status(self_task_id, "complete",
-                            summary=" | ".join(summary_parts) if summary_parts else "Completed")
-                except Exception as e:
-                    logger.warning("[%s] Failed to update self-task: %s", executor_key, e)
-
             msg_meta_out: dict[str, str] = {}
             if result and result.model:
                 msg_meta_out["model"] = result.model
@@ -3398,17 +3373,6 @@ def run_single_agent(
                 _ca_failed = True
                 reply = error_msgs.get("sandboxNoOutput",
                     "I processed the request but didn't produce any output. Could you provide more detail?")
-
-            if self_task_id:
-                try:
-                    if _ca_failed:
-                        await executor.update_task_status(self_task_id, "cancelled",
-                            summary="Could not complete")
-                    else:
-                        await executor.update_task_status(self_task_id, "complete",
-                            summary=reply[:200] if reply else "Completed")
-                except Exception as e:
-                    logger.warning("[%s] Failed to update self-task: %s", executor_key, e)
 
             msg_meta_out: dict[str, str] = {}
             if result and result.model:
@@ -3522,26 +3486,6 @@ def run_single_agent(
                 family_agents=delegate_agents,
             )
             logger.info("[%s] Routed %d/%d DM block(s)", executor_key, dm_sent, len(dm_blocks))
-
-        # Complete self-task with contextual summary
-        if self_task_id:
-            try:
-                if _self_task_failed:
-                    await executor.update_task_status(self_task_id, "cancelled",
-                        summary="Could not complete — model returned no usable response")
-                else:
-                    summary_parts = []
-                    if reply:
-                        summary_parts.append(reply[:150])
-                    if _deferred_task_requests:
-                        task_titles = [tr.get("title", "untitled") for tr in _deferred_task_requests]
-                        summary_parts.append(f"Delegated: {', '.join(task_titles)}")
-                    if presentations:
-                        summary_parts.append(f"Sent {len(presentations)} structured result(s)")
-                    await executor.update_task_status(self_task_id, "complete",
-                        summary=" | ".join(summary_parts) if summary_parts else "Completed")
-            except Exception as e:
-                logger.warning("[%s] Failed to update self-task: %s", executor_key, e)
 
         # --- Outgoing filler filter ---
         # LLMs interpret "stay silent" as "tell them you're staying silent".
