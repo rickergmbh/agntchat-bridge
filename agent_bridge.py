@@ -3370,10 +3370,11 @@ def run_single_agent(
                     logger.info("[%s] Executed %d/%d memory operations (tool_use)", executor_key, mem_count, len(tu_memory_ops))
 
             _tu_task_requests: list[dict[str, Any]] = []
-            if task_creation_allowed and not _tu_failed:
-                reply, _tu_task_requests = parse_task_requests(reply)
-            else:
-                reply, _ = parse_task_requests(reply)
+            if reply:
+                if task_creation_allowed and not _tu_failed:
+                    reply, _tu_task_requests = parse_task_requests(reply)
+                else:
+                    reply, _ = parse_task_requests(reply)
 
             msg_meta_out: dict[str, str] = {}
             if result and result.model:
