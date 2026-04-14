@@ -360,14 +360,24 @@ class ExecutorClient:
 
     @staticmethod
     def _backoff_delay(consecutive_errors: int) -> float:
-        """Compute exponential backoff: 5s, 10s, 20s, 40s, capped at 60s, with jitter."""
+        """Compute exponential backoff with wide jitter to prevent thundering herd.
+
+        When the backend goes down, all executor poll loops (tasks, messages,
+        scope-requests × N agents) retry simultaneously. Without enough jitter,
+        the flood of reconnection attempts triggers Fly's proxy rate limiter,
+        preventing the machine from restarting. Wide jitter (0-50% of base)
+        spreads reconnection attempts across a wider window.
+        """
         import random
         base = min(5 * (2 ** consecutive_errors), 60)
-        jitter = random.uniform(0, base * 0.25)
+        jitter = random.uniform(0, base * 0.5)
         return base + jitter
 
     async def _task_poll_loop(self) -> None:
         """Poll for tasks until stopped."""
+        # Stagger initial poll to avoid thundering herd when multiple agents start
+        import random
+        await asyncio.sleep(random.uniform(0, 2))
         consecutive_errors = 0
         while self._running:
             try:
@@ -396,6 +406,8 @@ class ExecutorClient:
 
     async def _message_poll_loop(self) -> None:
         """Poll for messages until stopped."""
+        import random
+        await asyncio.sleep(random.uniform(0, 2))
         consecutive_errors = 0
         while self._running:
             try:
@@ -1612,6 +1624,8 @@ class ExecutorClient:
 
     async def _scope_request_poll_loop(self) -> None:
         """Poll for scope requests until stopped."""
+        import random
+        await asyncio.sleep(random.uniform(0, 2))
         consecutive_errors = 0
         while self._running:
             try:
