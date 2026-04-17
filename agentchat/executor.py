@@ -897,6 +897,61 @@ class ExecutorClient:
                     return await self._delete(f"/api/agents/me/memories/{mem_id}")
         return {}
 
+    async def save_family_memory(
+        self,
+        category: str,
+        key: str,
+        content: str,
+        *,
+        confidence: float | None = None,
+        description: str | None = None,
+        tags: list[str] | None = None,
+        reason: str | None = None,
+        source_conversation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Save a family-scoped memory (shared across every agent in the family).
+
+        Upserts on (category, key) keyed on family_root_id — the latest write
+        replaces the older one. Every write is appended to the audit trail.
+        """
+        body: dict[str, Any] = {
+            "category": category,
+            "key": key,
+            "content": content,
+        }
+        if confidence is not None:
+            body["confidence"] = confidence
+        if description:
+            body["description"] = description
+        if tags:
+            body["tags"] = tags
+        if reason:
+            body["reason"] = reason
+        if source_conversation_id:
+            body["sourceConversationId"] = source_conversation_id
+        return await self._post("/api/family/memories", body)
+
+    async def get_family_memories(
+        self,
+        *,
+        category: str | None = None,
+        q: str | None = None,
+        tag: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fetch family memories shared across the family."""
+        params: dict[str, Any] = {}
+        if category:
+            params["category"] = category
+        if q:
+            params["q"] = q
+        if tag:
+            params["tag"] = tag
+        if limit is not None:
+            params["limit"] = limit
+        data = await self._get("/api/family/memories", params=params)
+        return data.get("memories", [])
+
     async def search_memory(
         self,
         query: str,
