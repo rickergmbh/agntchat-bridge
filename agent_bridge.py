@@ -2801,7 +2801,12 @@ def run_single_agent(
             # has the LAST output from Claude CLI (often just heartbeat_state tags),
             # but the proactive message was output earlier in tool-use iterations.
             if is_heartbeat:
-                # Fetch messages from the work conversation to get the full text
+                # Fetch messages from the work conversation to get the full text.
+                # remaining_text is often just <heartbeat_state> tags from the
+                # last tool-use iteration — the actual proactive message was
+                # posted earlier. If this fetch fails we fall back to
+                # remaining_text, but log so we can diagnose silent "Heartbeat
+                # OK" suppressions when the real message vanished.
                 try:
                     work_conv = task.work_conversation_id or task.conversation_id
                     if work_conv:
@@ -2816,7 +2821,15 @@ def run_single_agent(
                         summary_text = "\n\n".join(all_texts) if all_texts else remaining_text
                     else:
                         summary_text = remaining_text
-                except Exception:
+                except Exception as e:
+                    logger.warning(
+                        "[%s] Heartbeat work-conv fetch failed (task=%s, conv=%s), "
+                        "falling back to remaining_text: %s",
+                        executor_key,
+                        task.id,
+                        task.work_conversation_id or task.conversation_id,
+                        e,
+                    )
                     summary_text = remaining_text
             else:
                 summary_text = remaining_text
