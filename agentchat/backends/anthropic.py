@@ -94,6 +94,23 @@ class AnthropicBackend(ModelBackend):
             kwargs["top_k"] = self._top_k
         return kwargs
 
+    @staticmethod
+    def _cached_system(system_prompt: str) -> list[dict[str, Any]]:
+        """Wrap the system prompt in a cache_control block for prompt caching.
+
+        Anthropic's ephemeral cache has a 5-minute TTL and a ~1024-token minimum.
+        For a conversation with a 15k-token system prompt, this drops subsequent
+        first-token latency from ~1.5-2s to ~100-200ms. The cache is keyed on
+        the exact text, so any change invalidates it.
+        """
+        return [
+            {
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+
     async def generate_quick(
         self,
         system_prompt: str,
@@ -115,7 +132,7 @@ class AnthropicBackend(ModelBackend):
                 self._client.messages.create(
                     model=_QUICK_MODEL,
                     max_tokens=_QUICK_MAX_TOKENS,
-                    system=system_prompt,
+                    system=self._cached_system(system_prompt),
                     messages=[{"role": "user", "content": user_prompt}],
                 ),
                 timeout=timeout,
@@ -145,7 +162,7 @@ class AnthropicBackend(ModelBackend):
             response = await self._client.messages.create(
                 model=self._model,
                 max_tokens=self._max_tokens,
-                system=system_prompt,
+                system=self._cached_system(system_prompt),
                 messages=[{"role": "user", "content": user_prompt}],
                 **self._sampling_kwargs(),
             )
@@ -198,7 +215,7 @@ class AnthropicBackend(ModelBackend):
             response = await self._client.messages.create(
                 model=self._model,
                 max_tokens=self._max_tokens,
-                system=system_prompt,
+                system=self._cached_system(system_prompt),
                 messages=api_messages,
                 **self._sampling_kwargs(),
             )
@@ -258,7 +275,7 @@ class AnthropicBackend(ModelBackend):
         async with self._client.messages.stream(
             model=self._model,
             max_tokens=self._max_tokens,
-            system=system_prompt,
+            system=self._cached_system(system_prompt),
             messages=api_messages,
             **self._sampling_kwargs(),
         ) as stream:
@@ -341,7 +358,7 @@ class AnthropicBackend(ModelBackend):
             return await self._client.messages.create(
                 model=self._model,
                 max_tokens=self._max_tokens,
-                system=system_prompt,
+                system=self._cached_system(system_prompt),
                 messages=api_messages,
                 tools=tools,
                 **self._sampling_kwargs(),
@@ -356,7 +373,7 @@ class AnthropicBackend(ModelBackend):
         async with self._client.messages.stream(
             model=self._model,
             max_tokens=self._max_tokens,
-            system=system_prompt,
+            system=self._cached_system(system_prompt),
             messages=api_messages,
             tools=tools,
             **self._sampling_kwargs(),

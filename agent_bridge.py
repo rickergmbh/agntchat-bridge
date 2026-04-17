@@ -218,20 +218,52 @@ async def _fetch_profile(base_url: str, agent_id: str, api_key: str) -> dict[str
     return None
 
 
-async def _fetch_owner_location(base_url: str, agent_id: str, api_key: str) -> dict[str, Any]:
-    """Fetch the owning human's location. Returns {} on failure or if disabled."""
-    try:
-        import httpx
+_OWNER_LOC_CACHE_TTL = 60.0  # seconds
+_owner_loc_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
-        tm = TokenManager(base_url, agent_id, api_key)
-        token = await tm.get_token()
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(
+
+async def _fetch_owner_location(
+    base_url: str,
+    agent_id: str,
+    api_key: str,
+    executor: "ExecutorClient | None" = None,
+) -> dict[str, Any]:
+    """Fetch the owning human's location. Cached per agent_id for 60s.
+
+    When *executor* is provided, reuses its persistent TokenManager + HTTP
+    client — eliminating the per-call ``/api/auth/agent-token`` refresh and
+    cold TLS handshake that would otherwise fire on every message.
+    """
+    # Cache check — owner location rarely changes within a conversation window
+    cached = _owner_loc_cache.get(agent_id)
+    if cached is not None:
+        cached_at, cached_loc = cached
+        if _time.monotonic() - cached_at < _OWNER_LOC_CACHE_TTL:
+            return cached_loc
+
+    try:
+        if executor is not None and executor._api_client is not None:
+            # Fast path: reuse persistent client + cached JWT
+            token = await executor._token_manager.ensure_fresh()
+            resp = await executor._api_client.get(
                 f"{base_url.rstrip('/')}/api/owner/location",
                 headers={"Authorization": f"Bearer {token}"},
             )
+        else:
+            # Fallback (startup, pre-executor contexts): spin up ephemeral client
+            import httpx
+
+            tm = TokenManager(base_url, agent_id, api_key)
+            token = await tm.get_token()
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"{base_url.rstrip('/')}/api/owner/location",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
         if resp.status_code == 200:
-            return resp.json().get("location", {})
+            loc = resp.json().get("location", {})
+            _owner_loc_cache[agent_id] = (_time.monotonic(), loc)
+            return loc
     except Exception as e:
         logger.debug("Owner location not available: %s", e)
     return {}
@@ -2484,10 +2516,10 @@ def run_single_agent(
         my_participant_id = agent_id
         agent_name = None
 
-    # Helper: fetch live location
+    # Helper: fetch live location (reuses executor's persistent client + token)
     async def _get_live_location_context() -> tuple[str, float | None, float | None]:
         try:
-            loc = await _fetch_owner_location(AGENTGRAM_API_URL, agent_id, api_key)
+            loc = await _fetch_owner_location(AGENTGRAM_API_URL, agent_id, api_key, executor=executor)
             if loc.get("latitude") is not None and loc.get("longitude") is not None:
                 lat = float(loc["latitude"])
                 lng = float(loc["longitude"])
@@ -2646,7 +2678,7 @@ def run_single_agent(
         if needs_location:
             logger.info("[%s] Task requires location (field=%s)", executor_key, location_field_key)
 
-            loc = await _fetch_owner_location(AGENTGRAM_API_URL, agent_id, api_key)
+            loc = await _fetch_owner_location(AGENTGRAM_API_URL, agent_id, api_key, executor=executor)
             if loc.get("latitude") is not None and loc.get("longitude") is not None:
                 input_values[location_field_key] = f"{loc['latitude']},{loc['longitude']}"
             else:
