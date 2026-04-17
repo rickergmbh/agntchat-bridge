@@ -237,48 +237,6 @@ async def _fetch_owner_location(base_url: str, agent_id: str, api_key: str) -> d
     return {}
 
 
-async def _fetch_agent_memories_prompt(base_url: str, agent_id: str, api_key: str) -> str | None:
-    """Fetch agent's persistent memories and format into a prompt block.
-
-    Called at startup so the bridge always has a baseline memory prompt,
-    even when the server-side preloader times out on the text search.
-    """
-    try:
-        import httpx
-
-        tm = TokenManager(base_url, agent_id, api_key)
-        token = await tm.get_token()
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(
-                f"{base_url.rstrip('/')}/api/agents/me/memories",
-                headers={"Authorization": f"Bearer {token}"},
-                params={"limit": "50"},
-            )
-        if resp.status_code != 200:
-            return None
-        memories = resp.json().get("memories", [])
-        if not memories:
-            return None
-
-        # Build prompt block matching the server's format
-        lines = ["\n\nYOUR PERSISTENT MEMORY"]
-        lines.append("These are facts, preferences, and learnings you've saved from past conversations.")
-        lines.append("Use them to personalize your responses and maintain continuity.\n")
-        for m in memories:
-            cat = m.get("category", "general")
-            key = m.get("key", "")
-            content = m.get("content", "")
-            conf = m.get("confidence")
-            conf_str = f" (confidence: {conf})" if conf else ""
-            lines.append(f"- [{cat}] {key}: {content}{conf_str}")
-        lines.append("\nIf you learn something important about the user or a decision is made,")
-        lines.append("always save it as a memory so you can recall it in future conversations.")
-        return "\n".join(lines)
-    except Exception as e:
-        logger.debug("Could not fetch agent memories: %s", e)
-        return None
-
-
 async def _warm_up_directives(
     base_url: str, agent_id: str, api_key: str, limit: int = 3
 ) -> dict[str, dict[str, Any]]:
@@ -520,64 +478,6 @@ _MEMORY_FORGET_TAG_RE = re.compile(
 
 # Helper to extract named attributes from a <memory ...> opening tag
 _MEMORY_ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
-
-
-# --- Fast-path task detection (pure regex, no LLM, no network) ---
-# Mirrors the backend MessageTriage.classify_fast patterns. Only matches
-# OBVIOUS task signals — ambiguous messages fall through to the LLM.
-
-_TASK_SIGNAL_PATTERNS = [
-    re.compile(
-        r"\b(implement|build|create|write|deploy|fix|debug|refactor|migrate|add|remove|delete|update|change|modify|set up|configure|install)\b"
-        r".*\b(the|a|an|this|that|my|our|it|code|file|test|feature|bug|endpoint|function|module|component|page|screen|route|api|db|database|schema|migration)\b",
-        re.IGNORECASE,
-    ),
-    re.compile(r"\bcan you (implement|build|create|write|deploy|fix|debug|refactor|add|update|change|set up|configure)\b", re.IGNORECASE),
-    re.compile(r"\bplease (implement|build|create|write|deploy|fix|debug|refactor|add|update|change|set up|configure)\b", re.IGNORECASE),
-    re.compile(r"\b(PR|pull request|commit|push|merge|rebase|branch|checkout)\b.*\b(for|the|this|that)\b", re.IGNORECASE),
-    re.compile(r"\bfly deploy\b", re.IGNORECASE),
-    re.compile(r"\bmix test\b", re.IGNORECASE),
-    re.compile(r"\bnpx tsc\b", re.IGNORECASE),
-    re.compile(r"\bgit (push|commit|merge|rebase)\b", re.IGNORECASE),
-]
-
-_REPLY_PATTERNS = [
-    re.compile(r"\A(hi|hey|hello|yo|sup|hola|howdy|morning|afternoon|evening)\s*[!?.,]*\Z", re.IGNORECASE),
-    re.compile(r"\A(thanks|thank you|thx|ty|cheers|ta|appreciated)\s*[!?.,]*\Z", re.IGNORECASE),
-    re.compile(r"\A(ok|okay|k|sure|yep|yup|yeah|yes|no|nah|nope|cool|nice|great|good|got it|roger|copy|ack|np|nw)\s*[!?.,]*\Z", re.IGNORECASE),
-    re.compile(r"\A(lol|haha|hah|ha|lmao)\s*[!?.,]*\Z", re.IGNORECASE),
-]
-
-
-def _fast_path_task_check(content: str) -> str | None:
-    """Check if a message is obviously a task using pure regex (no LLM).
-
-    Returns a short title string if the message matches task-signal patterns,
-    or None if it should fall through to the LLM for inline handling.
-    Only matches clear task signals — ambiguous messages return None.
-    """
-    text = content.strip()
-    if not text:
-        return None
-
-    # Short messages (≤4 words) without task signals → not a task
-    words = text.split()
-    if len(words) <= 4:
-        # But still check if it matches a reply pattern
-        if any(p.match(text) for p in _REPLY_PATTERNS):
-            return None
-        # Short and no task signal → ambiguous, let LLM decide
-        if not any(p.search(text) for p in _TASK_SIGNAL_PATTERNS):
-            return None
-
-    # Check for explicit task signal patterns
-    for pattern in _TASK_SIGNAL_PATTERNS:
-        if pattern.search(text):
-            # Generate a short title from the message
-            title = text[:80].rstrip(".,!?;: ").strip()
-            return title or "Requested task"
-
-    return None
 
 
 def _try_repair_json(text: str) -> dict[str, Any] | None:
@@ -2273,15 +2173,11 @@ def _build_tool_param_details_from_resolved(tools: list[dict[str, Any]]) -> str:
 
 def _build_system_prompt_from_directives(
     directives: dict[str, Any] | None,
-    *,
-    memory_prompt_override: str | None = None,
 ) -> str | None:
     """Build system prompt from server-provided promptDirectives.
 
-    If *memory_prompt_override* is provided, it replaces the YOUR PERSISTENT
-    MEMORY section in the assembled prompt so the agent sees its freshest
-    memories without waiting for a new server-computed directive.
-
+    The server is the single source of truth for prompt content, including
+    persistent memory. The bridge only concatenates — no mutation, no splicing.
     Returns None if no directives available (caller should use fallback).
     """
     if not directives:
@@ -2289,26 +2185,7 @@ def _build_system_prompt_from_directives(
     prompt_directives = directives.get("promptDirectives")
     if not prompt_directives:
         return None
-
-    prompt = "".join(prompt_directives)
-
-    if memory_prompt_override:
-        _MEMORY_MARKER = "\n\nYOUR PERSISTENT MEMORY"
-        _MEMORY_END = "always save it as a memory so you can recall it in future conversations."
-        start = prompt.find(_MEMORY_MARKER)
-        if start >= 0:
-            end = prompt.find(_MEMORY_END, start)
-            if end >= 0:
-                end += len(_MEMORY_END)
-                prompt = prompt[:start] + memory_prompt_override + prompt[end:]
-            else:
-                # Marker found but end not found — append override after existing content
-                prompt += memory_prompt_override
-        else:
-            # No existing memory section — just append
-            prompt += memory_prompt_override
-
-    return prompt
+    return "".join(prompt_directives)
 
 
 # ---------------------------------------------------------------------------
@@ -2624,28 +2501,12 @@ def run_single_agent(
             pass
         return "", None, None
 
-    # Cached memory prompt — pre-fetched at startup and updated after memory
-    # save/delete operations. Injected into system prompts so the agent always
-    # has its memories, even when server-side enrichment times out.
-    _cached_memory_prompt: str | None = None
-
     # Per-conversation directive cache. Keyed by conversation_id.
     # Seeded at startup by warm-up, updated from each server response.
     _cached_directives_by_conv: dict[str, dict[str, Any]] = {}
     # Fallback: the most recently received directives from any conversation.
     # Used when we get a message from a conversation not yet in the cache.
     _cached_directives_fallback: dict[str, Any] | None = None
-
-    # Pre-fetch agent memories at startup so we always have a baseline
-    try:
-        _startup_memories = asyncio.run(
-            _fetch_agent_memories_prompt(AGENTGRAM_API_URL, agent_id, api_key)
-        )
-        if _startup_memories:
-            _cached_memory_prompt = _startup_memories
-            logger.info("[%s] Pre-cached %d chars of agent memory prompt", executor_key, len(_startup_memories))
-    except Exception as e:
-        logger.debug("[%s] Could not pre-fetch agent memories: %s", executor_key, e)
 
     # Pre-warm directives cache for active conversations (best-effort)
     try:
@@ -2722,39 +2583,9 @@ def run_single_agent(
                 owner_id=agent_owner_id or "",
             )
 
-    def _strip_directive_tool_sections(prompt: str) -> str:
-        """Strip directive tool sections that conflict with the backend's tool format.
-
-        The behavioral directives include tool sections (## Available Tools,
-        ## Execution Mode: Tool Use) designed for native API tool calling.
-        When the backend uses its own tool format (MCP native tools or
-        claude_cli's <tool_call> XML), these sections must be stripped to
-        avoid conflicting instructions that prevent the LLM from calling tools.
-        """
-        # Strip when MCP is active OR when claude_cli adds its own XML tool prompt
-        needs_strip = _has_mcp or (execution_mode == "tool_use" and _tool_defs)
-        if not needs_strip:
-            return prompt
-        import re
-        # Strip "## Available Tools" through end of that section
-        prompt = re.sub(
-            r"\n## Available Tools\n.*?(?=\n## |\Z)",
-            "",
-            prompt,
-            flags=re.DOTALL,
-        )
-        # Strip "## Execution Mode: Tool Use" section similarly
-        prompt = re.sub(
-            r"\n## Execution Mode: Tool Use\n.*?(?=\n## |\Z)",
-            "",
-            prompt,
-            flags=re.DOTALL,
-        )
-        return prompt
-
     @executor.on_task
     async def handle_task(task: GatewayTask) -> dict[str, Any]:
-        nonlocal _cached_memory_prompt, _cached_directives_by_conv, _cached_directives_fallback
+        nonlocal _cached_directives_by_conv, _cached_directives_fallback
 
         # Read behavioral config from server directives (with per-conversation cache fallback)
         task_directives = task.raw.get("directives") or {}
@@ -2779,9 +2610,7 @@ def run_single_agent(
         execution_plan = task_meta.get("execution_plan")
         if execution_plan and execution_plan.get("steps"):
             # Build prompt from directives
-            task_prompt = _build_system_prompt_from_directives(
-                task_directives, memory_prompt_override=_cached_memory_prompt,
-            ) or _FALLBACK_SYSTEM_PROMPT
+            task_prompt = _build_system_prompt_from_directives(task_directives) or _FALLBACK_SYSTEM_PROMPT
             return await _handle_compound_task(
                 task, execution_plan, executor, backend, task_prompt,
                 executor_key, history_limit, my_participant_id,
@@ -2793,10 +2622,7 @@ def run_single_agent(
         task_description = task.description
 
         # --- Build system prompt from server directives ---
-        task_prompt = _build_system_prompt_from_directives(
-            task_directives, memory_prompt_override=_cached_memory_prompt,
-        ) or _FALLBACK_SYSTEM_PROMPT
-        task_prompt = _strip_directive_tool_sections(task_prompt)
+        task_prompt = _build_system_prompt_from_directives(task_directives) or _FALLBACK_SYSTEM_PROMPT
 
         if _tool_prompt_suffix:
             task_prompt += _tool_prompt_suffix
@@ -2929,8 +2755,6 @@ def run_single_agent(
                     source_conversation_id=tu_mem_conv,
                     executor_key=executor_key,
                 )
-                if mem_prompt:
-                    _cached_memory_prompt = mem_prompt
                 logger.info("[%s] Executed %d/%d memory operations from task (tool_use)", executor_key, mem_count, len(tu_memory_ops))
 
             if presentations:
@@ -3082,8 +2906,6 @@ def run_single_agent(
                     source_conversation_id=task_conv_id,
                     executor_key=executor_key,
                 )
-                if mem_prompt:
-                    _cached_memory_prompt = mem_prompt
                 logger.info("[%s] Executed %d/%d memory operations from task", executor_key, mem_count, len(task_memory_ops))
 
             if presentations:
@@ -3168,7 +2990,7 @@ def run_single_agent(
         All behavioral decisions (trivial filtering, scoping, reframing, freshness
         checks, error messages) use server-provided behavioralConfig.
         """
-        nonlocal _cached_memory_prompt, _cached_directives_by_conv, _cached_directives_fallback
+        nonlocal _cached_directives_by_conv, _cached_directives_fallback
         logger.info(
             "[%s] === Message from %s (%s): %s ===",
             executor_key, msg.sender_name,
@@ -3222,33 +3044,6 @@ def run_single_agent(
             if result_msg is not None:
                 return result_msg
 
-        # --- Fast-path: immediate self-task for obvious task messages ---
-        # Uses pure regex (no LLM, no network) to detect messages that clearly
-        # need substantial work. Creates a self-task immediately and defers to
-        # the task handler, giving the user ~2s feedback ("On it...") instead
-        # of waiting 10-12s for the LLM to start. For ambiguous messages, the
-        # agent decides inline via <task_request> tags.
-        if task_creation_allowed and msg.content and msg.is_human:
-            fast_task = _fast_path_task_check(msg.content)
-            if fast_task:
-                try:
-                    task_id = await executor.create_task(
-                        msg.conversation_id,
-                        fast_task,
-                        msg.content,
-                        assigned_to=[my_participant_id],
-                        metadata={"source": "fast_path_self_task"},
-                    )
-                    logger.info("[%s] Fast-path self-task %s: %s", executor_key, task_id, fast_task)
-                    ack_msg = "On it — working on this now."
-                    msg_meta: dict[str, str] = {}
-                    if effective_backend:
-                        msg_meta["backend"] = effective_backend
-                    await executor.send_message(msg.conversation_id, ack_msg, metadata=msg_meta)
-                    return None
-                except Exception as e:
-                    logger.warning("[%s] Fast-path task creation failed, handling inline: %s", executor_key, e)
-
         # --- Create stream early so StreamingBubble appears immediately ---
         # This fires before history/location loading, so the user sees feedback
         # within ~200ms of sending their message.
@@ -3298,10 +3093,7 @@ def run_single_agent(
         # when to self-task vs just reply.
 
         # --- Build system prompt from server directives ---
-        msg_prompt = _build_system_prompt_from_directives(
-            directives, memory_prompt_override=_cached_memory_prompt,
-        ) or _FALLBACK_SYSTEM_PROMPT
-        msg_prompt = _strip_directive_tool_sections(msg_prompt)
+        msg_prompt = _build_system_prompt_from_directives(directives) or _FALLBACK_SYSTEM_PROMPT
 
         # Inject tool definitions for single-shot mode
         if _tool_prompt_suffix:
@@ -3365,8 +3157,6 @@ def run_single_agent(
                         source_conversation_id=msg.conversation_id,
                         executor_key=executor_key,
                     )
-                    if mem_prompt:
-                        _cached_memory_prompt = mem_prompt
                     logger.info("[%s] Executed %d/%d memory operations (tool_use)", executor_key, mem_count, len(tu_memory_ops))
 
             _tu_task_requests: list[dict[str, Any]] = []
@@ -3512,8 +3302,6 @@ def run_single_agent(
                 source_conversation_id=msg.conversation_id,
                 executor_key=executor_key,
             )
-            if mem_prompt:
-                _cached_memory_prompt = mem_prompt
             logger.info("[%s] Executed %d/%d memory operations", executor_key, mem_count, len(memory_ops))
 
         # Detect and execute tool calls (<tool_call> tags — works with any backend)
