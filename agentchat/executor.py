@@ -35,7 +35,7 @@ import httpx
 
 from ._dedup import MessageDedup
 from .auth import TokenManager
-from .errors import AgentChatError, AuthError
+from .errors import AgentChatError, AuthError, StaleContextError
 
 logger = logging.getLogger("agentchat.executor")
 
@@ -672,8 +672,14 @@ class ExecutorClient:
         message_type: str | None = None,
         content_structured: dict[str, Any] | None = None,
         correlation_id: str | None = None,
+        last_seen_message_id: str | None = None,
     ) -> dict[str, Any]:
-        """Send a message to a conversation (call from within handler)."""
+        """Send a message to a conversation (call from within handler).
+
+        If `last_seen_message_id` is provided and the backend determines that
+        newer messages from other participants arrived since that anchor,
+        raises `StaleContextError` with the new messages attached.
+        """
         body: dict[str, Any] = {"content": content, "contentType": content_type}
         if metadata:
             body["metadata"] = metadata
@@ -683,6 +689,8 @@ class ExecutorClient:
             body["contentStructured"] = content_structured
         if correlation_id:
             body["correlationId"] = correlation_id
+        if last_seen_message_id:
+            body["lastSeenMessageId"] = last_seen_message_id
         return await self._post(
             f"/api/conversations/{conversation_id}/messages",
             json=body,
@@ -2068,6 +2076,17 @@ class ExecutorClient:
     def _handle_response(resp: httpx.Response) -> dict:
         if resp.status_code == 204:
             return {}
+        if resp.status_code == 409:
+            try:
+                body = resp.json()
+            except Exception:
+                body = {}
+            if body.get("stale"):
+                raise StaleContextError(
+                    f"API error 409: {body}",
+                    new_messages=body.get("newMessages") or [],
+                )
+            # non-stale 409 falls through to generic error path
         if resp.status_code >= 400:
             try:
                 body = resp.json()

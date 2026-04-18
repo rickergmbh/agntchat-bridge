@@ -66,7 +66,7 @@ for _env_candidate in [
 import time as _time  # noqa: E402
 
 from agentchat.auth import TokenManager  # noqa: E402
-from agentchat.errors import AuthError  # noqa: E402
+from agentchat.errors import AuthError, StaleContextError  # noqa: E402
 from agentchat.backends import ChatMessage, create_backend  # noqa: E402
 from agentchat.executor import ExecutorClient, GatewayMessage, GatewayTask, ScopeRequest  # noqa: E402
 from agentchat.tools.executor import ToolExecutor  # noqa: E402
@@ -3232,8 +3232,18 @@ def run_single_agent(
 
             if reply:
                 try:
-                    await executor.send_message(msg.conversation_id, reply, metadata=msg_meta_out)
+                    await executor.send_message(
+                        msg.conversation_id, reply,
+                        metadata=msg_meta_out,
+                        last_seen_message_id=msg.message_id or None,
+                    )
                     await _stream_cb.complete()
+                except StaleContextError as sce:
+                    logger.info(
+                        "[%s] Dropped stale tool_use reply — %d new message(s) arrived during draft",
+                        executor_key, len(sce.new_messages),
+                    )
+                    await _stream_cb.cancel()
                 except Exception as e:
                     logger.warning("[%s] Failed to send tool_use reply: %s", executor_key, e)
                     await _stream_cb.cancel()
@@ -3436,8 +3446,18 @@ def run_single_agent(
 
             # Send reply explicitly so we can create tasks AFTER it appears in the timeline
             try:
-                await executor.send_message(msg.conversation_id, reply, metadata=msg_meta_out)
+                await executor.send_message(
+                    msg.conversation_id, reply,
+                    metadata=msg_meta_out,
+                    last_seen_message_id=msg.message_id or None,
+                )
                 await _stream_cb.complete()
+            except StaleContextError as sce:
+                logger.info(
+                    "[%s] Dropped stale reply — %d new message(s) arrived during draft",
+                    executor_key, len(sce.new_messages),
+                )
+                await _stream_cb.cancel()
             except Exception as e:
                 logger.warning("[%s] Failed to send reply: %s", executor_key, e)
                 await _stream_cb.cancel()
