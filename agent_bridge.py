@@ -2667,10 +2667,11 @@ def run_single_agent(
         # Extract structured input values from task metadata
         input_values = task_meta.get("input_values", {})
 
-        # Always fetch live location for task context
+        # Always fetch live location for task context. Injected into the user
+        # message (below) — NOT the system prompt — to keep the system prompt
+        # stable for Anthropic prompt caching.
         live_loc_ctx, owner_lat, owner_lng = await _get_live_location_context()
         if live_loc_ctx:
-            task_prompt += live_loc_ctx
             logger.info("[%s] Live owner location injected", executor_key)
 
         # Check for missing required location input field
@@ -2695,10 +2696,11 @@ def run_single_agent(
                     if loc and loc.get("latitude") is not None:
                         input_values[location_field_key] = f"{loc['latitude']},{loc['longitude']}"
                         if not live_loc_ctx:
-                            task_prompt += f"\n\nUser's current location: lat={loc['latitude']}, lng={loc['longitude']}"
+                            # Fallback location → inject into user turn, not system prompt.
+                            live_loc_ctx = f"\n\nUser's current location: lat={loc['latitude']}, lng={loc['longitude']}"
                     else:
                         if not live_loc_ctx:
-                            task_prompt += "\n\nNote: User's device location was not available."
+                            live_loc_ctx = "\n\nNote: User's device location was not available."
 
         # Progress callback + streaming
         progress_cb = make_progress_callback(executor, task.id)
@@ -2732,6 +2734,11 @@ def run_single_agent(
             task_content += "\n\nStructured Inputs:"
             for k, v in input_values.items():
                 task_content += f"\n  {k}: {v}"
+
+        # Prepend dynamic per-call context (live location) to the user message
+        # so the system prompt stays cache-stable across calls.
+        if live_loc_ctx:
+            task_content = f"{live_loc_ctx.strip()}\n\n{task_content}"
 
         chat_messages.append(ChatMessage(role="user", content=task_content))
 
@@ -3144,8 +3151,18 @@ def run_single_agent(
         if _tool_prompt_suffix:
             msg_prompt += _tool_prompt_suffix
 
-        if live_loc_ctx:
-            msg_prompt += live_loc_ctx
+        # Dynamic per-message context (live location + timestamps) goes into the
+        # user turn, NOT the system prompt. Appending to the system prompt would
+        # bust Anthropic's prompt cache on every call — losing the ~1-2s TTFB
+        # win on large prompts. Keeping the system prompt stable lets consecutive
+        # messages in the same conversation hit the cache.
+        if live_loc_ctx and chat_messages:
+            last = chat_messages[-1]
+            if last.role == "user" and isinstance(last.content, str):
+                chat_messages[-1] = ChatMessage(
+                    role="user",
+                    content=f"{live_loc_ctx.strip()}\n\n{last.content}",
+                )
 
         # Get error messages from server config
         error_msgs = (behavioral_config or {}).get("errorMessages", {})

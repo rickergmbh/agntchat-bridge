@@ -111,6 +111,23 @@ class AnthropicBackend(ModelBackend):
             }
         ]
 
+    @staticmethod
+    def _usage_dict(usage: Any) -> dict[str, int]:
+        """Extract token usage including prompt-cache fields.
+
+        With prompt caching enabled, Anthropic returns input_tokens (uncached),
+        cache_creation_input_tokens (first-time cache write), and
+        cache_read_input_tokens (cache hits). Reading only input_tokens would
+        undercount actual token usage by ~95% on cache hits. All four fields
+        default to 0 when absent from the response.
+        """
+        return {
+            "input_tokens": getattr(usage, "input_tokens", 0) or 0,
+            "output_tokens": getattr(usage, "output_tokens", 0) or 0,
+            "cache_creation_input_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0,
+            "cache_read_input_tokens": getattr(usage, "cache_read_input_tokens", 0) or 0,
+        }
+
     async def generate_quick(
         self,
         system_prompt: str,
@@ -149,10 +166,7 @@ class AnthropicBackend(ModelBackend):
             text=text,
             model=_QUICK_MODEL,
             elapsed_seconds=round(elapsed, 1),
-            usage={
-                "input_tokens": response.usage.input_tokens,
-                "output_tokens": response.usage.output_tokens,
-            },
+            usage=self._usage_dict(response.usage),
         )
 
     async def generate(self, system_prompt: str, user_prompt: str, on_progress=None) -> ModelResult:
@@ -179,10 +193,7 @@ class AnthropicBackend(ModelBackend):
             text=text,
             model=self._model,
             elapsed_seconds=round(elapsed, 1),
-            usage={
-                "input_tokens": response.usage.input_tokens,
-                "output_tokens": response.usage.output_tokens,
-            },
+            usage=self._usage_dict(response.usage),
         )
 
     async def chat(
@@ -232,10 +243,7 @@ class AnthropicBackend(ModelBackend):
             text=text,
             model=self._model,
             elapsed_seconds=round(elapsed, 1),
-            usage={
-                "input_tokens": response.usage.input_tokens,
-                "output_tokens": response.usage.output_tokens,
-            },
+            usage=self._usage_dict(response.usage),
         )
 
     # ------------------------------------------------------------------
@@ -331,10 +339,7 @@ class AnthropicBackend(ModelBackend):
             text=full_text,
             model=self._model,
             elapsed_seconds=round(elapsed, 1),
-            usage={
-                "input_tokens": message.usage.input_tokens,
-                "output_tokens": message.usage.output_tokens,
-            },
+            usage=self._usage_dict(message.usage),
         )
 
     # ------------------------------------------------------------------
@@ -440,7 +445,10 @@ class AnthropicBackend(ModelBackend):
         """
         api_messages = _coalesce_messages(messages)
         all_tool_calls: list[ToolCall] = []
-        total_usage = {"input_tokens": 0, "output_tokens": 0}
+        total_usage = {
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+        }
         start = time.monotonic()
         iteration = 0
 
@@ -465,8 +473,8 @@ class AnthropicBackend(ModelBackend):
                     f"(iteration {iteration})"
                 )
 
-            total_usage["input_tokens"] += response.usage.input_tokens
-            total_usage["output_tokens"] += response.usage.output_tokens
+            for k, v in self._usage_dict(response.usage).items():
+                total_usage[k] = total_usage.get(k, 0) + v
 
             # If the model didn't request tool use, extract final text and return
             if response.stop_reason != "tool_use":
@@ -560,8 +568,8 @@ class AnthropicBackend(ModelBackend):
                         f"(final text call)"
                     )
 
-                total_usage["input_tokens"] += response.usage.input_tokens
-                total_usage["output_tokens"] += response.usage.output_tokens
+                for k, v in self._usage_dict(response.usage).items():
+                    total_usage[k] = total_usage.get(k, 0) + v
                 text = _extract_text(response.content)
                 elapsed = time.monotonic() - start
                 return ModelResult(
