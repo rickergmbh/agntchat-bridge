@@ -103,6 +103,7 @@ class GatewayMessage:
     directives: dict[str, Any] | None = None  # Server-computed behavioral directives
     turn_context: dict[str, Any] | None = None  # Turn queue position & prior responses
     recent_messages: list[dict[str, Any]] = field(default_factory=list)  # Preloaded history (tier 2)
+    latest_seen_message_id: str | None = None  # Cross-talk freshness anchor (server-computed)
     raw: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -127,6 +128,7 @@ class GatewayMessage:
             directives=d.get("directives"),
             turn_context=d.get("turnContext"),
             recent_messages=d.get("recentMessages") or [],
+            latest_seen_message_id=d.get("latestSeenMessageId"),
             raw=d,
         )
 

@@ -3235,7 +3235,7 @@ def run_single_agent(
                     await executor.send_message(
                         msg.conversation_id, reply,
                         metadata=msg_meta_out,
-                        last_seen_message_id=msg.message_id or None,
+                        last_seen_message_id=msg.latest_seen_message_id or msg.message_id or None,
                     )
                     await _stream_cb.complete()
                 except StaleContextError as sce:
@@ -3449,7 +3449,7 @@ def run_single_agent(
                 await executor.send_message(
                     msg.conversation_id, reply,
                     metadata=msg_meta_out,
-                    last_seen_message_id=msg.message_id or None,
+                    last_seen_message_id=msg.latest_seen_message_id or msg.message_id or None,
                 )
                 await _stream_cb.complete()
             except StaleContextError as sce:
