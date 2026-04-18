@@ -79,7 +79,12 @@ class PhoenixTransport:
 
     @property
     def connected(self) -> bool:
-        return self._ws is not None and self._ws.open
+        # `websockets` 12+ removed `.open` in favor of `.state`, but the most
+        # portable signal across versions is `close_code` — None while the
+        # connection is alive, set when the peer or we close it.
+        if self._ws is None:
+            return False
+        return getattr(self._ws, "close_code", None) is None
 
     # ------------------------------------------------------------------
     # Channel operations
