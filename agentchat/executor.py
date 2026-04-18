@@ -36,6 +36,7 @@ import httpx
 from ._dedup import MessageDedup
 from .auth import TokenManager
 from .errors import AgentChatError, AuthError, StaleContextError
+from .transport import PhoenixTransport
 
 logger = logging.getLogger("agentchat.executor")
 
@@ -237,6 +238,17 @@ class ExecutorClient:
         self._api_client: httpx.AsyncClient | None = None
         self._poll_client: httpx.AsyncClient | None = None
 
+        # Phase 1 WS gateway: prefer WebSocket push over HTTP long-poll when healthy.
+        # Derive WS URL from base URL.
+        ws_scheme = "wss" if self._base_url.startswith("https") else "ws"
+        host = self._base_url.split("://", 1)[1]
+        self._ws_url = f"{ws_scheme}://{host}/socket/websocket"
+        self._ws_transport: PhoenixTransport | None = None
+        # _ws_healthy signals that the long-poll loops should SLEEP instead of
+        # hitting the gateway endpoints. On WS disconnect, this flips to False
+        # and polling resumes automatically as the HTTP fallback.
+        self._ws_healthy: bool = False
+
     # ------------------------------------------------------------------
     # Decorator
     # ------------------------------------------------------------------
@@ -362,9 +374,9 @@ class ExecutorClient:
         )
 
         # Run task poll, message poll, scope request poll, and heartbeat.
-        # Message delivery is event-driven server-side: the long-poll endpoint
-        # uses PubSub to wake instantly when a message is queued, so no
-        # additional WS push listener is needed.
+        # The HTTP long-poll endpoints stay available as fallback — when the
+        # WS gateway is healthy, each poll loop sleeps instead of making the
+        # request. On WS disconnect, the loops resume transparently.
         loops = []
         if self._task_handler:
             loops.append(self._task_poll_loop())
@@ -373,6 +385,7 @@ class ExecutorClient:
         if self._scope_request_handler:
             loops.append(self._scope_request_poll_loop())
         loops.append(self._heartbeat_loop())
+        loops.append(self._ws_gateway_loop())
 
         await asyncio.gather(*loops)
 
@@ -394,12 +407,15 @@ class ExecutorClient:
         return base + jitter
 
     async def _task_poll_loop(self) -> None:
-        """Poll for tasks until stopped."""
+        """Poll for tasks until stopped. Paused while the WS gateway is healthy."""
         # Stagger initial poll to avoid thundering herd when multiple agents start
         import random
         await asyncio.sleep(random.uniform(0, 2))
         consecutive_errors = 0
         while self._running:
+            if self._ws_healthy:
+                await asyncio.sleep(2)
+                continue
             try:
                 await self._poll_once()
                 consecutive_errors = 0
@@ -425,11 +441,14 @@ class ExecutorClient:
                 await asyncio.sleep(delay)
 
     async def _message_poll_loop(self) -> None:
-        """Poll for messages until stopped."""
+        """Poll for messages until stopped. Paused while the WS gateway is healthy."""
         import random
         await asyncio.sleep(random.uniform(0, 2))
         consecutive_errors = 0
         while self._running:
+            if self._ws_healthy:
+                await asyncio.sleep(2)
+                continue
             try:
                 await self._poll_messages_once()
                 consecutive_errors = 0
@@ -453,6 +472,192 @@ class ExecutorClient:
                 delay = self._backoff_delay(consecutive_errors)
                 logger.exception("Message poll error, retrying in %.1fs...", delay)
                 await asyncio.sleep(delay)
+
+    # ------------------------------------------------------------------
+    # Phase 1 WS gateway
+    # ------------------------------------------------------------------
+
+    async def _ws_gateway_loop(self) -> None:
+        """Maintain a WebSocket connection to user:{agent_id} for push delivery.
+
+        When the WS is healthy, the poll loops pause (see their top-of-loop guard
+        on self._ws_healthy). Gateway messages/tasks/scope-requests are pushed
+        to this connection as events with full payloads — no HTTP round-trip for
+        delivery. Acks still go over HTTP.
+
+        On disconnect, self._ws_healthy flips to False and the HTTP poll loops
+        resume transparently as the fallback transport. The atomic SELECT FOR
+        UPDATE SKIP LOCKED on Gateway.claim_next_message prevents duplicate
+        delivery when both paths are briefly active during reconnect.
+        """
+        import random
+        # Small delay so startup logs read linearly
+        await asyncio.sleep(1.0)
+
+        consecutive_errors = 0
+        while self._running:
+            transport: PhoenixTransport | None = None
+            try:
+                transport = PhoenixTransport(self._ws_url, self._token_manager)
+                transport.on_event(self._ws_dispatch_event)
+                transport.on_disconnect(self._on_ws_disconnect)
+                await transport.connect()
+
+                # Join user:{agent_id} with executor_id. The server-side
+                # UserChannel uses this to route gateway claims to this executor
+                # and push full payloads (see backend user_channel.ex:bind_executor).
+                await transport.join(
+                    f"user:{self._agent_id}",
+                    params={"executor_id": self._executor_id},
+                )
+                self._ws_transport = transport
+                self._ws_healthy = True
+                consecutive_errors = 0
+                logger.info(
+                    "[WS-GATEWAY] Connected and joined user:%s as executor %s — HTTP poll loops paused",
+                    self._agent_id, self._executor_id,
+                )
+
+                # Stay alive until the transport disconnects. The receive loop
+                # inside the transport calls our on_disconnect callback which
+                # flips self._ws_healthy back to False and lets the polls resume.
+                while self._running and transport.connected:
+                    await asyncio.sleep(5)
+
+                # Exited the inner loop — either self._running is False (shutdown)
+                # or the transport lost its connection.
+                self._ws_healthy = False
+                if self._running:
+                    logger.info("[WS-GATEWAY] Disconnected — HTTP poll loops resuming as fallback")
+
+            except Exception as e:
+                self._ws_healthy = False
+                consecutive_errors += 1
+                delay = self._backoff_delay(consecutive_errors)
+                logger.warning(
+                    "[WS-GATEWAY] Connection attempt failed (%s: %s); "
+                    "HTTP polls active, retrying in %.1fs",
+                    type(e).__name__, e, delay,
+                )
+                # Teardown any half-open state
+                if transport is not None:
+                    try:
+                        await transport.disconnect()
+                    except Exception:
+                        pass
+                self._ws_transport = None
+                await asyncio.sleep(delay)
+                continue
+            finally:
+                # Clean disconnect on exit (either loop iteration end or shutdown)
+                if transport is not None and transport is self._ws_transport:
+                    try:
+                        await transport.disconnect()
+                    except Exception:
+                        pass
+                    self._ws_transport = None
+
+    def _on_ws_disconnect(self) -> None:
+        """Transport-driven disconnect callback. Flips health flag; polls resume."""
+        self._ws_healthy = False
+
+    def _ws_dispatch_event(self, topic: str, event: str, payload: dict) -> None:
+        """Sync callback from PhoenixTransport. Schedules the async handler.
+
+        Parses gateway events into the same GatewayMessage/Task/ScopeRequest
+        dataclasses the poll path uses, then dispatches to the same wrappers —
+        so handler, dedup, ack, and concurrency semantics are identical across
+        WS and HTTP paths.
+        """
+        if not topic.startswith("user:"):
+            return
+
+        if event == "gateway_message":
+            # Signal-only payload ({} with no fields) is the legacy hint for
+            # long-poll clients that haven't bound an executor_id. Ignore it —
+            # if we bound executor_id we only expect full payloads here.
+            if not payload or not payload.get("id"):
+                return
+            asyncio.ensure_future(self._handle_ws_message(payload))
+
+        elif event == "gateway_task":
+            if not payload or not payload.get("id"):
+                return
+            asyncio.ensure_future(self._handle_ws_task(payload))
+
+        elif event == "gateway_scope_request":
+            if not payload or not payload.get("id"):
+                return
+            asyncio.ensure_future(self._handle_ws_scope_request(payload))
+
+    async def _handle_ws_message(self, payload: dict) -> None:
+        try:
+            msg = GatewayMessage.from_dict(payload)
+        except Exception:
+            logger.exception("[WS-GATEWAY] Failed to parse gateway_message payload")
+            return
+
+        if self._message_dedup.is_duplicate(msg.message_id):
+            logger.info("[WS-GATEWAY] Skipping duplicate message %s (already processed)", msg.message_id)
+            try:
+                await self._post(
+                    f"/api/gateway/messages/{msg.id}/ack",
+                    json={"executor_id": self._executor_id},
+                )
+            except Exception:
+                pass
+            return
+
+        logger.info(
+            "[WS-GATEWAY] Received message from %s in %s (queue_id=%s)",
+            msg.sender_name, msg.conversation_id, msg.id,
+        )
+        if self._semaphore is None or self._message_handler is None:
+            return
+        await self._semaphore.acquire()
+        t = asyncio.create_task(self._handle_message_wrapper(msg))
+        self._background_tasks.add(t)
+        t.add_done_callback(self._background_tasks.discard)
+
+    async def _handle_ws_task(self, payload: dict) -> None:
+        try:
+            task = GatewayTask.from_dict(payload)
+        except Exception:
+            logger.exception("[WS-GATEWAY] Failed to parse gateway_task payload")
+            return
+        logger.info("[WS-GATEWAY] Received task: %s (queue_id=%s)", task.title, task.id)
+        if self._semaphore is None or self._task_handler is None:
+            return
+        await self._semaphore.acquire()
+        t = asyncio.create_task(self._handle_task_wrapper(task))
+        self._background_tasks.add(t)
+        t.add_done_callback(self._background_tasks.discard)
+
+    async def _handle_ws_scope_request(self, payload: dict) -> None:
+        try:
+            sr = ScopeRequest.from_dict(payload)
+        except Exception:
+            logger.exception("[WS-GATEWAY] Failed to parse gateway_scope_request payload")
+            return
+        if self._scope_request_handler is None:
+            return
+        logger.info("[WS-GATEWAY] Received scope request %s for conversation %s", sr.id, sr.conversation_id)
+        try:
+            result = await asyncio.wait_for(
+                self._scope_request_handler(sr),
+                timeout=25,
+            )
+            if result and isinstance(result, dict):
+                await self.respond_to_scope_request(
+                    sr.id,
+                    title=result.get("title", ""),
+                    description=result.get("description"),
+                    scope_message=result.get("scope_message"),
+                )
+        except asyncio.TimeoutError:
+            logger.warning("[WS-GATEWAY] Scope request handler timed out for %s", sr.id)
+        except Exception:
+            logger.exception("[WS-GATEWAY] Scope request handler failed for %s", sr.id)
 
     async def _heartbeat_loop(self) -> None:
         """Send periodic heartbeats with process metrics to keep the executor online."""
@@ -506,6 +711,15 @@ class ExecutorClient:
     async def stop(self) -> None:
         """Signal the poll loop to stop and deregister executor."""
         self._running = False
+        self._ws_healthy = False
+
+        # Close WS transport so the gateway loop unblocks and exits cleanly
+        if self._ws_transport is not None:
+            try:
+                await self._ws_transport.disconnect()
+            except Exception:
+                pass
+            self._ws_transport = None
 
         # Deregister executor so backend marks agent offline immediately
         if self._executor_id:
@@ -1706,11 +1920,14 @@ class ExecutorClient:
         )
 
     async def _scope_request_poll_loop(self) -> None:
-        """Poll for scope requests until stopped."""
+        """Poll for scope requests until stopped. Paused while the WS gateway is healthy."""
         import random
         await asyncio.sleep(random.uniform(0, 2))
         consecutive_errors = 0
         while self._running:
+            if self._ws_healthy:
+                await asyncio.sleep(2)
+                continue
             try:
                 await self._poll_scope_requests_once()
                 consecutive_errors = 0

@@ -85,14 +85,14 @@ class PhoenixTransport:
     # Channel operations
     # ------------------------------------------------------------------
 
-    async def join(self, topic: str) -> dict:
-        """Join a channel topic. Returns the server reply payload."""
+    async def join(self, topic: str, params: dict | None = None) -> dict:
+        """Join a channel topic with optional params. Returns the server reply payload."""
         ref = self._next_ref()
         fut: asyncio.Future[dict] = asyncio.get_event_loop().create_future()
         self._pending[ref] = fut
         # For phx_join, join_ref == ref
         self._join_refs[topic] = ref
-        msg = [ref, ref, topic, "phx_join", {}]
+        msg = [ref, ref, topic, "phx_join", params or {}]
         await self._send_raw(msg)
         try:
             reply = await asyncio.wait_for(fut, timeout=10)
