@@ -319,20 +319,38 @@ class ExecutorClient:
 
         # Create persistent HTTP clients (connection pooling eliminates
         # repeated TLS handshakes — saves ~200-400ms per request).
-        self._api_client = httpx.AsyncClient(timeout=30)
+        # Startup-phase timeout is generous (60s) because /api/me and
+        # /api/auth/agent-token touch the DB and can lag during Supabase
+        # pooler pressure — a slow startup is fine, a crashed one is not.
+        self._api_client = httpx.AsyncClient(timeout=60)
         self._poll_client = httpx.AsyncClient(timeout=self._poll_timeout)
 
         # Authenticate
         logger.info("Authenticating as agent %s...", self._agent_id)
         await self._token_manager.get_token()
 
-        # Validate credentials by fetching profile
-        try:
-            profile = await self._get("/api/me")
-            display_name = profile.get("displayName", "?")
-            logger.info("Authenticated as '%s' (id=%s)", display_name, self._agent_id)
-        except Exception as e:
-            raise AuthError(f"Credential validation failed — check AGENT_ID and API key: {e}")
+        # Validate credentials by fetching profile. Retry once on network
+        # timeouts so a single slow /api/me doesn't abort the whole startup.
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                profile = await self._get("/api/me")
+                display_name = profile.get("displayName", "?")
+                logger.info("Authenticated as '%s' (id=%s)", display_name, self._agent_id)
+                last_exc = None
+                break
+            except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError) as e:
+                last_exc = e
+                if attempt == 0:
+                    logger.warning("Profile fetch timed out (%s); retrying once...", e)
+                    await asyncio.sleep(2)
+            except Exception as e:
+                raise AuthError(f"Credential validation failed — check AGENT_ID and API key: {e}")
+
+        if last_exc is not None:
+            raise AuthError(
+                f"Credential validation failed after retry — backend unreachable or overloaded: {last_exc}"
+            )
 
         # Register executor
         await self._register()
