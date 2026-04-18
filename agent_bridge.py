@@ -1979,7 +1979,6 @@ def make_stream_callback(
     stream_id: str,
     *,
     task_progress_cb: Any | None = None,
-    tool_use: bool = False,
     suppress_stream: bool = False,
 ):
     """Create an on_progress callback that forwards text deltas to the streaming endpoint.
@@ -1992,10 +1991,11 @@ def make_stream_callback(
     inside the Anthropic streaming loop causes the stream to stall or timeout, which
     triggers silent fallback to batch mode.
 
-    When *tool_use* is True, text streaming is suppressed during the first iteration.
-    Iteration 1 text is typically a "let me check..." preamble before tool calls.
-    The user sees "Processing..." and "Using tool..." phases, then real text only
-    streams once tools are done and the LLM produces its final answer.
+    Text is always streamed to the client as it arrives. When the model transitions
+    to a tool call mid-stream, the phase changes to "tool_call" and the client's
+    streamingStore auto-clears the in-progress text (see streamingStore.ts:108) so
+    pre-tool preamble doesn't linger. When the tool completes and the model starts
+    emitting its final answer, text streams again with a fresh phase="writing".
 
     When *suppress_stream* is True, streaming updates to the conversation are skipped
     entirely. Only task_progress_cb (if provided) receives events. Used when a task
@@ -2005,7 +2005,6 @@ def make_stream_callback(
     _pending_tasks: list[asyncio.Task[None]] = []
     _iteration = 0
     _had_tool_calls = False  # Whether ANY iteration so far used tools
-    _text_suppressed = tool_use  # Suppress first iteration text in tool-use mode only
 
     def _fire_and_forget(coro) -> None:
         """Schedule a coroutine without blocking the caller."""
@@ -2014,7 +2013,7 @@ def make_stream_callback(
         task.add_done_callback(lambda t: _pending_tasks.remove(t) if t in _pending_tasks else None)
 
     async def on_progress(event: dict[str, Any]) -> None:
-        nonlocal _started, _iteration, _had_tool_calls, _text_suppressed
+        nonlocal _started, _iteration, _had_tool_calls
         event_type = event.get("type", "")
 
         # Forward to task progress callback too (if task-based)
@@ -2028,12 +2027,7 @@ def make_stream_callback(
             detail = "Analyzing..." if not _started else None
             if not _started:
                 _started = True
-                _text_suppressed = True  # Suppress text in first iteration
                 logger.info("[stream:%s] started (thinking)", stream_id[:8])
-            else:
-                # New iteration after tool calls — this is the final answer, un-suppress
-                if _had_tool_calls:
-                    _text_suppressed = False
             if not suppress_stream:
                 _fire_and_forget(executor.send_stream_update(
                     conversation_id, stream_id,
@@ -2044,7 +2038,7 @@ def make_stream_callback(
             accumulated = event.get("accumulated", "")
             if accumulated:
                 logger.info("[stream:%s] text_delta (%d chars)", stream_id[:8], len(accumulated))
-                if not _text_suppressed and not suppress_stream:
+                if not suppress_stream:
                     _fire_and_forget(executor.send_stream_update(
                         conversation_id, stream_id,
                         content=accumulated, status="streaming", phase="writing",
@@ -2090,14 +2084,9 @@ def make_stream_callback(
             conversation_id, stream_id, status="cancelled",
         )
 
-    def set_tool_use(enabled: bool) -> None:
-        nonlocal _text_suppressed
-        _text_suppressed = enabled
-
     on_progress.complete = complete  # type: ignore[attr-defined]
     on_progress.cancel = cancel  # type: ignore[attr-defined]
     on_progress.stream_id = stream_id  # type: ignore[attr-defined]
-    on_progress.set_tool_use = set_tool_use  # type: ignore[attr-defined]
     return on_progress
 
 
@@ -2759,7 +2748,6 @@ def run_single_agent(
                 "source_type": "task",
             }
             tool_exec = ToolExecutor(executor, context=tool_context, resolved_tools=resolved_tools)
-            _task_stream_cb.set_tool_use(True)
             result = await backend.chat_with_tools(
                 task_prompt, chat_messages, _tool_defs, tool_exec,
                 on_progress=_task_stream_cb,
@@ -3177,7 +3165,6 @@ def run_single_agent(
         if execution_mode == "tool_use" and _tool_defs:
             tool_context = {"conversation_id": msg.conversation_id, "owner_id": agent_owner_id, "source_type": "message"}
             tool_exec = ToolExecutor(executor, context=tool_context, resolved_tools=resolved_tools)
-            _stream_cb.set_tool_use(True)
             _tu_failed = False
             try:
                 result = await backend.chat_with_tools(
