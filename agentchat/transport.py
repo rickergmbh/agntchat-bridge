@@ -240,16 +240,23 @@ class PhoenixTransport:
                 if not self.connected:
                     break
 
-                # Retry heartbeat up to _HEARTBEAT_RETRIES times
+                # Retry heartbeat up to _HEARTBEAT_RETRIES times. We WAIT for
+                # phx_reply here — `push_no_reply` would happily succeed against
+                # a half-dead socket (one-way TCP: our kernel buffers outbound
+                # data, but no ACKs come back). Requiring a reply forces a real
+                # round-trip, so silent deaths get caught within ~10s and the
+                # force-close below kicks the reconnect loop.
                 sent = False
                 for attempt in range(1, _HEARTBEAT_RETRIES + 1):
                     try:
-                        await self.push_no_reply("phoenix", "heartbeat", {})
+                        # `push` has an internal 10s timeout on phx_reply;
+                        # ChannelError bubbles up if the server never replies.
+                        await self.push("phoenix", "heartbeat", {})
                         sent = True
                         break
                     except Exception:
                         logger.warning(
-                            f"Heartbeat send failed (attempt {attempt}/{_HEARTBEAT_RETRIES})"
+                            f"Heartbeat send/reply failed (attempt {attempt}/{_HEARTBEAT_RETRIES})"
                         )
                         if attempt < _HEARTBEAT_RETRIES:
                             await asyncio.sleep(_HEARTBEAT_RETRY_DELAY)
