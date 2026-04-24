@@ -52,7 +52,7 @@ for _env_candidate in [
     os.path.join(os.path.dirname(__file__), "..", ".env"),        # desktop/
 ]:
     if os.path.isfile(_env_candidate):
-        with open(_env_candidate) as _f:
+        with open(_env_candidate, encoding="utf-8") as _f:
             for _line in _f:
                 _line = _line.strip()
                 if _line and not _line.startswith("#") and "=" in _line:
@@ -2254,7 +2254,7 @@ def resolve_credentials() -> list[dict[str, str]]:
 
 def load_config_file(path: str) -> list[dict[str, str]]:
     """Load multi-agent config from a JSON file."""
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         agents = json.load(f)
 
     if not isinstance(agents, list):

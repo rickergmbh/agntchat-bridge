@@ -25,6 +25,8 @@ import asyncio
 import json
 import os
 import re
+import shutil
+import sys
 import tempfile
 import time
 from typing import Any
@@ -33,6 +35,44 @@ import logging
 
 from . import ChatMessage, ModelBackend, ModelResult, ProgressCallback, ToolCall
 from ..tools.parsing import parse_tool_calls
+
+
+def _resolve_cli_path(path: str) -> str:
+    """Resolve the CLI to an absolute path that the OS can actually launch.
+
+    On Windows, npm installs `claude` as a `.cmd` shim — the bare name is
+    not what CreateProcess sees. `shutil.which` respects PATHEXT so it
+    returns the real `claude.cmd` path (or the .ps1/.bat equivalent).
+    """
+    resolved = shutil.which(path)
+    return resolved or path
+
+
+def _write_temp(content: str, suffix: str, prefix: str, cleanup: list[str]) -> str:
+    """Write `content` to a new temp file (utf-8) and record it for cleanup."""
+    fd, path = tempfile.mkstemp(suffix=suffix, prefix=prefix)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(content)
+    cleanup.append(path)
+    return path
+
+
+def _spawn_argv(cmd: list[str]) -> list[str]:
+    """Adjust argv so asyncio.create_subprocess_exec can launch it on Windows.
+
+    Windows' CreateProcess can't execute shim scripts directly — it only
+    runs real `.exe` files. npm's global bin (where Claude Code lives) is
+    exactly these shims, so we route through `cmd.exe /c` for `.cmd`/`.bat`
+    and `powershell.exe -File` for `.ps1`. Non-Windows is unchanged.
+    """
+    if sys.platform != "win32" or not cmd:
+        return cmd
+    exe_lower = cmd[0].lower()
+    if exe_lower.endswith((".cmd", ".bat")):
+        return ["cmd.exe", "/c", *cmd]
+    if exe_lower.endswith(".ps1"):
+        return ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", *cmd]
+    return cmd
 
 # Patterns detected in streaming text to report semantic progress (same as anthropic backend).
 _SECTION_PATTERNS = [
@@ -152,7 +192,9 @@ class ClaudeCliBackend(ModelBackend):
         api_key: str | None = None,
         **_kwargs: Any,
     ) -> None:
-        self._cli_path = cli_path or os.getenv("CLAUDE_CLI_PATH", _DEFAULT_CLI_PATH)
+        self._cli_path = _resolve_cli_path(
+            cli_path or os.getenv("CLAUDE_CLI_PATH", _DEFAULT_CLI_PATH)
+        )
         self._model = model or os.getenv("CLAUDE_CLI_MODEL")
         self._timeout = (
             timeout
@@ -235,11 +277,14 @@ class ClaudeCliBackend(ModelBackend):
             logger.warning("MCP server script not found — AgentGram tools won't be available")
             return ""
 
+        # Use the interpreter currently running the bridge — guaranteed to
+        # exist on every platform (vs. hardcoded `python3`, which isn't on
+        # Windows by default) and shares the bridge's installed deps.
         config = {
             "mcpServers": {
                 "agentgram": {
                     "type": "stdio",
-                    "command": "python3",
+                    "command": sys.executable,
                     "args": [self._mcp_server_script],
                     "env": {
                         "AGENTGRAM_API_URL": self._api_url,
@@ -330,11 +375,13 @@ class ClaudeCliBackend(ModelBackend):
         conversation_id: str = "",
         task_id: str = "",
         owner_id: str = "",
-    ) -> tuple[list[str], str]:
+    ) -> tuple[list[str], str, list[str]]:
         """Build the base CLI command with all standard flags.
 
-        Returns (cmd, prompt) — the prompt is piped via stdin to avoid
-        OS argument-length limits (images can exceed macOS's ~1MB limit).
+        Returns (cmd, prompt, cleanup_paths) — the prompt is piped via stdin
+        to avoid OS argument-length limits (images can exceed macOS's ~1MB
+        limit). ``cleanup_paths`` are temp files the caller must unlink
+        after the subprocess exits.
 
         Applied to every invocation:
           --no-session-persistence  Don't write session files to disk
@@ -349,6 +396,8 @@ class ClaudeCliBackend(ModelBackend):
         the default Claude Code identity. The CLI's built-in identity rejects
         appended overrides as prompt injection, breaking agent personas.
         """
+        cleanup_paths: list[str] = []
+
         # Prompt is piped via stdin, not passed as -p argument
         cmd = [self._cli_path, "-p", "-"]
 
@@ -359,7 +408,14 @@ class ClaudeCliBackend(ModelBackend):
         cmd.append("--strict-mcp-config")
 
         if system_prompt:
-            cmd.extend(["--system-prompt", system_prompt])
+            if sys.platform == "win32":
+                # Windows routes `.cmd` shims through `cmd.exe /c`, which
+                # re-interprets `%VAR%`, `&`, `|`, `^`, `<`, `>` in argv.
+                # Soul.md commonly contains those characters, so write the
+                # prompt to a temp file and pass --system-prompt-file.
+                cmd.extend(["--system-prompt-file", _write_temp(system_prompt, ".txt", "agentchat_sp_", cleanup_paths)])
+            else:
+                cmd.extend(["--system-prompt", system_prompt])
         if self._max_tokens:
             cmd.extend(["--settings", json.dumps({"maxOutputTokens": self._max_tokens})])
         if self._model:
@@ -392,9 +448,23 @@ class ClaudeCliBackend(ModelBackend):
                 resolved_tools, conversation_id, task_id, owner_id,
             )
             if mcp_config:
-                cmd.extend(["--mcp-config", mcp_config])
+                if sys.platform == "win32":
+                    # Same rationale as --system-prompt-file: API URLs with
+                    # `?a=1&b=2` or env values with `%` would be re-parsed
+                    # by cmd.exe. The CLI accepts a JSON file path here.
+                    cmd.extend(["--mcp-config", _write_temp(mcp_config, ".json", "agentchat_mcp_", cleanup_paths)])
+                else:
+                    cmd.extend(["--mcp-config", mcp_config])
 
-        return cmd, user_prompt
+        return cmd, user_prompt, cleanup_paths
+
+    @staticmethod
+    def _cleanup_temp_files(paths: list[str]) -> None:
+        for p in paths:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
 
     def set_mcp_context(
         self,
@@ -420,7 +490,7 @@ class ClaudeCliBackend(ModelBackend):
         user_prompt: str,
         on_progress: ProgressCallback | None = None,
     ) -> ModelResult:
-        cmd, prompt = self._base_cmd(
+        cmd, prompt, cleanup = self._base_cmd(
             user_prompt, system_prompt,
             resolved_tools=self._mcp_resolved_tools,
             conversation_id=self._mcp_conversation_id,
@@ -428,9 +498,12 @@ class ClaudeCliBackend(ModelBackend):
             owner_id=self._mcp_owner_id,
         )
 
-        if on_progress:
-            return await self._generate_streaming(cmd, on_progress, prompt)
-        return await self._generate_batch(cmd, prompt)
+        try:
+            if on_progress:
+                return await self._generate_streaming(cmd, on_progress, prompt)
+            return await self._generate_batch(cmd, prompt)
+        finally:
+            self._cleanup_temp_files(cleanup)
 
     # ------------------------------------------------------------------
     # Batch mode (original behavior, no progress)
@@ -452,7 +525,7 @@ class ClaudeCliBackend(ModelBackend):
     async def _generate_batch(self, cmd: list[str], prompt: str = "") -> ModelResult:
         start = time.monotonic()
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
+            *_spawn_argv(cmd),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -516,7 +589,7 @@ class ClaudeCliBackend(ModelBackend):
         start = time.monotonic()
 
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
+            *_spawn_argv(cmd),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -700,7 +773,7 @@ class ClaudeCliBackend(ModelBackend):
                 conversation.append(f"{prefix}: {_content_to_cli_text(msg.content)}")
             user_prompt = "\n\n".join(conversation)
 
-            cmd, prompt = self._base_cmd(
+            cmd, prompt, cleanup = self._base_cmd(
                 user_prompt, system_prompt,
                 resolved_tools=mcp_tools,
                 conversation_id=self._mcp_conversation_id,
@@ -722,12 +795,15 @@ class ClaudeCliBackend(ModelBackend):
                     _debug_cmd.append(arg)
             logger.info("CLI command: %s | prompt_len=%d", " ".join(_debug_cmd), len(prompt))
 
-            start = time.monotonic()
-            if on_progress:
-                result = await self._generate_streaming(cmd, on_progress, prompt)
-            else:
-                result = await self._generate_batch(cmd, prompt)
-            elapsed = time.monotonic() - start
+            try:
+                start = time.monotonic()
+                if on_progress:
+                    result = await self._generate_streaming(cmd, on_progress, prompt)
+                else:
+                    result = await self._generate_batch(cmd, prompt)
+                elapsed = time.monotonic() - start
+            finally:
+                self._cleanup_temp_files(cleanup)
 
             return ModelResult(
                 text=result.text,
@@ -774,7 +850,7 @@ class ClaudeCliBackend(ModelBackend):
                 break
 
             user_prompt = "\n\n".join(conversation)
-            cmd, prompt = self._base_cmd(user_prompt, full_system)
+            cmd, prompt, cleanup = self._base_cmd(user_prompt, full_system)
 
             try:
                 if on_progress:
@@ -792,6 +868,8 @@ class ClaudeCliBackend(ModelBackend):
                     iterations=iteration,
                     stop_reason="error",
                 )
+            finally:
+                self._cleanup_temp_files(cleanup)
 
             remaining_text, calls = parse_tool_calls(result.text)
 
@@ -878,13 +956,15 @@ class ClaudeCliBackend(ModelBackend):
             if len(all_tool_calls) >= max_tool_calls:
                 logger.warning("Max tool calls (%d) reached, forcing final response", max_tool_calls)
                 final_prompt = "\n\n".join(conversation)
-                cmd, prompt = self._base_cmd(final_prompt, system_prompt)
+                cmd, prompt, cleanup = self._base_cmd(final_prompt, system_prompt)
 
                 try:
                     final = await self._generate_batch(cmd, prompt)
                     remaining_text = final.text
                 except Exception:
                     remaining_text = results_text[:5000]
+                finally:
+                    self._cleanup_temp_files(cleanup)
 
                 elapsed = time.monotonic() - start
                 return ModelResult(
