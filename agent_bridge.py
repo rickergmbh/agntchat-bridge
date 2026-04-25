@@ -3038,6 +3038,27 @@ def run_single_agent(
             msg.content[:100],
         )
 
+        async def _cancel_signal_bubble() -> None:
+            """Clear the backend's InstantAgentSignal "thinking" bubble.
+
+            When a message is queued for an agent the backend paints a signal
+            stream (`signal:{agent_id}:{int}`) so the bubble appears within
+            ~50ms of send. If we then early-return without invoking the LLM,
+            nothing else cancels it and it ghosts for ~90s until the
+            TimeoutServer sweep. The streaming endpoint cancels by senderId,
+            not stream_id, so any cancel from this agent clears it.
+            """
+            if not msg.conversation_id:
+                return
+            try:
+                await executor.send_stream_update(
+                    msg.conversation_id,
+                    f"signal-cancel:{msg.id}",
+                    status="cancelled",
+                )
+            except Exception:
+                pass  # best-effort; bubble would otherwise expire on its own
+
         # --- Read behavioral directives from server ---
         # Use fresh server directives when available. If the preloader timed
         # out (no directives in response), fall back to per-conversation cached
@@ -3063,6 +3084,7 @@ def run_single_agent(
         # --- Skip message if server directive says so (final decision, no override) ---
         if skip_message:
             logger.info("[%s] Skipping message per directive: %s", executor_key, skip_reason)
+            await _cancel_signal_bubble()
             return None
 
         # --- Trivial/engagement filter (server-computed decision) ---
@@ -3072,6 +3094,7 @@ def run_single_agent(
                 "[%s] Skipping message (%s): '%s'",
                 executor_key, skip_trivial_reason, msg.content[:60],
             )
+            await _cancel_signal_bubble()
             return None
 
         # --- CTA action handler (direct execution, no LLM needed) ---
