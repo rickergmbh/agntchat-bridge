@@ -3107,16 +3107,15 @@ def run_single_agent(
             if result_msg is not None:
                 return result_msg
 
-        # --- Create stream early so StreamingBubble appears immediately ---
-        # This fires before history/location loading, so the user sees feedback
-        # within ~200ms of sending their message.
+        # Create the stream callback now so the LLM's first real event has
+        # something to fire through. We deliberately do NOT broadcast a
+        # speculative "started/thinking" event here — that used to fire
+        # before history/location loading and before the LLM was even
+        # called, which over-promised work that wasn't happening yet. The
+        # first emission now comes from make_stream_callback when the LLM
+        # actually produces a thinking_block / text_delta / tool_call.
         _msg_stream_id = str(uuid.uuid4())
         _stream_cb = make_stream_callback(executor, msg.conversation_id, _msg_stream_id)
-        if msg.conversation_id:
-            asyncio.create_task(executor.send_stream_update(
-                msg.conversation_id, _msg_stream_id,
-                status="started", phase="thinking",
-            ))
 
         # --- Fetch conversation history + location in parallel ---
         # Use pre-loaded messages from gateway response (tier 2) when available,
