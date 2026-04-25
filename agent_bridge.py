@@ -3107,15 +3107,19 @@ def run_single_agent(
             if result_msg is not None:
                 return result_msg
 
-        # Create the stream callback now so the LLM's first real event has
-        # something to fire through. We deliberately do NOT broadcast a
-        # speculative "started/thinking" event here — that used to fire
-        # before history/location loading and before the LLM was even
-        # called, which over-promised work that wasn't happening yet. The
-        # first emission now comes from make_stream_callback when the LLM
-        # actually produces a thinking_block / text_delta / tool_call.
+        # Paint the streaming bubble as soon as the bridge accepts the
+        # message — by this point the agent has been chosen for delivery,
+        # passed the skipMessage / skipTrivialMessage filters, and is
+        # committed to invoking the LLM. The user sees "Thinking..." as
+        # acknowledgement that we're processing, then it transitions to
+        # the real LLM phases (tool_call/writing) as those events fire.
         _msg_stream_id = str(uuid.uuid4())
         _stream_cb = make_stream_callback(executor, msg.conversation_id, _msg_stream_id)
+        if msg.conversation_id:
+            asyncio.create_task(executor.send_stream_update(
+                msg.conversation_id, _msg_stream_id,
+                status="started", phase="thinking",
+            ))
 
         # --- Fetch conversation history + location in parallel ---
         # Use pre-loaded messages from gateway response (tier 2) when available,
