@@ -203,7 +203,7 @@ class ExecutorClient:
         poll_timeout: int = 90,
         task_timeout: int = 1800,
         message_timeout: int = 300,
-        heartbeat_interval: int = 120,
+        heartbeat_interval: int = 300,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._agent_id = agent_id
@@ -377,10 +377,14 @@ class ExecutorClient:
             self._executor_id,
         )
 
-        # Run task poll, message poll, scope request poll, and heartbeat.
-        # The HTTP long-poll endpoints stay available as fallback — when the
-        # WS gateway is healthy, each poll loop sleeps instead of making the
-        # request. On WS disconnect, the loops resume transparently.
+        # Loop topology:
+        # - WS gateway: primary push delivery. Active always; reconnects on disconnect.
+        # - Per-endpoint poll loops (tasks/messages/scope): active only when WS is
+        #   unhealthy — full long-polls are the fallback transport.
+        # - Combined floor loop: single safety-net poll covering all three kinds
+        #   while WS is healthy. Replaces the per-endpoint floor mode (3 polls
+        #   per cycle → 1) — see _combined_floor_loop docstring.
+        # - Heartbeat: sends executor metrics + receives pending commands.
         loops = []
         if self._task_handler:
             loops.append(self._task_poll_loop())
@@ -390,6 +394,7 @@ class ExecutorClient:
             loops.append(self._scope_request_poll_loop())
         loops.append(self._heartbeat_loop())
         loops.append(self._ws_gateway_loop())
+        loops.append(self._combined_floor_loop())
 
         await asyncio.gather(*loops)
 
@@ -426,27 +431,25 @@ class ExecutorClient:
     async def _task_poll_loop(self) -> None:
         """Poll for tasks until stopped.
 
-        Two modes:
-        - `_ws_healthy=False` (HTTP is the primary transport): tight
-          long-poll loop using `self._poll_wait`.
-        - `_ws_healthy=True` (WS is primary): safety-net floor — one
-          short-wait poll every `_WS_HEALTHY_POLL_FLOOR_S`. If the floor
-          actually claims something, flip `_ws_healthy=False` and tear
-          down the WS transport so the reconnect loop kicks in.
+        Active only when WS is unhealthy — runs the full long-poll using
+        `self._poll_wait`. When WS is healthy the combined floor loop
+        (`_combined_floor_loop`) covers the silent-WS-death safety net for
+        all three poll types in a single request, so this loop sleeps.
         """
         # Stagger initial poll to avoid thundering herd when multiple agents start
         import random
         await asyncio.sleep(random.uniform(0, 2))
         consecutive_errors = 0
         while self._running:
+            if self._ws_healthy:
+                # Idle while WS is primary — _combined_floor_loop handles the
+                # safety net for all three poll kinds in one request.
+                await asyncio.sleep(self._WS_HEALTHY_POLL_FLOOR_S)
+                continue
+
             try:
-                floor_mode = self._ws_healthy
-                claimed = await self._poll_once(
-                    wait_seconds=0 if floor_mode else None
-                )
+                await self._poll_once(wait_seconds=None)
                 consecutive_errors = 0
-                if floor_mode and claimed:
-                    await self._on_floor_claim("task")
             except AuthError:
                 consecutive_errors += 1
                 logger.warning("Auth failed (tasks), refreshing token...")
@@ -467,11 +470,6 @@ class ExecutorClient:
                 delay = self._backoff_delay(consecutive_errors)
                 logger.exception("Task poll error, retrying in %.1fs...", delay)
                 await asyncio.sleep(delay)
-            else:
-                if self._ws_healthy:
-                    # Safety-net mode: sleep the floor interval so the WS
-                    # gateway stays the primary path when healthy.
-                    await asyncio.sleep(self._WS_HEALTHY_POLL_FLOOR_S)
 
     async def _message_poll_loop(self) -> None:
         """Poll for messages until stopped. See `_task_poll_loop` for the
@@ -480,14 +478,14 @@ class ExecutorClient:
         await asyncio.sleep(random.uniform(0, 2))
         consecutive_errors = 0
         while self._running:
+            if self._ws_healthy:
+                # Idle while WS is primary — see _task_poll_loop comment.
+                await asyncio.sleep(self._WS_HEALTHY_POLL_FLOOR_S)
+                continue
+
             try:
-                floor_mode = self._ws_healthy
-                claimed = await self._poll_messages_once(
-                    wait_seconds=0 if floor_mode else None
-                )
+                await self._poll_messages_once(wait_seconds=None)
                 consecutive_errors = 0
-                if floor_mode and claimed:
-                    await self._on_floor_claim("message")
             except AuthError:
                 consecutive_errors += 1
                 logger.warning("Auth failed (messages), refreshing token...")
@@ -508,9 +506,6 @@ class ExecutorClient:
                 delay = self._backoff_delay(consecutive_errors)
                 logger.exception("Message poll error, retrying in %.1fs...", delay)
                 await asyncio.sleep(delay)
-            else:
-                if self._ws_healthy:
-                    await asyncio.sleep(self._WS_HEALTHY_POLL_FLOOR_S)
 
     async def _on_floor_claim(self, kind: str) -> None:
         """Floor poll succeeded — WS was supposed to be delivering but we
@@ -529,6 +524,119 @@ class ExecutorClient:
                 await transport.disconnect()
             except Exception:
                 logger.exception("[WS-GATEWAY] Error disconnecting after floor claim")
+
+    async def _combined_floor_loop(self) -> None:
+        """Single safety-net floor poll covering messages + tasks + scope-requests.
+
+        Runs every `_WS_HEALTHY_POLL_FLOOR_S` seconds while `_ws_healthy=True`.
+        Hits the combined `/api/gateway/poll` endpoint with `wait=0`, so per
+        idle agent we make one HTTP request per floor interval instead of
+        three (one per endpoint). Idles when WS is unhealthy — the per-endpoint
+        long-poll loops cover that mode.
+
+        On a successful claim, flips `_ws_healthy=False` and tears down the
+        WS so the reconnect loop resumes — same semantics as the old
+        per-endpoint floor.
+        """
+        # Stagger the first probe so 13 agents don't all hit the combined
+        # endpoint at the same instant on startup.
+        import random
+        await asyncio.sleep(random.uniform(0, self._WS_HEALTHY_POLL_FLOOR_S))
+
+        while self._running:
+            if not self._ws_healthy:
+                await asyncio.sleep(self._WS_HEALTHY_POLL_FLOOR_S)
+                continue
+
+            try:
+                await self._combined_poll_once(wait_seconds=0)
+            except AuthError:
+                logger.warning("Auth failed (combined floor), refreshing token...")
+                try:
+                    await self._token_manager.get_token()
+                except AuthError:
+                    pass
+            except httpx.ConnectError:
+                # Transient network blip — let the WS gateway loop's own
+                # reconnect logic handle recovery; we'll retry next cycle.
+                pass
+            except Exception:
+                logger.exception("[Combined-Floor] poll failed")
+
+            await asyncio.sleep(self._WS_HEALTHY_POLL_FLOOR_S)
+
+    async def _combined_poll_once(self, wait_seconds: int = 0) -> None:
+        """Single combined poll request. Dispatches the result through the
+        same WS handlers used for push delivery so dedup, ack, and concurrency
+        semantics are identical."""
+        token = await self._token_manager.ensure_fresh()
+        headers = {"Authorization": f"Bearer {token}"}
+        params = {
+            "executor_id": self._executor_id,
+            "wait": str(wait_seconds),
+            "preload": "full",
+        }
+
+        client = self._poll_client or httpx.AsyncClient(timeout=self._poll_timeout)
+        resp = await client.get(
+            f"{self._base_url}/api/gateway/poll",
+            headers=headers,
+            params=params,
+        )
+
+        if resp.status_code == 204:
+            return
+
+        if resp.status_code == 401:
+            raise AuthError("Token expired during combined poll")
+
+        if resp.status_code != 200:
+            # 404 means the backend hasn't deployed the combined endpoint
+            # yet. Don't retry tightly — the next floor cycle handles it.
+            if resp.status_code == 404:
+                logger.warning(
+                    "[Combined-Floor] /api/gateway/poll not available (404). "
+                    "Backend deploy pending? Floor check is skipped this cycle."
+                )
+            else:
+                logger.warning(
+                    "[Combined-Floor] Unexpected status %d: %s",
+                    resp.status_code, resp.text[:200],
+                )
+            return
+
+        body = resp.json()
+
+        if "command" in body and body["command"]:
+            await self._handle_command(body["command"])
+            return
+
+        kind = body.get("type")
+        data = body.get("data") or {}
+
+        if kind == "message":
+            logger.warning(
+                "[Combined-Floor] Claimed a queued message — WS was 'healthy' "
+                "but missed the broadcast. Flipping unhealthy."
+            )
+            await self._on_floor_claim("message")
+            await self._handle_ws_message(data)
+        elif kind == "task":
+            logger.warning(
+                "[Combined-Floor] Claimed a queued task — WS was 'healthy' "
+                "but missed the broadcast. Flipping unhealthy."
+            )
+            await self._on_floor_claim("task")
+            await self._handle_ws_task(data)
+        elif kind == "scope_request":
+            logger.warning(
+                "[Combined-Floor] Claimed a scope request — WS was 'healthy' "
+                "but missed the broadcast. Flipping unhealthy."
+            )
+            await self._on_floor_claim("scope")
+            await self._handle_ws_scope_request(data)
+        else:
+            logger.warning("[Combined-Floor] Unknown body shape: %s", body)
 
     # ------------------------------------------------------------------
     # Phase 1 WS gateway
@@ -646,6 +754,14 @@ class ExecutorClient:
             if not payload or not payload.get("id"):
                 return
             asyncio.ensure_future(self._handle_ws_scope_request(payload))
+
+        elif event == "gateway_command":
+            # Pending commands (shutdown, pause, etc.) used to be delivered
+            # via heartbeat response. Now pushed via WS so heartbeat cadence
+            # can be longer without delaying operator-issued commands.
+            if not payload:
+                return
+            asyncio.ensure_future(self._handle_command(payload))
 
     async def _handle_ws_message(self, payload: dict) -> None:
         try:
