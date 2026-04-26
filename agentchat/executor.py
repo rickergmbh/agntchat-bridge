@@ -203,7 +203,7 @@ class ExecutorClient:
         poll_timeout: int = 90,
         task_timeout: int = 1800,
         message_timeout: int = 300,
-        heartbeat_interval: int = 30,
+        heartbeat_interval: int = 120,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._agent_id = agent_id
@@ -410,10 +410,18 @@ class ExecutorClient:
         jitter = random.uniform(0, base * 0.5)
         return base + jitter
 
-    # Seconds between HTTP floor polls while `_ws_healthy=True`. Short enough
-    # that a silently-dead WS is caught fast; long enough that the floor is
-    # essentially free when WS is actually delivering.
-    _WS_HEALTHY_POLL_FLOOR_S = 30
+    # Seconds between HTTP floor polls while `_ws_healthy=True`. The floor's
+    # only job is to catch the rare case where the bridge thinks the WS is
+    # healthy but the server-side PubSub subscription is wedged — Phoenix's
+    # built-in WS heartbeat already detects genuinely dead WS within ~30-60s.
+    #
+    # Held at 30s historically; per-agent that's 2 floor polls/min × 3
+    # endpoints (tasks, messages, scope) = 6 DB-hitting requests/minute even
+    # with the WS delivering everything. Multiplied across N online agents
+    # this is the dominant baseline DB load when nothing is happening.
+    # 3 minutes catches silent-WS death fast enough for our use case while
+    # cutting steady-state floor traffic by 6x.
+    _WS_HEALTHY_POLL_FLOOR_S = 180
 
     async def _task_poll_loop(self) -> None:
         """Poll for tasks until stopped.
