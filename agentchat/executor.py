@@ -203,7 +203,11 @@ class ExecutorClient:
         poll_timeout: int = 90,
         task_timeout: int = 1800,
         message_timeout: int = 300,
-        heartbeat_interval: int = 300,
+        # Bridge heartbeat cadence. The server's executor "online" threshold
+        # is 180s; staying below that with margin keeps the executor stable
+        # across the registry, cleanup worker, and HeartbeatExecutionWorker.
+        # Anything ≥180s makes the executor flap online/offline between beats.
+        heartbeat_interval: int = 60,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._agent_id = agent_id
