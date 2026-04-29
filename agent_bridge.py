@@ -218,6 +218,69 @@ async def _fetch_profile(base_url: str, agent_id: str, api_key: str) -> dict[str
     return None
 
 
+async def _fetch_llm_credential(
+    base_url: str, agent_id: str, api_key: str, provider: str
+) -> str | None:
+    """Resolve the agent owner's stored LLM API key from the backend.
+
+    Returns None when there is *legitimately* no server-stored key to use:
+    either the user hasn't configured one (404), the backend is unreachable,
+    or the resolve endpoint is rate-limited / transiently unhappy. The caller
+    falls back to the local env var in those cases.
+
+    Raises AuthError when the agent's *own* credentials are bad (the agent
+    API key is rotated or revoked). That's distinct from "no LLM key on
+    file" — silently falling back to env in that case would mask a real
+    misconfiguration. _fetch_profile fails the same way for the same reason.
+    """
+    import httpx
+
+    tm = TokenManager(base_url, agent_id, api_key)
+    # Auth failure here means the agent's API key is bad — don't swallow it.
+    token = await tm.get_token()
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{base_url.rstrip('/')}/api/integrations/{provider}/resolve",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+    except Exception as e:
+        logger.warning("Failed to reach resolve endpoint for %s: %s", provider, e)
+        return None
+
+    if resp.status_code == 200:
+        body_token = resp.json().get("token")
+        if not body_token:
+            # Server returned 200 with no token — proxy mangling, server bug,
+            # or response shape regression. Don't silently use the env var as
+            # if everything is fine.
+            logger.warning(
+                "Resolve endpoint returned 200 with no token for %s — falling back to env",
+                provider,
+            )
+            return None
+        return body_token
+
+    if resp.status_code == 404:
+        # Expected when the user hasn't stored a key — quiet log, fall
+        # through to env-var path.
+        logger.debug(
+            "No %s credential on file for agent %s; using local env",
+            provider,
+            agent_id,
+        )
+        return None
+
+    logger.warning(
+        "Failed to resolve %s credential (HTTP %s): %s",
+        provider,
+        resp.status_code,
+        resp.text[:200],
+    )
+    return None
+
+
 _OWNER_LOC_CACHE_TTL = 60.0  # seconds
 _owner_loc_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
@@ -2423,6 +2486,25 @@ def run_single_agent(
         backend_kwargs["api_url"] = AGENTGRAM_API_URL
         backend_kwargs["agent_id"] = agent_id
         backend_kwargs["api_key"] = api_key
+
+    # LLM API key precedence: explicit kwarg (CLI / agent_config) → server
+    # credential → env var (handled inside the backend constructor).
+    # The server fetch only runs when nothing has been set locally.
+    if (
+        effective_backend in ("anthropic", "openai")
+        and "api_key" not in backend_kwargs
+    ):
+        resolved = asyncio.run(
+            _fetch_llm_credential(AGENTGRAM_API_URL, agent_id, api_key, effective_backend)
+        )
+        if resolved:
+            backend_kwargs["api_key"] = resolved
+            logger.info(
+                "[%s] Using %s key resolved from server credential",
+                executor_key,
+                effective_backend,
+            )
+
     backend = create_backend(effective_backend, **backend_kwargs)
 
     # Model config sync
