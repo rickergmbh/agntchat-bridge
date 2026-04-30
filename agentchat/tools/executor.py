@@ -27,11 +27,39 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import re
 from typing import Any
 
 from agentchat.tools.verification import needs_verification, verify_action
 
 logger = logging.getLogger("agentchat.tools.executor")
+
+# Strip well-formed <result_presentation>{json}</result_presentation>
+# blocks from tool output before feeding it back to the LLM. Without
+# this, a tool returning attacker-controlled text (e.g. a Gmail body
+# or an HTTP response) containing this tag would smuggle structured
+# canvas payloads into the agent's reply when the LLM echoed the
+# content. Mirrors the backend's
+# `Agentchat.Hosted.EnvelopeParser.sanitize_tool_output/1`.
+_TOOL_RESULT_PRESENTATION_RE = re.compile(
+    r"<result_presentation(?:\s[^>]*)?>\s*.*?\s*</result_presentation>",
+    re.DOTALL,
+)
+
+
+def _sanitize_tool_output(text: str) -> str:
+    """Remove canvas-card injection vectors from tool output.
+
+    Scope is narrow on purpose: only `<result_presentation>` blocks
+    have downstream UI consequences (the parse_result_presentations
+    pipeline lifts them into renderable cards). Other envelope tags
+    (`<dm>`, `<memory>`, `<task_request>`, `<tool_call>`) are stripped
+    from display text on the way out anyway, so leaving them in tool
+    output preserves legitimate quoted user text.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    return _TOOL_RESULT_PRESENTATION_RE.sub("", text)
 
 
 class ToolExecutor:
@@ -216,6 +244,10 @@ class ToolExecutor:
                         tool_name,
                         verification.detail,
                     )
+
+        # Sanitize before feeding back to the LLM — see
+        # `_sanitize_tool_output` docstring for the threat model.
+        result_str = _sanitize_tool_output(result_str)
 
         # Record in history
         self._call_history.append({
