@@ -2847,7 +2847,7 @@ def run_single_agent(
 
             remaining_text = result.text[:MAX_REPLY_CHARS]
 
-            # Preserve full text for heartbeat tasks — the gateway needs the
+            # Preserve full text for pulse tasks — the gateway needs the
             # complete response (before tag stripping) to extract the proactive
             # message and post it to the DM.
             _full_text_for_completion = remaining_text
@@ -2893,11 +2893,11 @@ def run_single_agent(
                         logger.warning("[%s] Failed to create task '%s': %s", executor_key, tr["title"], e)
 
             # Send remaining text as message in work conv.
-            # Skip for heartbeat tasks — the gateway handles routing the proactive
-            # message to the owner's DM. Posting here would put it in the heartbeat
+            # Skip for pulse tasks — the gateway handles routing the proactive
+            # message to the owner's DM. Posting here would put it in the pulse
             # conversation (agent-to-agent), which is the wrong place.
-            is_heartbeat = task_meta.get("source") == "heartbeat"
-            if remaining_text.strip() and not is_heartbeat:
+            is_pulse = task_meta.get("source") == "pulse"
+            if remaining_text.strip() and not is_pulse:
                 task_conv = task.work_conversation_id or task.conversation_id
                 if task_conv:
                     try:
@@ -2905,17 +2905,17 @@ def run_single_agent(
                     except Exception as e:
                         logger.warning("[%s] Failed to send task text: %s", executor_key, e)
 
-            # For heartbeat tasks, collect ALL text from the work conversation
+            # For pulse tasks, collect ALL text from the work conversation
             # so the gateway can extract the proactive message. result.text only
-            # has the LAST output from Claude CLI (often just heartbeat_state tags),
+            # has the LAST output from Claude CLI (often just pulse_state tags),
             # but the proactive message was output earlier in tool-use iterations.
-            if is_heartbeat:
+            if is_pulse:
                 # Fetch messages from the work conversation to get the full text.
-                # remaining_text is often just <heartbeat_state> tags from the
+                # remaining_text is often just <pulse_state> tags from the
                 # last tool-use iteration — the actual proactive message was
                 # posted earlier. If this fetch fails we fall back to
-                # remaining_text, but log so we can diagnose silent "Heartbeat
-                # OK" suppressions when the real message vanished.
+                # remaining_text, but log so we can diagnose silent "PULSE_OK"
+                #  suppressions when the real message vanished.
                 try:
                     work_conv = task.work_conversation_id or task.conversation_id
                     if work_conv:
@@ -2932,7 +2932,7 @@ def run_single_agent(
                         summary_text = remaining_text
                 except Exception as e:
                     logger.warning(
-                        "[%s] Heartbeat work-conv fetch failed (task=%s, conv=%s), "
+                        "[%s] Pulse work-conv fetch failed (task=%s, conv=%s), "
                         "falling back to remaining_text: %s",
                         executor_key,
                         task.id,
