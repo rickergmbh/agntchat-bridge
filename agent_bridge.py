@@ -627,9 +627,10 @@ def _is_result_presentation(data: dict[str, Any]) -> bool:
 def parse_result_presentations(text: str) -> tuple[str, list[dict[str, Any]]]:
     """Extract <result_presentation> JSON blocks from LLM output."""
     presentations: list[dict[str, Any]] = []
-    remaining = text
+    matched_any = False
 
     for match in _RESULT_TAG_RE.finditer(text):
+        matched_any = True
         json_str = match.group(1)
         try:
             data = json.loads(json_str)
@@ -645,8 +646,12 @@ def parse_result_presentations(text: str) -> tuple[str, list[dict[str, Any]]]:
             else:
                 logger.warning("Failed to parse or repair result_presentation JSON")
 
-    if presentations:
-        remaining = _RESULT_TAG_RE.sub("", text).strip()
+    # Always strip well-formed <result_presentation>...</result_presentation>
+    # blocks from the user-visible text, even when none parsed as JSON. The
+    # tag is an internal protocol — when the model emits XML-shaped children
+    # instead of JSON (a known failure mode), raw template markup bleeding
+    # into the conversation is worse than dropping the structured payload.
+    remaining = _RESULT_TAG_RE.sub("", text).strip() if matched_any else text
 
     # Truncated blocks (opening tag but no closing tag)
     _OPEN_TAG = "<result_presentation>"
