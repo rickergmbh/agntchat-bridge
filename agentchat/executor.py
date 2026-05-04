@@ -1508,6 +1508,96 @@ class ExecutorClient:
         content = result.get("content", [])
         return content[0].get("text", "") if content else "{}"
 
+    async def search_jobs_theirstack(
+        self,
+        *,
+        job_title_or: list[str] | None = None,
+        job_title_not: list[str] | None = None,
+        job_country_code_or: list[str] | None = None,
+        job_country_code_not: list[str] | None = None,
+        job_location_pattern_or: list[str] | None = None,
+        posted_at_max_age_days: int | None = None,
+        posted_at_gte: str | None = None,
+        posted_at_lte: str | None = None,
+        job_description_pattern_or: list[str] | None = None,
+        remote: bool | None = None,
+        employment_statuses_or: list[str] | None = None,
+        min_salary_usd: float | None = None,
+        max_salary_usd: float | None = None,
+        job_seniority_or: list[str] | None = None,
+        job_technology_slug_or: list[str] | None = None,
+        company_name_or: list[str] | None = None,
+        company_domain_or: list[str] | None = None,
+        min_employee_count: int | None = None,
+        max_employee_count: int | None = None,
+        company_country_code_or: list[str] | None = None,
+        include_total_results: bool | None = None,
+        limit: int | None = None,
+        page: int | None = None,
+    ) -> str:
+        """Search jobs via TheirStack API. Routes through backend MCP handler.
+
+        191M+ postings from 329K sources across 195 countries. Requires at
+        least one anchor filter: posted_at_max_age_days, posted_at_gte/lte,
+        or company_domain_or/company_name_or.
+        """
+        arguments: dict[str, Any] = {}
+        if job_title_or is not None:
+            arguments["job_title_or"] = job_title_or
+        if job_title_not is not None:
+            arguments["job_title_not"] = job_title_not
+        if job_country_code_or is not None:
+            arguments["job_country_code_or"] = job_country_code_or
+        if job_country_code_not is not None:
+            arguments["job_country_code_not"] = job_country_code_not
+        if job_location_pattern_or is not None:
+            arguments["job_location_pattern_or"] = job_location_pattern_or
+        if posted_at_max_age_days is not None:
+            arguments["posted_at_max_age_days"] = posted_at_max_age_days
+        if posted_at_gte is not None:
+            arguments["posted_at_gte"] = posted_at_gte
+        if posted_at_lte is not None:
+            arguments["posted_at_lte"] = posted_at_lte
+        if job_description_pattern_or is not None:
+            arguments["job_description_pattern_or"] = job_description_pattern_or
+        if remote is not None:
+            arguments["remote"] = remote
+        if employment_statuses_or is not None:
+            arguments["employment_statuses_or"] = employment_statuses_or
+        if min_salary_usd is not None:
+            arguments["min_salary_usd"] = min_salary_usd
+        if max_salary_usd is not None:
+            arguments["max_salary_usd"] = max_salary_usd
+        if job_seniority_or is not None:
+            arguments["job_seniority_or"] = job_seniority_or
+        if job_technology_slug_or is not None:
+            arguments["job_technology_slug_or"] = job_technology_slug_or
+        if company_name_or is not None:
+            arguments["company_name_or"] = company_name_or
+        if company_domain_or is not None:
+            arguments["company_domain_or"] = company_domain_or
+        if min_employee_count is not None:
+            arguments["min_employee_count"] = min_employee_count
+        if max_employee_count is not None:
+            arguments["max_employee_count"] = max_employee_count
+        if company_country_code_or is not None:
+            arguments["company_country_code_or"] = company_country_code_or
+        if include_total_results is not None:
+            arguments["include_total_results"] = include_total_results
+        if limit is not None:
+            arguments["limit"] = limit
+        if page is not None:
+            arguments["page"] = page
+        data = await self._post("/api/mcp", {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "search_jobs_theirstack", "arguments": arguments},
+        })
+        result = data.get("result", {})
+        content = result.get("content", [])
+        return content[0].get("text", "") if content else "{}"
+
     def get_task_inputs(
         self, task: GatewayTask, schema: Any | None = None
     ) -> dict[str, Any]:
