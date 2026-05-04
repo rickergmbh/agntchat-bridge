@@ -1308,6 +1308,7 @@ async def _handle_compound_task(
     execution_mode: str,
     tool_defs: list[dict[str, Any]] | None,
     resolved_tools: list[dict[str, Any]] | None = None,
+    my_display_name: str | None = None,
 ) -> dict[str, Any]:
     """Execute a compound task with an execution plan (DAG of steps)."""
     steps = execution_plan.get("steps", [])
@@ -1375,6 +1376,7 @@ async def _handle_compound_task(
                 chat_messages = await messages_to_chat_history(
                     raw_messages, my_participant_id,
                     base_url=executor._base_url, token=vision_token,
+                    my_display_name=my_display_name,
                 )
             except Exception:
                 pass
@@ -1683,7 +1685,22 @@ def _parse_file_content(raw_content: str) -> dict[str, Any] | None:
         return None
 
 
-def _extract_structured_text(msg: dict[str, Any], sender_name: str) -> str | None:
+def _format_speaker_label(sender_name: str, sender_type: str | None) -> str:
+    """Tag other-participant turns by kind so the LLM doesn't conflate them.
+
+    Why: a fresh joiner sees a stack of "user" turns with no "assistant"
+    turns of its own; without a kind tag, peer-agent text reads as the
+    user the LLM should mimic. Prefixing peer agents with `Agent:` and
+    humans with `Human:` keeps the role boundary visible in-context.
+    """
+    if sender_type == "agent":
+        return f"[Agent: {sender_name}]"
+    if sender_type == "human":
+        return f"[Human: {sender_name}]"
+    return f"[{sender_name}]"
+
+
+def _extract_structured_text(msg: dict[str, Any], sender_label: str) -> str | None:
     """Extract human-readable text from structured/status_update messages.
 
     Converts ResultPresentation items, task completion summaries, and other
@@ -1699,13 +1716,13 @@ def _extract_structured_text(msg: dict[str, Any], sender_name: str) -> str | Non
 
     if not isinstance(data, dict):
         # Fallback: if content is just a string summary, use it
-        return f"[{sender_name}]: {raw[:2000]}" if raw else None
+        return f"{sender_label}: {raw[:2000]}" if raw else None
 
     if message_type == "ResultPresentation":
         # Extract title + items as readable summary
         title = data.get("title", "Results")
         items = data.get("items", [])
-        parts = [f"[{sender_name}] — {title}:"]
+        parts = [f"{sender_label} — {title}:"]
         for item in items[:10]:  # Cap at 10 items
             item_title = item.get("title", "")
             item_subtitle = item.get("subtitle", "")
@@ -1741,14 +1758,14 @@ def _extract_structured_text(msg: dict[str, Any], sender_name: str) -> str | Non
         status = data.get("status", "")
         task_title = data.get("title", data.get("task_title", ""))
         if summary:
-            return f"[{sender_name}] Task '{task_title}' {status}: {summary}" if task_title else f"[{sender_name}]: {summary}"
+            return f"{sender_label} Task '{task_title}' {status}: {summary}" if task_title else f"{sender_label}: {summary}"
         if raw and len(raw) < 500:
-            return f"[{sender_name}]: {raw}"
+            return f"{sender_label}: {raw}"
         return None
 
     # Generic structured: use content text if short enough, otherwise skip
     if raw and len(raw) < 1000:
-        return f"[{sender_name}]: {raw}"
+        return f"{sender_label}: {raw}"
     return None
 
 
@@ -1757,11 +1774,17 @@ async def messages_to_chat_history(
     my_participant_id: str,
     base_url: str = "",
     token: str = "",
+    my_display_name: str | None = None,
 ) -> list[ChatMessage]:
     """Convert API message dicts to ChatMessage list for the model.
 
     Handles multimodal content: image file messages are converted to
     vision content blocks with base64-encoded image data.
+
+    When `my_display_name` is provided, appends a final identity-anchor
+    user turn that reminds the model whose voice it must speak in. This
+    counters in-context drift when a fresh joiner sees a long history of
+    other speakers and no assistant turns of its own.
     """
     history: list[ChatMessage] = []
     for msg in messages:
@@ -1772,6 +1795,12 @@ async def messages_to_chat_history(
         sender_id = msg.get("senderId") or msg.get("sender_id")
         role = "assistant" if sender_id == my_participant_id else "user"
         sender_name = msg.get("senderName") or msg.get("sender_name") or "Someone"
+        sender_type = (
+            msg.get("senderType")
+            or msg.get("sender_type")
+            or (msg.get("sender") or {}).get("type")
+        )
+        sender_label = _format_speaker_label(sender_name, sender_type)
 
         if content_type == "file":
             raw_content = msg.get("content", "")
@@ -1787,7 +1816,7 @@ async def messages_to_chat_history(
                 # Get signed URL for image — no downloading or base64 encoding
                 image_url = await _get_image_url(attachment_id, base_url, token)
                 if image_url:
-                    label = f"[{sender_name}] shared an image: {filename}" if role == "user" else f"I shared an image: {filename}"
+                    label = f"{sender_label} shared an image: {filename}" if role == "user" else f"I shared an image: {filename}"
                     content_blocks: list[dict[str, Any]] = [
                         {
                             "type": "image",
@@ -1803,14 +1832,14 @@ async def messages_to_chat_history(
                 # Fall through to text-only if URL fetch failed
 
             # Non-image file or failed image fetch — add as text description
-            text = f"[{sender_name}] shared a file: {filename}" if role == "user" else f"I shared a file: {filename}"
+            text = f"{sender_label} shared a file: {filename}" if role == "user" else f"I shared a file: {filename}"
             history.append(ChatMessage(role=role, content=text))
             continue
 
         # Structured messages (ResultPresentation, StatusUpdate, TaskComplete, etc.)
         # Extract readable text so the LLM can reference delegated results.
         if content_type in ("structured", "status_update"):
-            text = _extract_structured_text(msg, sender_name)
+            text = _extract_structured_text(msg, sender_label)
             if text:
                 history.append(ChatMessage(role=role, content=text))
             continue
@@ -1820,10 +1849,21 @@ async def messages_to_chat_history(
         if not content:
             continue
         if role == "user":
-            content = f"[{sender_name}]: {content}"
+            content = f"{sender_label}: {content}"
         elif role == "assistant" and _contains_stale_tool_error(content):
             content += "\n\n[SYSTEM: The tool errors above are STALE — the platform has been updated. These tools now work. You MUST retry them.]"
         history.append(ChatMessage(role=role, content=content))
+
+    if my_display_name:
+        history.append(ChatMessage(
+            role="user",
+            content=(
+                f"[SYSTEM REMINDER: You are {my_display_name}. Respond in your own voice. "
+                f"Do not address yourself in third person, and do not speak as any of the "
+                f"other participants whose messages appear above.]"
+            ),
+        ))
+
     return history
 
 
@@ -2719,6 +2759,7 @@ def run_single_agent(
                 executor_key, history_limit, my_participant_id,
                 execution_mode, _tool_defs,
                 resolved_tools=resolved_tools,
+                my_display_name=agent_name,
             )
 
         task_title = task.title
@@ -2793,6 +2834,7 @@ def run_single_agent(
                 chat_messages = await messages_to_chat_history(
                     raw_messages, my_participant_id,
                     base_url=executor._base_url, token=vision_token,
+                    my_display_name=agent_name,
                 )
             except Exception:
                 logger.warning("[%s] Failed to fetch conversation history for task", executor_key)
@@ -3216,6 +3258,7 @@ def run_single_agent(
                 return await messages_to_chat_history(
                     raw, my_participant_id,
                     base_url=executor._base_url, token=vt,
+                    my_display_name=agent_name,
                 )
             except Exception:
                 logger.warning("[%s] Failed to fetch conversation history", executor_key)
@@ -3228,9 +3271,11 @@ def run_single_agent(
         live_loc_ctx, msg_owner_lat, msg_owner_lng = await location_task
 
         if not chat_messages or chat_messages[-1].content != msg.content:
-            sender_label = msg.sender_name or "Someone"
+            sender_label = _format_speaker_label(
+                msg.sender_name or "Someone", msg.sender_type
+            )
             chat_messages.append(
-                ChatMessage(role="user", content=f"[{sender_label}]: {msg.content}")
+                ChatMessage(role="user", content=f"{sender_label}: {msg.content}")
             )
 
         # --- Agent decides task vs reply inline ---
