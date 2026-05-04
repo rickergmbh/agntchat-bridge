@@ -2881,10 +2881,12 @@ def run_single_agent(
             await _task_stream_cb({"type": "stage", "stage": "processing_results", "force": True})
             await _maybe_sync_model(result.model)
 
+            _cli_internal = bool((result.metadata or {}).get("cli_internal_loop"))
+            _loop_label = "CLI-internal loop" if _cli_internal else "outer loop"
             logger.info(
-                "[%s] Tool-use completed in %.1fs (%d iterations, %d tool calls, stop=%s)",
-                executor_key, result.elapsed_seconds, result.iterations,
-                len(result.tool_calls), result.stop_reason,
+                "[%s] Tool-use completed in %.1fs (%s: %d iterations, %d tool calls, stop=%s)",
+                executor_key, result.elapsed_seconds, _loop_label,
+                result.iterations, len(result.tool_calls), result.stop_reason,
             )
 
             remaining_text = result.text[:MAX_REPLY_CHARS]
@@ -3335,10 +3337,12 @@ def run_single_agent(
                     "I ran into an issue processing that request. Let me know if you'd like me to try again.")
             else:
                 await _maybe_sync_model(result.model)
+                _cli_internal = bool((result.metadata or {}).get("cli_internal_loop"))
+                _loop_label = "CLI-internal loop" if _cli_internal else "outer loop"
                 logger.info(
-                    "[%s] Tool-use completed in %.1fs (%d iterations, %d tool calls)",
-                    executor_key, result.elapsed_seconds, result.iterations,
-                    len(result.tool_calls),
+                    "[%s] Tool-use completed in %.1fs (%s: %d iterations, %d tool calls)",
+                    executor_key, result.elapsed_seconds, _loop_label,
+                    result.iterations, len(result.tool_calls),
                 )
                 reply = result.text[:MAX_REPLY_CHARS]
                 if not reply:

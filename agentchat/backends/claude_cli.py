@@ -610,10 +610,16 @@ class ClaudeCliBackend(ModelBackend):
         _detected_sections: set[str] = set()
 
         _result_error_subtype = ""  # populated from result event if is_error=True
+        # Inner-loop visibility: the CLI subprocess runs its own agentic loop
+        # when MCP tools are in play. Capture each tool_use block it emits and
+        # the final num_turns so the outer bridge can log real counts instead
+        # of hard-coded zeros.
+        _tool_uses: list[dict[str, Any]] = []
+        _num_turns: int = 0
 
         try:
             async def read_stream():
-                nonlocal result_text, _last_delta_time, _accumulated_text, _result_error_subtype
+                nonlocal result_text, _last_delta_time, _accumulated_text, _result_error_subtype, _num_turns
                 assert proc.stdout is not None
                 while True:
                     line = await asyncio.wait_for(
@@ -637,6 +643,7 @@ class ClaudeCliBackend(ModelBackend):
                     # Final result event — capture the text
                     if event_type == "result":
                         result_text = event.get("result", "")
+                        _num_turns = int(event.get("num_turns") or 0)
                         # Detect error results (max_turns, permission denied, etc.)
                         if event.get("is_error"):
                             _result_error_subtype = event.get("subtype", "unknown_error")
@@ -687,6 +694,10 @@ class ClaudeCliBackend(ModelBackend):
                             cb = inner.get("content_block") or {}
                             if cb.get("type") == "tool_use":
                                 tool_name = cb.get("name", "tool")
+                                _tool_uses.append({
+                                    "id": cb.get("id", ""),
+                                    "name": tool_name,
+                                })
                                 await on_progress({
                                     "type": "tool_call",
                                     "tool": tool_name,
@@ -738,7 +749,13 @@ class ClaudeCliBackend(ModelBackend):
             text=clean_text,
             model=self._model or "claude-cli",
             elapsed_seconds=round(elapsed, 1),
-            metadata={"backend": "claude_cli", "cli_path": self._cli_path, "streaming": True},
+            metadata={
+                "backend": "claude_cli",
+                "cli_path": self._cli_path,
+                "streaming": True,
+                "cli_tool_uses": _tool_uses,
+                "cli_num_turns": _num_turns,
+            },
         )
 
     # ------------------------------------------------------------------
@@ -805,12 +822,31 @@ class ClaudeCliBackend(ModelBackend):
             finally:
                 self._cleanup_temp_files(cleanup)
 
+            # The inner CLI ran the entire agentic loop. Hoist its tool_use
+            # tally and turn count up so the bridge can log real numbers
+            # instead of zeros. We can't reconstruct ToolCall.result/elapsed
+            # from the stream, so use minimal ToolCall records — the names
+            # and count are what surface in logs.
+            cli_tool_uses = (result.metadata or {}).get("cli_tool_uses") or []
+            cli_num_turns = int((result.metadata or {}).get("cli_num_turns") or 0)
+            tool_calls = [
+                ToolCall(
+                    id=tu.get("id", ""),
+                    name=tu.get("name", "tool"),
+                    arguments={},
+                    result="",
+                )
+                for tu in cli_tool_uses
+            ]
+            merged_metadata = dict(result.metadata or {})
+            merged_metadata["cli_internal_loop"] = True
             return ModelResult(
                 text=result.text,
                 model=result.model,
                 elapsed_seconds=round(elapsed, 1),
-                tool_calls=[],  # CLI handled them internally
-                iterations=0,
+                metadata=merged_metadata,
+                tool_calls=tool_calls,
+                iterations=cli_num_turns,
                 stop_reason="end_turn",
             )
 
