@@ -1393,6 +1393,121 @@ class ExecutorClient:
         """Get today's top gainers, losers, and most actively traded stocks."""
         return await self._get("/api/finance/movers")
 
+    # ------------------------------------------------------------------
+    # Job Search (Adzuna + SerpApi)
+    # ------------------------------------------------------------------
+
+    async def search_jobs_adzuna(
+        self,
+        query: str,
+        *,
+        country: str | None = None,
+        location: str | None = None,
+        category: str | None = None,
+        salary_min: int | None = None,
+        salary_max: int | None = None,
+        full_time: bool | None = None,
+        permanent: bool | None = None,
+        days_since_posted: int | None = None,
+        page: int | None = None,
+        results_per_page: int | None = None,
+    ) -> str:
+        """Search jobs via Adzuna API. Routes through backend MCP handler."""
+        arguments: dict[str, Any] = {"query": query}
+        if country:
+            arguments["country"] = country
+        if location:
+            arguments["location"] = location
+        if category:
+            arguments["category"] = category
+        if salary_min is not None:
+            arguments["salary_min"] = salary_min
+        if salary_max is not None:
+            arguments["salary_max"] = salary_max
+        if full_time is not None:
+            arguments["full_time"] = full_time
+        if permanent is not None:
+            arguments["permanent"] = permanent
+        if days_since_posted is not None:
+            arguments["days_since_posted"] = days_since_posted
+        if page is not None:
+            arguments["page"] = page
+        if results_per_page is not None:
+            arguments["results_per_page"] = results_per_page
+        data = await self._post("/api/mcp", {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "search_jobs_adzuna", "arguments": arguments},
+        })
+        result = data.get("result", {})
+        content = result.get("content", [])
+        return content[0].get("text", "") if content else "{}"
+
+    async def search_jobs_google(
+        self,
+        query: str,
+        *,
+        location: str | None = None,
+        radius_km: int | None = None,
+        date_posted: str | None = None,
+        job_type: str | None = None,
+        remote: bool | None = None,
+        language: str | None = None,
+        country: str | None = None,
+        next_page_token: str | None = None,
+    ) -> str:
+        """Search jobs via SerpApi (Google Jobs). Routes through backend MCP handler."""
+        arguments: dict[str, Any] = {"query": query}
+        if location:
+            arguments["location"] = location
+        if radius_km is not None:
+            arguments["radius_km"] = radius_km
+        if date_posted:
+            arguments["date_posted"] = date_posted
+        if job_type:
+            arguments["job_type"] = job_type
+        if remote is not None:
+            arguments["remote"] = remote
+        if language:
+            arguments["language"] = language
+        if country:
+            arguments["country"] = country
+        if next_page_token:
+            arguments["next_page_token"] = next_page_token
+        data = await self._post("/api/mcp", {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "search_jobs_google", "arguments": arguments},
+        })
+        result = data.get("result", {})
+        content = result.get("content", [])
+        return content[0].get("text", "") if content else "{}"
+
+    async def get_salary_data(
+        self,
+        query: str,
+        *,
+        country: str | None = None,
+        location: str | None = None,
+    ) -> str:
+        """Get salary data via Adzuna. Routes through backend MCP handler."""
+        arguments: dict[str, Any] = {"query": query}
+        if country:
+            arguments["country"] = country
+        if location:
+            arguments["location"] = location
+        data = await self._post("/api/mcp", {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "get_salary_data", "arguments": arguments},
+        })
+        result = data.get("result", {})
+        content = result.get("content", [])
+        return content[0].get("text", "") if content else "{}"
+
     def get_task_inputs(
         self, task: GatewayTask, schema: Any | None = None
     ) -> dict[str, Any]:
