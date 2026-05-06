@@ -1910,6 +1910,124 @@ class ExecutorClient:
         return await self._post(f"/api/routines/{routine_id}/resume", json={})
 
     # ------------------------------------------------------------------
+    # GitHub (per-user OAuth — see /api/github/* routes)
+    # ------------------------------------------------------------------
+
+    async def list_repos(
+        self, *, affiliation: str | None = None, sort: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """List repositories the user has access to. Default: 30 most recently updated."""
+        params: dict[str, str] = {}
+        if affiliation:
+            params["affiliation"] = affiliation
+        if sort:
+            params["sort"] = sort
+        if limit:
+            params["limit"] = str(limit)
+        return await self._get("/api/github/repos", params=params or None)
+
+    async def get_repo(self, owner: str, repo: str) -> dict[str, Any]:
+        """Get a single repository by owner/name."""
+        return await self._get(f"/api/github/repos/{owner}/{repo}")
+
+    async def list_issues(
+        self, owner: str, repo: str, *, state: str | None = None,
+        labels: str | None = None, assignee: str | None = None,
+        since: str | None = None, limit: int | None = None,
+    ) -> dict[str, Any]:
+        """List issues in a repo. Default: open issues only, 30 most recent."""
+        params: dict[str, str] = {}
+        if state:
+            params["state"] = state
+        if labels:
+            params["labels"] = labels
+        if assignee:
+            params["assignee"] = assignee
+        if since:
+            params["since"] = since
+        if limit:
+            params["limit"] = str(limit)
+        return await self._get(f"/api/github/repos/{owner}/{repo}/issues", params=params or None)
+
+    async def get_issue(self, owner: str, repo: str, number: int) -> dict[str, Any]:
+        """Get an issue with its last 20 comments."""
+        return await self._get(f"/api/github/repos/{owner}/{repo}/issues/{number}")
+
+    async def create_issue(
+        self, owner: str, repo: str, title: str, *,
+        body: str | None = None, labels: list[str] | None = None,
+        assignees: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Create an issue. Body is markdown."""
+        payload: dict[str, Any] = {"title": title}
+        if body is not None:
+            payload["body"] = body
+        if labels:
+            payload["labels"] = labels
+        if assignees:
+            payload["assignees"] = assignees
+        return await self._post(
+            f"/api/github/repos/{owner}/{repo}/issues", json=payload
+        )
+
+    async def comment_on_issue(
+        self, owner: str, repo: str, number: int, body: str,
+    ) -> dict[str, Any]:
+        """Post a comment on an issue (or pull request — same endpoint)."""
+        return await self._post(
+            f"/api/github/repos/{owner}/{repo}/issues/{number}/comments",
+            json={"body": body},
+        )
+
+    async def list_pull_requests(
+        self, owner: str, repo: str, *, state: str | None = None,
+        base: str | None = None, head: str | None = None, limit: int | None = None,
+    ) -> dict[str, Any]:
+        """List pull requests. Default: open PRs only, 30 most recently updated."""
+        params: dict[str, str] = {}
+        if state:
+            params["state"] = state
+        if base:
+            params["base"] = base
+        if head:
+            params["head"] = head
+        if limit:
+            params["limit"] = str(limit)
+        return await self._get(
+            f"/api/github/repos/{owner}/{repo}/pulls", params=params or None
+        )
+
+    async def get_pull_request(self, owner: str, repo: str, number: int) -> dict[str, Any]:
+        """Get a PR with its last 20 review comments and commit summaries."""
+        return await self._get(f"/api/github/repos/{owner}/{repo}/pulls/{number}")
+
+    async def get_file_content(
+        self, owner: str, repo: str, path: str, *, ref: str | None = None,
+    ) -> dict[str, Any]:
+        """Read a file from a repo. Returns decoded UTF-8 content. Pass ref for branch/tag/sha."""
+        params: dict[str, str] = {}
+        if ref:
+            params["ref"] = ref
+        return await self._get(
+            f"/api/github/repos/{owner}/{repo}/contents/{path}", params=params or None
+        )
+
+    async def search_code(
+        self, query: str, *, owner: str | None = None, repo: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Search code. Pass owner (a GitHub login) or repo ('owner/name') to scope."""
+        params: dict[str, str] = {"q": query}
+        if owner:
+            params["owner"] = owner
+        if repo:
+            params["repo"] = repo
+        if limit:
+            params["limit"] = str(limit)
+        return await self._get("/api/github/search/code", params=params)
+
+    # ------------------------------------------------------------------
     # Canvas State
     # ------------------------------------------------------------------
 
