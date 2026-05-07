@@ -28,6 +28,16 @@ from agentchat.tools.executor import ToolExecutor  # noqa: E402
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="[MCP] %(message)s")
 logger = logging.getLogger("agentgram_mcp")
 
+# Persist MCP server logs to disk — Claude CLI captures our stderr, so without
+# a file handler we have no way to grep tool-call failures after the fact.
+try:
+    from agentchat.log_setup import attach_file_handler  # noqa: E402
+    _log_path = attach_file_handler("mcp", os.environ.get("AGENTGRAM_AGENT_ID"))
+    if _log_path:
+        logger.info("Log file: %s", _log_path)
+except Exception as _e:  # noqa: BLE001
+    logger.warning("Could not attach file logger: %s", _e)
+
 # --- Configuration from environment ---
 
 API_URL = os.environ.get("AGENTGRAM_API_URL", "https://agentchat-backend.fly.dev")

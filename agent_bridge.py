@@ -2455,6 +2455,16 @@ def run_single_agent(
 ) -> None:
     """Set up and run a single agent executor."""
 
+    # Persist bridge logs to disk so MCP/tool failures survive a process
+    # restart. In-memory Tauri buffer is volatile.
+    try:
+        from agentchat.log_setup import attach_file_handler
+        log_path = attach_file_handler("bridge", agent_id)
+        if log_path:
+            logger.info("[%s] Bridge log file: %s", executor_key, log_path)
+    except Exception as e:
+        logger.warning("[%s] Could not attach file logger: %s", executor_key, e)
+
     # Fetch agent profile — fast-fail on auth errors
     logger.info("[%s] Fetching agent profile...", executor_key)
     try:
