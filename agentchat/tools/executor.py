@@ -217,6 +217,16 @@ class ToolExecutor:
             if not arguments.get("source_conversation_id"):
                 arguments["source_conversation_id"] = self._context.get("conversation_id")
 
+        # Auto-inject active_conversation_id for create_task so the backend's
+        # anti-misrouting guard can apply the in-process descendant check
+        # (Path A) instead of falling back to the bridge-only recency
+        # heuristic that fires when no other party has posted in the target
+        # conv lately. The active conv comes from the bridge's tool context
+        # — this is the conversation the agent is genuinely working in.
+        if executor_method == "create_task" and ctx_conv_id:
+            if not arguments.get("active_conversation_id"):
+                arguments["active_conversation_id"] = ctx_conv_id
+
         # Find the ExecutorClient method
         method = getattr(self._client, executor_method, None)
         if not method:
@@ -242,7 +252,7 @@ class ToolExecutor:
             kw_args[pname] = val
 
         # Pass through auto-injected context values not in schema
-        for injected_key in ("conversation_id", "source_conversation_id"):
+        for injected_key in ("conversation_id", "source_conversation_id", "active_conversation_id"):
             if injected_key in arguments and injected_key not in kw_args:
                 kw_args[injected_key] = arguments[injected_key]
 

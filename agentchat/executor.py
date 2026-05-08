@@ -783,6 +783,7 @@ class ExecutorClient:
         *,
         assigned_to: list[str] | str | None = None,
         metadata: dict[str, Any] | None = None,
+        active_conversation_id: str | None = None,
     ) -> dict[str, Any]:
         """Create a task in a conversation and optionally assign it.
 
@@ -792,6 +793,10 @@ class ExecutorClient:
             description: Task description.
             assigned_to: Agent ID(s) to assign. Auto-assigns and wakes the agent.
             metadata: Optional metadata dict.
+            active_conversation_id: The conversation the bridge is currently
+                acting in. Sent as `X-Active-Conversation` so the backend's
+                anti-misrouting guard can use the in-process descendant
+                check (Path A) instead of the bridge-only recency heuristic.
         """
         body: dict[str, Any] = {"title": title, "description": description}
         if assigned_to is not None:
@@ -800,9 +805,15 @@ class ExecutorClient:
             body["assignedTo"] = assigned_to
         if metadata:
             body["metadata"] = metadata
+        extra_headers = (
+            {"X-Active-Conversation": active_conversation_id}
+            if active_conversation_id
+            else None
+        )
         return await self._post(
             f"/api/conversations/{conversation_id}/tasks",
             json=body,
+            extra_headers=extra_headers,
         )
 
     async def send_message(
@@ -2312,9 +2323,16 @@ class ExecutorClient:
     # HTTP helpers
     # ------------------------------------------------------------------
 
-    async def _post(self, path: str, json: dict | None = None) -> dict:
+    async def _post(
+        self,
+        path: str,
+        json: dict | None = None,
+        extra_headers: dict[str, str] | None = None,
+    ) -> dict:
         token = await self._token_manager.ensure_fresh()
         headers = {"Authorization": f"Bearer {token}"}
+        if extra_headers:
+            headers.update(extra_headers)
         kwargs: dict[str, Any] = {"headers": headers}
         if json is not None:
             kwargs["json"] = json
@@ -2322,7 +2340,10 @@ class ExecutorClient:
         resp = await client.post(f"{self._base_url}{path}", **kwargs)
         if resp.status_code == 401:
             token = await self._token_manager.get_token()
-            kwargs["headers"] = {"Authorization": f"Bearer {token}"}
+            refreshed = {"Authorization": f"Bearer {token}"}
+            if extra_headers:
+                refreshed.update(extra_headers)
+            kwargs["headers"] = refreshed
             resp = await client.post(f"{self._base_url}{path}", **kwargs)
         return self._handle_response(resp)
 
