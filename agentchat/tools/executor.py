@@ -47,6 +47,37 @@ _TOOL_RESULT_PRESENTATION_RE = re.compile(
 )
 
 
+# Strings the LLM hands back when it means "the conversation I'm in" without
+# substituting the real UUID. Anything in this set (case-insensitive, stripped
+# of surrounding angle brackets) triggers conversation_id injection from the
+# bridge's ambient context.
+_CONV_ID_PLACEHOLDERS = frozenset({
+    "",
+    "current",
+    "this",
+    "this_conv",
+    "this_conversation",
+    "conversation_id",
+    "conv_id",
+})
+
+
+def _is_placeholder_conv_id(value: Any) -> bool:
+    """True when `value` looks like a placeholder rather than a real conv UUID.
+
+    Recognizes the empty/missing case, `{{conversation_id}}`-style template
+    tokens, and bare sentinels like "current" / "this" / "<this_conv>".
+    """
+    if value is None:
+        return True
+    if not isinstance(value, str):
+        return False
+    if value.startswith("{{"):
+        return True
+    normalized = value.strip().strip("<>").lower()
+    return normalized in _CONV_ID_PLACEHOLDERS
+
+
 def _sanitize_tool_output(text: str) -> str:
     """Remove canvas-card injection vectors from tool output.
 
@@ -132,38 +163,44 @@ class ToolExecutor:
         param_names = set(schema.get("properties", {}).keys())
         executor_method = tool_def.get("executorMethod", tool_def.get("executor_method", tool_name))
 
-        # Auto-inject conversation_id from context when the LLM didn't provide one
-        # (or provided a placeholder like "{{conversation_id}}"). Only inject when
-        # the executor method actually accepts it (check method signature, not schema
-        # — the param may be hidden from the LLM but still needed by the method).
-        #
-        # For create_task specifically: when context comes from a TASK (agent is
-        # processing a task in conversation B), don't inject — the task's
-        # conversation_id is wrong for cross-conversation delegation. When context
-        # comes from a MESSAGE (agent is responding to a human in conversation A),
-        # injection is correct — the task should be in that conversation.
+        # Auto-inject conversation_id from context when the LLM didn't provide
+        # a real value. The detector covers the common ways a model gestures at
+        # "this conversation" without filling in the actual UUID:
+        #   - missing/empty
+        #   - "{{conversation_id}}"-style template tokens
+        #   - placeholder words like "current", "this", "<this_conv>"
+        # When the LLM provides a real ID we leave it alone — that protects
+        # cross-conversation delegation where the agent intends conv A while
+        # processing a task in conv B (the original concern behind the prior
+        # task-source skip).
         ctx_conv_id = self._context.get("conversation_id")
-        ctx_source = self._context.get("source_type", "message")
-        _skip_conv_inject = (
-            executor_method in ("create_task",) and ctx_source == "task"
-        )
-        if ctx_conv_id and not _skip_conv_inject:
+        if ctx_conv_id:
             method_ref = getattr(self._client, executor_method, None)
             if method_ref is not None:
                 sig = inspect.signature(method_ref)
                 if "conversation_id" in sig.parameters:
                     llm_val = arguments.get("conversation_id")
-                    # Only inject if the LLM omitted it or used a placeholder
-                    if not llm_val or (isinstance(llm_val, str) and llm_val.startswith("{{")):
+                    if _is_placeholder_conv_id(llm_val):
                         arguments["conversation_id"] = ctx_conv_id
                         if executor_method == "create_task":
-                            logger.info("[ToolExecutor] Injected conversation_id=%s for create_task (source=%s)", ctx_conv_id[:12], ctx_source)
+                            ctx_source = self._context.get("source_type", "message")
+                            logger.info(
+                                "[ToolExecutor] Injected conversation_id=%s for create_task (placeholder=%r, source=%s)",
+                                ctx_conv_id[:12], llm_val, ctx_source,
+                            )
 
         if executor_method == "create_task":
+            final_conv = arguments.get("conversation_id", "MISSING")
             logger.info("[ToolExecutor] create_task final args: conversation_id=%s, title=%s, assigned_to=%s",
-                        arguments.get("conversation_id", "MISSING")[:40],
+                        str(final_conv)[:40],
                         str(arguments.get("title", "MISSING"))[:40],
                         str(arguments.get("assigned_to", "MISSING"))[:60])
+            if _is_placeholder_conv_id(final_conv):
+                logger.warning(
+                    "[ToolExecutor] create_task about to call API with placeholder conversation_id=%r "
+                    "(ctx_conv_id=%s) — backend will reject this as 400. Check ToolExecutor context wiring.",
+                    final_conv, ctx_conv_id,
+                )
 
         # Auto-inject user_id from context (for knowledge tools called by agents)
         if "user_id" in param_names:
