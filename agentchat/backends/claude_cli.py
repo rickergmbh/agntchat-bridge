@@ -617,9 +617,18 @@ class ClaudeCliBackend(ModelBackend):
         _tool_uses: list[dict[str, Any]] = []
         _num_turns: int = 0
 
+        # Anthropic streaming delivers tool_use input via `input_json_delta`
+        # events that arrive AFTER the `content_block_start`. We accumulate
+        # those deltas so we can re-emit the tool_call progress event with the
+        # populated arguments on `content_block_stop` — without this, the
+        # streaming bubble shows generic fallbacks like "Searching for '...'"
+        # because the args dict is still empty at content_block_start time.
+        _active_tool_use: dict[str, Any] | None = None
+
         try:
             async def read_stream():
                 nonlocal result_text, _last_delta_time, _accumulated_text, _result_error_subtype, _num_turns
+                nonlocal _active_tool_use
                 assert proc.stdout is not None
                 while True:
                     line = await asyncio.wait_for(
@@ -665,6 +674,12 @@ class ClaudeCliBackend(ModelBackend):
                         inner_type = inner.get("type", "")
                         if inner_type == "content_block_delta":
                             delta = inner.get("delta") or {}
+                            if (
+                                delta.get("type") == "input_json_delta"
+                                and _active_tool_use is not None
+                                and inner.get("index") == _active_tool_use.get("index")
+                            ):
+                                _active_tool_use["partial_json"] += delta.get("partial_json", "")
                             if delta.get("type") == "text_delta":
                                 text_chunk = delta.get("text", "")
                                 if text_chunk:
@@ -698,11 +713,40 @@ class ClaudeCliBackend(ModelBackend):
                                     "id": cb.get("id", ""),
                                     "name": tool_name,
                                 })
+                                _active_tool_use = {
+                                    "index": inner.get("index"),
+                                    "name": tool_name,
+                                    "partial_json": "",
+                                }
+                                # Fire immediately so the bubble flips to the
+                                # tool_call phase right away. A second event
+                                # with populated args is emitted on
+                                # content_block_stop once input streaming is
+                                # complete.
                                 await on_progress({
                                     "type": "tool_call",
                                     "tool": tool_name,
                                     "arguments": {},
                                 })
+                            await on_progress(event)
+                        elif inner_type == "content_block_stop":
+                            if (
+                                _active_tool_use is not None
+                                and inner.get("index") == _active_tool_use.get("index")
+                            ):
+                                raw = _active_tool_use.get("partial_json") or ""
+                                try:
+                                    args = json.loads(raw) if raw else {}
+                                except json.JSONDecodeError:
+                                    args = {}
+                                if args:
+                                    await on_progress({
+                                        "type": "tool_call",
+                                        "tool": _active_tool_use["name"],
+                                        "arguments": args,
+                                        "force": True,
+                                    })
+                                _active_tool_use = None
                             await on_progress(event)
                         elif inner_type == "message_start":
                             await on_progress(event)

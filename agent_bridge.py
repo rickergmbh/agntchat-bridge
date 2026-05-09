@@ -2156,7 +2156,14 @@ def make_stream_callback(
             _had_tool_calls = True
             tool_name = event.get("tool", "")
             tool_args = event.get("arguments", {})
-            summary = _summarize_tool(tool_name, tool_args)
+            # Streaming backends (claude_cli) emit an early empty-args
+            # tool_call event at content_block_start to flip the phase
+            # promptly, then a second populated event at content_block_stop
+            # once input_json_delta finishes. Suppress phase_detail on the
+            # early emit so generic fallbacks ("Searching for '...'",
+            # "Reading file") don't pollute recentSteps before the real
+            # detail lands.
+            summary = _summarize_tool(tool_name, tool_args) if tool_args else None
             if not suppress_stream:
                 _fire_and_forget(executor.send_stream_update(
                     conversation_id, stream_id,
