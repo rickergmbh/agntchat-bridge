@@ -1900,8 +1900,98 @@ def _contains_stale_tool_error(text: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+_MCP_PREFIXES = ("mcp__agentgram__", "mcp__")
+
+# Human-readable labels for platform tools (keyed on clean name after prefix strip)
+_PLATFORM_TOOL_LABELS: dict[str, str] = {
+    "send_message": "Sending message",
+    "get_messages": "Reading messages",
+    "create_task": "Creating task",
+    "update_task_status": "Updating task",
+    "report_progress": "Reporting progress",
+    "search_memory": "Searching memory",
+    "save_agent_memory": "Saving memory",
+    "get_memory": "Loading memory",
+    "list_knowledge": "Reading knowledge",
+    "create_knowledge": "Saving knowledge",
+    "upsert_knowledge": "Updating knowledge",
+    "delete_knowledge": "Deleting entry",
+    "list_knowledge_collections": "Listing collections",
+    "find_or_create_dm": "Opening DM",
+    "create_reminder": "Setting reminder",
+    "list_reminders": "Checking reminders",
+    "cancel_reminder": "Cancelling reminder",
+    "get_owner_location": "Getting location",
+    "update-canvas-state": "Updating canvas",
+    "save-family-memory": "Saving family memory",
+    # GitHub tools
+    "list_repos": "Listing repositories",
+    "get_repo": "Checking repository",
+    "list_issues": "Listing issues",
+    "get_issue": "Reading issue",
+    "create_issue": "Creating issue",
+    "comment_on_issue": "Commenting on issue",
+    "list_pull_requests": "Listing PRs",
+    "get_pull_request": "Reading PR",
+    "search_code": "Searching code",
+    "get_file_content": "Reading file",
+    # Google tools
+    "list_calendar_events": "Checking calendar",
+    "create_calendar_event": "Creating event",
+    "get_calendar_event": "Reading event",
+    "delete_calendar_event": "Deleting event",
+    "update_calendar_event": "Updating event",
+    "move_calendar_event": "Moving event",
+    "list_calendars": "Listing calendars",
+    "send_email": "Sending email",
+    "save_draft": "Saving draft",
+    "get_email": "Reading email",
+    "list_emails": "Checking inbox",
+    # Soul/routine tools
+    "read-soul": "Reading soul",
+    "update-soul": "Updating soul",
+    "get-soul-template": "Loading soul template",
+    "create-routine": "Creating routine",
+    "update-routine": "Updating routine",
+    "delete-routine": "Deleting routine",
+    "list-routines": "Listing routines",
+    "pause-routine": "Pausing routine",
+    "resume-routine": "Resuming routine",
+    "get_skill_content": "Loading skill",
+    # Finance tools
+    "get_stock_quote": "Getting stock quote",
+    "search_stocks": "Searching stocks",
+    "get_company_overview": "Getting company info",
+    "get_market_news": "Checking market news",
+    "get_economic_indicator": "Checking economic data",
+    "get_top_movers": "Checking top movers",
+    # Job tools
+    "search_jobs_adzuna": "Searching jobs",
+    "search_jobs_google": "Searching jobs",
+    "search_jobs_theirstack": "Searching jobs",
+    "get_salary_data": "Checking salary data",
+}
+
+
+def _strip_mcp_prefix(name: str) -> str:
+    """Strip MCP server prefix from tool names (e.g. mcp__agentgram__send_message -> send_message)."""
+    for prefix in _MCP_PREFIXES:
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def _humanize_snake(name: str) -> str:
+    """Convert snake_case/kebab-case to title case (e.g. send_message -> Send message)."""
+    words = name.replace("-", " ").replace("_", " ").split()
+    if not words:
+        return name
+    return words[0].capitalize() + (" " + " ".join(words[1:]) if len(words) > 1 else "")
+
+
 def _summarize_tool(name: str, inp: dict[str, Any]) -> str:
     """Human-readable summary for a tool call."""
+    # Claude Code built-in tools (no prefix stripping needed)
     if name == "Read":
         return f"Reading {_short_path(inp.get('file_path', 'file'))}"
     if name == "Write":
@@ -1927,7 +2017,16 @@ def _summarize_tool(name: str, inp: dict[str, Any]) -> str:
         return f"Delegating: {desc}" if desc else "Delegating sub-task"
     if name in ("TodoRead", "TodoWrite"):
         return "Updating task list"
-    return f"Using {name}"
+
+    # Strip MCP prefix for platform tools
+    clean = _strip_mcp_prefix(name)
+
+    # Check platform tool label mapping
+    if clean in _PLATFORM_TOOL_LABELS:
+        return _PLATFORM_TOOL_LABELS[clean]
+
+    # Fallback: humanize the clean name
+    return _humanize_snake(clean)
 
 
 def _short_path(path: str) -> str:
