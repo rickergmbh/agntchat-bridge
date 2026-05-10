@@ -1737,6 +1737,31 @@ def _format_speaker_label(sender_name: str, sender_type: str | None) -> str:
     return f"[{sender_name}]"
 
 
+def _format_message_timestamp(msg: dict[str, Any]) -> str:
+    """Format a message's insertedAt into a bracketed UTC timestamp prefix.
+
+    Returns e.g. '[2026-05-10 19:15 UTC] ' or '' if no timestamp available.
+    Gives the LLM temporal awareness of when each message was sent.
+    """
+    from datetime import datetime as _dt_cls, timezone as _tz
+
+    raw_ts = msg.get("insertedAt") or msg.get("inserted_at")
+    if not raw_ts:
+        return ""
+    try:
+        if isinstance(raw_ts, str):
+            # Handle ISO 8601 with or without trailing Z / offset
+            cleaned = raw_ts.replace("Z", "+00:00")
+            dt = _dt_cls.fromisoformat(cleaned)
+        else:
+            return ""
+        # Format as compact UTC timestamp
+        utc_dt = dt.astimezone(_tz.utc)
+        return f"[{utc_dt.strftime('%Y-%m-%d %H:%M UTC')}] "
+    except (ValueError, TypeError):
+        return ""
+
+
 def _extract_structured_text(msg: dict[str, Any], sender_label: str) -> str | None:
     """Extract human-readable text from structured/status_update messages.
 
@@ -1838,6 +1863,7 @@ async def messages_to_chat_history(
             or (msg.get("sender") or {}).get("type")
         )
         sender_label = _format_speaker_label(sender_name, sender_type)
+        ts_prefix = _format_message_timestamp(msg)
 
         if content_type == "file":
             raw_content = msg.get("content", "")
@@ -1853,7 +1879,7 @@ async def messages_to_chat_history(
                 # Get signed URL for image — no downloading or base64 encoding
                 image_url = await _get_image_url(attachment_id, base_url, token)
                 if image_url:
-                    label = f"{sender_label} shared an image: {filename}" if role == "user" else f"I shared an image: {filename}"
+                    label = f"{ts_prefix}{sender_label} shared an image: {filename}" if role == "user" else f"{ts_prefix}I shared an image: {filename}"
                     content_blocks: list[dict[str, Any]] = [
                         {
                             "type": "image",
@@ -1869,7 +1895,7 @@ async def messages_to_chat_history(
                 # Fall through to text-only if URL fetch failed
 
             # Non-image file or failed image fetch — add as text description
-            text = f"{sender_label} shared a file: {filename}" if role == "user" else f"I shared a file: {filename}"
+            text = f"{ts_prefix}{sender_label} shared a file: {filename}" if role == "user" else f"{ts_prefix}I shared a file: {filename}"
             history.append(ChatMessage(role=role, content=text))
             continue
 
@@ -1878,7 +1904,7 @@ async def messages_to_chat_history(
         if content_type in ("structured", "status_update"):
             text = _extract_structured_text(msg, sender_label)
             if text:
-                history.append(ChatMessage(role=role, content=text))
+                history.append(ChatMessage(role=role, content=f"{ts_prefix}{text}"))
             continue
 
         # Regular text message
@@ -1886,9 +1912,11 @@ async def messages_to_chat_history(
         if not content:
             continue
         if role == "user":
-            content = f"{sender_label}: {content}"
-        elif role == "assistant" and _contains_stale_tool_error(content):
-            content += "\n\n[SYSTEM: The tool errors above are STALE — the platform has been updated. These tools now work. You MUST retry them.]"
+            content = f"{ts_prefix}{sender_label}: {content}"
+        elif role == "assistant":
+            content = f"{ts_prefix}{content}"
+            if _contains_stale_tool_error(content):
+                content += "\n\n[SYSTEM: The tool errors above are STALE — the platform has been updated. These tools now work. You MUST retry them.]"
         history.append(ChatMessage(role=role, content=content))
 
     if my_display_name:
