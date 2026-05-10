@@ -444,6 +444,38 @@ def extract_capabilities(profile: dict[str, Any] | None) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# CLI tool-use telemetry
+# ---------------------------------------------------------------------------
+
+
+async def _record_cli_tool_uses(
+    executor: Any,
+    conversation_id: str | None,
+    tool_names: list[str],
+    executor_key: str,
+) -> None:
+    """POST a per-message tool tally for `claude_cli` agents.
+
+    The CLI's internal agentic loop (Read/Edit/Bash/etc.) is opaque to the
+    platform. Without this round-trip the `tool_invocations` table sees zero
+    rows for the codebase's biggest grinder. Best-effort: failures log but
+    don't propagate — never blocks the reply path.
+    """
+    if not tool_names:
+        return
+    try:
+        await executor._post(  # type: ignore[attr-defined]
+            "/api/agents/me/cli-tool-uses",
+            {
+                "conversation_id": conversation_id,
+                "tool_uses": [{"name": n} for n in tool_names],
+            },
+        )
+    except Exception as e:
+        logger.debug("[%s] CLI tool-use telemetry POST failed: %s", executor_key, e)
+
+
+# ---------------------------------------------------------------------------
 # Location request helpers
 # ---------------------------------------------------------------------------
 
@@ -3354,6 +3386,57 @@ def run_single_agent(
             if result_msg is not None:
                 return result_msg
 
+        # --- MessageTriage short-circuit (server-decided routing, no LLM) ---
+        # When the server's MessageTriage classifier (Agentchat.Gateway.MessageTriage)
+        # tags the trigger as TASK, create a self-task directly and ack — skip the
+        # LLM for this turn. The TaskAssignmentWorker reopens the work in a focused
+        # sub-conversation, where the agent gets clean context and platform-level
+        # progress visibility. Prevents the "agent grinds the whole job inline"
+        # failure mode (see executor.ex self-task nudge for why prompt-only doesn't
+        # work for CLI-internal-loop backends like claude_cli).
+        if (
+            msg.message_triage
+            and msg.message_triage.get("classification") == "TASK"
+            and task_creation_allowed
+            and not directives.get("deferTaskCreation", False)
+            and msg.is_human  # only force self-task on human triggers
+            and msg.conversation_id
+        ):
+            triage_title = (msg.message_triage.get("title") or "").strip() or "Task"
+            triage_source = msg.message_triage.get("source", "?")
+            try:
+                logger.info(
+                    "[%s] MessageTriage=TASK (source=%s) — short-circuit self-task: %s",
+                    executor_key, triage_source, triage_title,
+                )
+                await executor.create_task(
+                    msg.conversation_id,
+                    triage_title,
+                    description=msg.content or triage_title,
+                    assigned_to=my_participant_id,
+                    metadata={
+                        "source": "message_triage",
+                        "trigger_message_id": msg.message_id,
+                        "triage_source": triage_source,
+                    },
+                    active_conversation_id=msg.conversation_id,
+                )
+                # Brief ack so the user sees this turn closed cleanly. The actual
+                # work happens in the work sub-conversation when the worker fires.
+                await executor.send_message(
+                    msg.conversation_id,
+                    f"Tracking as: {triage_title}",
+                )
+                await _cancel_signal_bubble()
+                return None
+            except Exception:
+                # Triage short-circuit is best-effort. If create_task fails, fall
+                # through to the normal LLM path so the user still gets a reply.
+                logger.exception(
+                    "[%s] MessageTriage short-circuit failed — falling back to LLM",
+                    executor_key,
+                )
+
         # Paint the streaming bubble as soon as the bridge accepts the
         # message — by this point the agent has been chosen for delivery,
         # passed the skipMessage / skipTrivialMessage filters, and is
@@ -3465,6 +3548,20 @@ def run_single_agent(
                     executor_key, result.elapsed_seconds, _loop_label,
                     result.iterations, len(result.tool_calls),
                 )
+
+                # Telemetry: when the CLI ran its own internal loop, the
+                # platform's tool_invocations table never sees those calls.
+                # POST a per-tool tally so we can measure inline-grinding
+                # behaviour and verify MessageTriage routing is reducing it.
+                # Best-effort — fire-and-forget, never blocks the reply.
+                if _cli_internal and result.tool_calls:
+                    asyncio.create_task(_record_cli_tool_uses(
+                        executor,
+                        msg.conversation_id,
+                        [tc.name for tc in result.tool_calls if tc.name],
+                        executor_key,
+                    ))
+
                 reply = result.text[:MAX_REPLY_CHARS]
                 if not reply:
                     # Empty text from a successful model call = model chose silence

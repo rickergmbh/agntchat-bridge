@@ -105,6 +105,12 @@ class GatewayMessage:
     turn_context: dict[str, Any] | None = None  # Turn queue position & prior responses
     recent_messages: list[dict[str, Any]] = field(default_factory=list)  # Preloaded history (tier 2)
     latest_seen_message_id: str | None = None  # Cross-talk freshness anchor (server-computed)
+    # Server-computed REPLY/TASK classification (Agentchat.Gateway.MessageTriage).
+    # Shape: {"classification": "REPLY"|"TASK", "title": str|None, "source": str}.
+    # When `classification == "TASK"`, the bridge short-circuits the LLM call
+    # and creates a self-task directly so the work runs in a focused
+    # sub-conversation instead of inline.
+    message_triage: dict[str, Any] | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -130,6 +136,7 @@ class GatewayMessage:
             turn_context=d.get("turnContext"),
             recent_messages=d.get("recentMessages") or [],
             latest_seen_message_id=d.get("latestSeenMessageId"),
+            message_triage=d.get("messageTriage"),
             raw=d,
         )
 
