@@ -3423,14 +3423,10 @@ def run_single_agent(
         # failure mode (see executor.ex self-task nudge for why prompt-only doesn't
         # work for CLI-internal-loop backends like claude_cli).
         #
-        # IMPORTANT: skip the short-circuit when the trigger message has a file
-        # attachment (typically an image). The task description carries only the
-        # text caption; the attachment doesn't follow into the work sub-conversation,
-        # so the agent would respond "I can't see the image" — exactly the bug we
-        # had on conversation 8ebb8ed9 with content_type=file. Letting the normal
-        # LLM path handle image messages preserves the multimodal vision block
-        # that `messages_to_chat_history` builds for `content_type=file` entries
-        # with `image/*` mime types, so the agent actually sees the picture.
+        # File attachments (e.g. images) are copied into the work sub-conversation
+        # by TaskAssignmentWorker via the `trigger_message_id` task metadata key,
+        # so the worker sees the image in its chat history and `messages_to_chat_history`
+        # builds proper vision blocks.
         if (
             msg.message_triage
             and msg.message_triage.get("classification") == "TASK"
@@ -3438,7 +3434,6 @@ def run_single_agent(
             and not directives.get("deferTaskCreation", False)
             and msg.is_human  # only force self-task on human triggers
             and msg.conversation_id
-            and msg.content_type == "text"  # attachments need full LLM context
         ):
             triage_title = (msg.message_triage.get("title") or "").strip() or "Task"
             triage_source = msg.message_triage.get("source", "?")

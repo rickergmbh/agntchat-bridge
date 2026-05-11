@@ -256,17 +256,23 @@ class ToolExecutor:
             if injected_key in arguments and injected_key not in kw_args:
                 kw_args[injected_key] = arguments[injected_key]
 
+        result: Any = None
+        call_failed = False
         try:
             result = await method(**kw_args)
             result_str = _serialize(result)
         except Exception as e:
             logger.warning("Tool %s failed: %s", tool_name, e)
             result_str = json.dumps({"error": str(e)})
+            call_failed = True
 
         # Post-action verification for side-effecting tools.
         # If the method is in the verification registry, read back the
-        # created resource to confirm it actually exists.
-        if needs_verification(executor_method):
+        # created resource to confirm it actually exists. Skip when the
+        # call itself raised — there's nothing to verify, and passing
+        # the unset `result` would mask the real error with a confusing
+        # UnboundLocalError that the LLM then surfaces as "tools are down".
+        if not call_failed and needs_verification(executor_method):
             verification = await verify_action(
                 self._client, executor_method, result
             )
