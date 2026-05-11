@@ -479,6 +479,40 @@ class ExecutorClient:
                 if self._running:
                     logger.info("[WS-GATEWAY] Disconnected — reconnecting")
 
+            except asyncio.CancelledError:
+                # Two distinct cases for CancelledError:
+                #
+                # 1. We're shutting down (self._running == False): the caller
+                #    cancelled this loop, propagate so asyncio.gather unwinds
+                #    cleanly.
+                #
+                # 2. We're still running: the WS transport cancelled an
+                #    in-flight Future (typically when the underlying socket
+                #    closed mid-join — the reply Future is cancelled by
+                #    transport teardown). In Python 3.8+ CancelledError is a
+                #    BaseException, not Exception, so the generic handler
+                #    below doesn't catch this. Without explicit handling the
+                #    error propagates through `start()`'s asyncio.gather and
+                #    kills the bridge process.
+                if not self._running:
+                    raise
+
+                self._ws_healthy = False
+                consecutive_errors += 1
+                delay = self._backoff_delay(consecutive_errors)
+                logger.warning(
+                    "[WS-GATEWAY] Transport cancelled mid-handshake; retrying in %.1fs",
+                    delay,
+                )
+                if transport is not None:
+                    try:
+                        await transport.disconnect()
+                    except Exception:
+                        pass
+                self._ws_transport = None
+                await asyncio.sleep(delay)
+                continue
+
             except Exception as e:
                 self._ws_healthy = False
                 consecutive_errors += 1
