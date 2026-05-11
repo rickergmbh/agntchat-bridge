@@ -740,35 +740,57 @@ class ExecutorClient:
                 timeout=self._task_timeout,
             )
 
-            # Normalize result
-            if result is None:
-                result_data = {}
-            elif isinstance(result, str):
-                result_data = {"summary": result}
-            elif isinstance(result, dict):
-                result_data = result
-            else:
-                result_data = {"summary": str(result)}
+            # Atomic completion contract (protocol v2):
+            # - String result → the agent's full user-facing reply, posted in
+            #   the work conversation AND used as the parent-DM summary.
+            # - Dict result → may carry `response`, `summary`, `silent`, plus
+            #   any additional `result_data` fields. `response` is the
+            #   canonical user-facing text; `summary` overrides the derived
+            #   first-200-chars default for the parent-DM card.
+            # - None → silent completion (PULSE_OK-style; no work-conv post).
+            response_text: str | None = None
+            summary: str | None = None
+            silent: bool = False
+            extra: dict[str, Any] = {}
 
-            # Report completion
-            await self._post(
-                f"/api/gateway/tasks/{task.id}/complete",
-                json={
-                    "executor_id": self._executor_id,
-                    "result": result_data,
-                },
+            if result is None:
+                silent = True
+            elif isinstance(result, str):
+                response_text = result
+            elif isinstance(result, dict):
+                response_text = result.get("response")
+                summary = result.get("summary")
+                silent = bool(result.get("silent", False))
+                # Anything else is forwarded as result_data for downstream
+                # readers (ResultPresentation forwarding, etc.).
+                extra = {
+                    k: v
+                    for k, v in result.items()
+                    if k not in ("response", "summary", "silent")
+                }
+                # Tolerate the legacy shape: handlers that still return
+                # `{"summary": "..."}` get migrated to the new contract
+                # implicitly — that summary IS the response.
+                if response_text is None and summary and not silent:
+                    response_text = summary
+            else:
+                response_text = str(result)
+
+            await self._invoke_complete_task(
+                task.id,
+                response_text=response_text,
+                summary=summary,
+                silent=silent,
+                result_data=extra,
             )
             logger.info("Task %s completed", task.id)
 
         except Exception as e:
             logger.exception("Task %s failed: %s", task.id, e)
             try:
-                await self._post(
-                    f"/api/gateway/tasks/{task.id}/fail",
-                    json={
-                        "executor_id": self._executor_id,
-                        "error": {"message": str(e), "type": type(e).__name__},
-                    },
+                await self._invoke_fail_task(
+                    task.id,
+                    error_text=f"{type(e).__name__}: {e}",
                 )
             except Exception:
                 logger.exception("Failed to report failure for task %s", task.id)
@@ -781,6 +803,130 @@ class ExecutorClient:
             f"/api/gateway/tasks/{task_id}/progress",
             json={"executor_id": self._executor_id, **progress},
         )
+
+    # ------------------------------------------------------------------
+    # Atomic completion (protocol v2)
+    # ------------------------------------------------------------------
+    #
+    # The backend's HTTP /complete and /fail endpoints were removed in
+    # the atomic-completion migration. Completions now flow through MCP
+    # `complete_task` / `fail_task`, which post the agent's response and
+    # flip the task to terminal in one transaction. The bridge invokes
+    # these via the platform's internal MCP-call endpoint so the same
+    # backend code path serves bridge, hosted, and any future client.
+
+    async def _invoke_complete_task(
+        self,
+        task_id: str,
+        *,
+        response_text: str | None = None,
+        summary: str | None = None,
+        silent: bool = False,
+        result_data: dict[str, Any] | None = None,
+    ) -> None:
+        """Atomic completion via MCP. Posts the agent's response in the
+        work conversation AND flips the task to `complete` in one
+        transaction. Use `silent=True` for PULSE_OK-style no-output
+        completions.
+        """
+        payload: dict[str, Any] = {"task_id": task_id, "silent": silent}
+        if response_text is not None:
+            payload["response"] = response_text
+        if summary is not None:
+            payload["summary"] = summary
+        if result_data:
+            payload["result_data"] = result_data
+
+        await self._call_platform_tool("complete_task", payload)
+
+    async def _invoke_fail_task(
+        self,
+        task_id: str,
+        *,
+        error_text: str | None = None,
+        summary: str | None = None,
+        silent: bool = False,
+    ) -> None:
+        """Atomic failure via MCP. Symmetric to _invoke_complete_task."""
+        payload: dict[str, Any] = {"task_id": task_id, "silent": silent}
+        if error_text is not None:
+            payload["error"] = error_text
+        if summary is not None:
+            payload["summary"] = summary
+
+        await self._call_platform_tool("fail_task", payload)
+
+    async def complete_task(
+        self,
+        task_id: str,
+        *,
+        response: str | None = None,
+        summary: str | None = None,
+        silent: bool = False,
+        result_data: dict[str, Any] | None = None,
+    ) -> None:
+        """Public API for handlers/external callers that want to mark a
+        task complete directly without returning from `_task_handler`.
+
+        Same semantics as returning the equivalent dict from a handler:
+        the response is posted in the work conv AND the task flips to
+        `complete` in one atomic backend transaction.
+        """
+        await self._invoke_complete_task(
+            task_id,
+            response_text=response,
+            summary=summary,
+            silent=silent,
+            result_data=result_data,
+        )
+
+    async def fail_task(
+        self,
+        task_id: str,
+        *,
+        error: str | None = None,
+        summary: str | None = None,
+        silent: bool = False,
+    ) -> None:
+        """Public API for marking a task failed. See complete_task for
+        the full atomic contract.
+        """
+        await self._invoke_fail_task(
+            task_id,
+            error_text=error,
+            summary=summary,
+            silent=silent,
+        )
+
+    async def _call_platform_tool(
+        self, tool_name: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Invoke a platform MCP tool by name. Used by complete_task /
+        fail_task. The backend dispatches via MCP.ToolRegistry — same
+        code path as hosted agents.
+        """
+        body = await self._post(
+            "/api/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": arguments},
+            },
+        )
+
+        result = body.get("result") or {}
+        is_error = result.get("isError") is True
+
+        if is_error:
+            text = ""
+            for block in result.get("content") or []:
+                if block.get("type") == "text":
+                    text = block.get("text") or ""
+                    break
+            raise AgentChatError(f"MCP {tool_name} failed: {text}")
+
+        return result
 
     async def create_task(
         self,
