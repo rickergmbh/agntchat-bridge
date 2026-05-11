@@ -776,24 +776,49 @@ class ExecutorClient:
             else:
                 response_text = str(result)
 
+            # If the handler produced no usable text and didn't explicitly
+            # opt into silent, force silent so the task can terminate
+            # cleanly. The backend rejects empty-response non-silent
+            # completions (validate_content_args → :response_required),
+            # which otherwise traps the task in_progress and forces a
+            # fail_task fallback that may itself fail.
+            if not silent and not (response_text and response_text.strip()):
+                logger.warning(
+                    "Task %s: handler returned no response text; "
+                    "completing silently to avoid backend rejection",
+                    task.id,
+                )
+                silent = True
+                response_text = None
+                summary = None
+
+            # MCP complete_task / fail_task want the underlying Task.id
+            # (task.task_id), NOT the gateway queue entry id (task.id).
+            # The HTTP /accept and /progress endpoints below take the
+            # queue id; the atomic-completion MCP tools look up
+            # `Repo.get(Task, task_id)` so they need the real one.
+            real_task_id = task.task_id or task.id
+
             await self._invoke_complete_task(
-                task.id,
+                real_task_id,
                 response_text=response_text,
                 summary=summary,
                 silent=silent,
                 result_data=extra,
             )
-            logger.info("Task %s completed", task.id)
+            logger.info("Task %s completed", real_task_id)
 
         except Exception as e:
-            logger.exception("Task %s failed: %s", task.id, e)
+            logger.exception("Task %s failed: %s", task.task_id or task.id, e)
             try:
                 await self._invoke_fail_task(
-                    task.id,
+                    task.task_id or task.id,
                     error_text=f"{type(e).__name__}: {e}",
                 )
             except Exception:
-                logger.exception("Failed to report failure for task %s", task.id)
+                logger.exception(
+                    "Failed to report failure for task %s", task.task_id or task.id
+                )
 
     async def report_progress(
         self, task_id: str, progress: dict[str, Any]
