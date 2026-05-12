@@ -2072,6 +2072,13 @@ def _summarize_tool(name: str, inp: dict[str, Any]) -> str:
             return desc[:80]
         cmd = inp.get("command", "")
         return f"Running: {cmd[:60]}" if cmd else "Running command"
+    # Codex CLI's shell tool — same shape as Bash but the CLI calls it
+    # "shell" internally. Without this case the live stream shows a
+    # generic "Shell" label for every command (the codex_cli backend
+    # has very little tool variety vs claude_cli, so this fires often).
+    if name == "shell":
+        cmd = inp.get("command", "")
+        return f"Running: {cmd[:60]}" if cmd else "Running command"
     if name == "Glob":
         return f"Searching for {inp.get('pattern', 'files')}"
     if name == "Grep":
