@@ -432,6 +432,14 @@ def extract_agent_config(profile: dict[str, Any] | None) -> dict[str, Any]:
         config["execution_mode"] = execution_mode
     if model_config.get("effort"):
         config["effort"] = model_config["effort"]
+    # Skip-permissions: web/mobile save as snake_case in model_config,
+    # desktop's local agentStore keeps the camelCase form before the
+    # Tauri spawn translates it into a CLI flag. Accept both so the
+    # toggle works no matter which client wrote it.
+    if model_config.get("dangerously_skip_permissions") or model_config.get(
+        "dangerouslySkipPermissions"
+    ):
+        config["dangerously_skip_permissions"] = True
 
     return config
 
@@ -2683,6 +2691,11 @@ def run_single_agent(
     if agent_config.get("timeout"):
         backend_kwargs["timeout"] = agent_config["timeout"]
     if args.dangerously_skip_permissions:
+        backend_kwargs["dangerously_skip_permissions"] = True
+    elif agent_config.get("dangerously_skip_permissions"):
+        # Per-agent toggle from web/mobile UI (or desktop's local
+        # config when an agent is later edited via the server). The
+        # bridge CLI flag still wins so operators can override.
         backend_kwargs["dangerously_skip_permissions"] = True
     if args.effort:
         backend_kwargs["effort"] = args.effort
