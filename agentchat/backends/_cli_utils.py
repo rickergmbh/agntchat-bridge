@@ -1,0 +1,147 @@
+"""Shared helpers for subprocess-based CLI backends (claude_cli, codex_cli).
+
+These functions encode platform behavior (Windows shim routing, PATHEXT
+resolution, temp-file image handling) that must stay in sync across
+every CLI backend — if claude_cli updates one and codex_cli doesn't,
+Windows users see divergent failures. Put the shared logic here.
+"""
+
+from __future__ import annotations
+
+import base64
+import os
+import re
+import shutil
+import sys
+import tempfile
+import urllib.request
+from typing import Iterable
+
+
+# Matches ANSI escape sequences (colors, bold, cursor movement, etc.)
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def resolve_cli_path(path: str) -> str:
+    """Resolve the CLI to an absolute path the OS can actually launch.
+
+    On Windows, npm installs CLIs as ``.cmd`` shims — the bare name is
+    not what ``CreateProcess`` sees. ``shutil.which`` respects PATHEXT so
+    it returns the real ``.cmd`` / ``.ps1`` / ``.bat`` path.
+    """
+    return shutil.which(path) or path
+
+
+def spawn_argv(cmd: list[str]) -> list[str]:
+    """Adjust argv so asyncio.create_subprocess_exec can launch on Windows.
+
+    Windows' ``CreateProcess`` can't execute shim scripts directly — it
+    only runs real ``.exe`` files. npm's global bin (where CLIs live) is
+    exactly these shims, so we route ``.cmd`` / ``.bat`` through
+    ``cmd.exe /c`` and ``.ps1`` through ``powershell.exe -File``.
+    Non-Windows is unchanged.
+    """
+    if sys.platform != "win32" or not cmd:
+        return cmd
+    exe_lower = cmd[0].lower()
+    if exe_lower.endswith((".cmd", ".bat")):
+        return ["cmd.exe", "/c", *cmd]
+    if exe_lower.endswith(".ps1"):
+        return [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            *cmd,
+        ]
+    return cmd
+
+
+def try_int(val: str | None) -> int | None:
+    """Parse an int from a string, returning None on failure."""
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except ValueError:
+        return None
+
+
+def write_temp(content: str, suffix: str, prefix: str, cleanup: list[str]) -> str:
+    """Write `content` to a new temp file (utf-8) and record it for cleanup.
+
+    Records the path before writing so a write failure (disk full, encode
+    error) still leaves an entry the caller can unlink — no orphans.
+    """
+    fd, path = tempfile.mkstemp(suffix=suffix, prefix=prefix)
+    cleanup.append(path)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(content)
+    return path
+
+
+def cleanup_temp_files(paths: Iterable[str]) -> None:
+    """Unlink each path, swallowing OSError (already gone, permission, etc.)."""
+    for p in paths:
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
+
+def download_image_to_temp(url: str) -> str | None:
+    """Download an image URL to a temp file. Returns the file path or None."""
+    try:
+        ext_map = {
+            ".jpg": ".jpg",
+            ".jpeg": ".jpg",
+            ".png": ".png",
+            ".gif": ".gif",
+            ".webp": ".webp",
+        }
+        ext = ".jpg"
+        for suffix, mapped in ext_map.items():
+            if suffix in url.lower().split("?")[0]:
+                ext = mapped
+                break
+        fd, path = tempfile.mkstemp(suffix=ext, prefix="agentchat_img_")
+        os.close(fd)
+        urllib.request.urlretrieve(url, path)
+        # Defensive: a missing-image redirect or 200-OK-but-empty body
+        # produces a near-zero-byte file. Treat it as a failed download.
+        if os.path.getsize(path) < 100:
+            os.unlink(path)
+            return None
+        return path
+    except Exception:
+        return None
+
+
+def save_base64_image_to_temp(data: str, media_type: str) -> str | None:
+    """Save base64-encoded image data to a temp file. Returns the file path."""
+    try:
+        ext = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/gif": ".gif",
+            "image/webp": ".webp",
+        }.get(media_type, ".jpg")
+        fd, path = tempfile.mkstemp(suffix=ext, prefix="agentchat_img_")
+        os.write(fd, base64.b64decode(data))
+        os.close(fd)
+        return path
+    except Exception:
+        return None
+
+
+__all__ = [
+    "ANSI_ESCAPE_RE",
+    "cleanup_temp_files",
+    "download_image_to_temp",
+    "resolve_cli_path",
+    "save_base64_image_to_temp",
+    "spawn_argv",
+    "try_int",
+    "write_temp",
+]

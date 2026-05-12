@@ -25,54 +25,25 @@ import asyncio
 import json
 import os
 import re
-import shutil
 import sys
-import tempfile
 import time
 from typing import Any
 
 import logging
 
 from . import ChatMessage, ModelBackend, ModelResult, ProgressCallback, ToolCall
+from ._cli_utils import (
+    ANSI_ESCAPE_RE,
+    cleanup_temp_files,
+    download_image_to_temp,
+    resolve_cli_path,
+    save_base64_image_to_temp,
+    spawn_argv,
+    try_int,
+    write_temp,
+)
 from ..tools.parsing import parse_tool_calls
 
-
-def _resolve_cli_path(path: str) -> str:
-    """Resolve the CLI to an absolute path that the OS can actually launch.
-
-    On Windows, npm installs `claude` as a `.cmd` shim — the bare name is
-    not what CreateProcess sees. `shutil.which` respects PATHEXT so it
-    returns the real `claude.cmd` path (or the .ps1/.bat equivalent).
-    """
-    resolved = shutil.which(path)
-    return resolved or path
-
-
-def _write_temp(content: str, suffix: str, prefix: str, cleanup: list[str]) -> str:
-    """Write `content` to a new temp file (utf-8) and record it for cleanup."""
-    fd, path = tempfile.mkstemp(suffix=suffix, prefix=prefix)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(content)
-    cleanup.append(path)
-    return path
-
-
-def _spawn_argv(cmd: list[str]) -> list[str]:
-    """Adjust argv so asyncio.create_subprocess_exec can launch it on Windows.
-
-    Windows' CreateProcess can't execute shim scripts directly — it only
-    runs real `.exe` files. npm's global bin (where Claude Code lives) is
-    exactly these shims, so we route through `cmd.exe /c` for `.cmd`/`.bat`
-    and `powershell.exe -File` for `.ps1`. Non-Windows is unchanged.
-    """
-    if sys.platform != "win32" or not cmd:
-        return cmd
-    exe_lower = cmd[0].lower()
-    if exe_lower.endswith((".cmd", ".bat")):
-        return ["cmd.exe", "/c", *cmd]
-    if exe_lower.endswith(".ps1"):
-        return ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", *cmd]
-    return cmd
 
 # Patterns detected in streaming text to report semantic progress (same as anthropic backend).
 _SECTION_PATTERNS = [
@@ -85,9 +56,6 @@ logger = logging.getLogger("agentchat.backends.claude_cli")
 _DEFAULT_CLI_PATH = "claude"
 _DEFAULT_TIMEOUT = 900  # 15 minutes — complex tasks need time
 _STREAM_LIMIT = 10 * 1024 * 1024  # 10 MB — CLI can emit large JSON lines
-
-# Matches ANSI escape sequences (colors, bold, cursor movement, etc.)
-_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def _content_to_cli_text(content: str | list) -> str:
@@ -113,14 +81,14 @@ def _content_to_cli_text(content: str | list) -> str:
             if src_type == "url":
                 url = source.get("url", "")
                 # Download image to temp file for CLI's Read tool
-                path = _download_image_to_temp(url)
+                path = download_image_to_temp(url)
                 if path:
                     parts.append(f"[Image saved to: {path} — use Read to view it]")
                 else:
                     parts.append(f"[Image URL: {url}]")
             elif src_type == "base64":
                 # Legacy base64 — save to temp file to avoid bloating the prompt
-                path = _save_base64_image_to_temp(
+                path = save_base64_image_to_temp(
                     source.get("data", ""),
                     source.get("media_type", "image/jpeg"),
                 )
@@ -132,7 +100,7 @@ def _content_to_cli_text(content: str | list) -> str:
     return " ".join(parts) if parts else str(content)
 
 
-def _download_image_to_temp(url: str) -> str | None:
+def download_image_to_temp(url: str) -> str | None:
     """Download an image URL to a temp file. Returns the file path."""
     try:
         import urllib.request
@@ -155,7 +123,7 @@ def _download_image_to_temp(url: str) -> str | None:
         return None
 
 
-def _save_base64_image_to_temp(data: str, media_type: str) -> str | None:
+def save_base64_image_to_temp(data: str, media_type: str) -> str | None:
     """Save base64-encoded image data to a temp file. Returns the file path."""
     try:
         import base64
@@ -192,13 +160,13 @@ class ClaudeCliBackend(ModelBackend):
         api_key: str | None = None,
         **_kwargs: Any,
     ) -> None:
-        self._cli_path = _resolve_cli_path(
+        self._cli_path = resolve_cli_path(
             cli_path or os.getenv("CLAUDE_CLI_PATH", _DEFAULT_CLI_PATH)
         )
         self._model = model or os.getenv("CLAUDE_CLI_MODEL")
         self._timeout = (
             timeout
-            or _try_int(os.getenv("CLAUDE_CLI_TIMEOUT"))
+            or try_int(os.getenv("CLAUDE_CLI_TIMEOUT"))
             or _DEFAULT_TIMEOUT
         )
         if dangerously_skip_permissions is not None:
@@ -213,7 +181,7 @@ class ClaudeCliBackend(ModelBackend):
             self._effort = None
 
         # Max agentic turns — safety rail for print mode
-        self._max_turns = max_turns or _try_int(os.getenv("CLAUDE_CLI_MAX_TURNS"))
+        self._max_turns = max_turns or try_int(os.getenv("CLAUDE_CLI_MAX_TURNS"))
 
         # Fallback model when primary is overloaded (print mode only)
         # Opt-in: only set if explicitly provided via kwarg or env var
@@ -226,7 +194,7 @@ class ClaudeCliBackend(ModelBackend):
         # Max output tokens — passed via --settings '{"maxOutputTokens": N}'
         self._max_tokens = (
             max_tokens
-            or _try_int(os.getenv("CLAUDE_CLI_MAX_TOKENS"))
+            or try_int(os.getenv("CLAUDE_CLI_MAX_TOKENS"))
             or 16384
         )
 
@@ -413,7 +381,7 @@ class ClaudeCliBackend(ModelBackend):
                 # re-interprets `%VAR%`, `&`, `|`, `^`, `<`, `>` in argv.
                 # Soul.md commonly contains those characters, so write the
                 # prompt to a temp file and pass --system-prompt-file.
-                cmd.extend(["--system-prompt-file", _write_temp(system_prompt, ".txt", "agentchat_sp_", cleanup_paths)])
+                cmd.extend(["--system-prompt-file", write_temp(system_prompt, ".txt", "agentchat_sp_", cleanup_paths)])
             else:
                 cmd.extend(["--system-prompt", system_prompt])
         if self._max_tokens:
@@ -452,19 +420,11 @@ class ClaudeCliBackend(ModelBackend):
                     # Same rationale as --system-prompt-file: API URLs with
                     # `?a=1&b=2` or env values with `%` would be re-parsed
                     # by cmd.exe. The CLI accepts a JSON file path here.
-                    cmd.extend(["--mcp-config", _write_temp(mcp_config, ".json", "agentchat_mcp_", cleanup_paths)])
+                    cmd.extend(["--mcp-config", write_temp(mcp_config, ".json", "agentchat_mcp_", cleanup_paths)])
                 else:
                     cmd.extend(["--mcp-config", mcp_config])
 
         return cmd, user_prompt, cleanup_paths
-
-    @staticmethod
-    def _cleanup_temp_files(paths: list[str]) -> None:
-        for p in paths:
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
 
     def set_mcp_context(
         self,
@@ -503,7 +463,7 @@ class ClaudeCliBackend(ModelBackend):
                 return await self._generate_streaming(cmd, on_progress, prompt)
             return await self._generate_batch(cmd, prompt)
         finally:
-            self._cleanup_temp_files(cleanup)
+            cleanup_temp_files(cleanup)
 
     # ------------------------------------------------------------------
     # Batch mode (original behavior, no progress)
@@ -525,7 +485,7 @@ class ClaudeCliBackend(ModelBackend):
     async def _generate_batch(self, cmd: list[str], prompt: str = "") -> ModelResult:
         start = time.monotonic()
         proc = await asyncio.create_subprocess_exec(
-            *_spawn_argv(cmd),
+            *spawn_argv(cmd),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -558,7 +518,7 @@ class ClaudeCliBackend(ModelBackend):
             )
 
         text = stdout.decode().strip() if stdout else ""
-        text = _ANSI_ESCAPE_RE.sub("", text)
+        text = ANSI_ESCAPE_RE.sub("", text)
 
         return ModelResult(
             text=text,
@@ -589,7 +549,7 @@ class ClaudeCliBackend(ModelBackend):
         start = time.monotonic()
 
         proc = await asyncio.create_subprocess_exec(
-            *_spawn_argv(cmd),
+            *spawn_argv(cmd),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -787,7 +747,7 @@ class ClaudeCliBackend(ModelBackend):
             )
 
         clean_text = result_text.strip() if result_text else ""
-        clean_text = _ANSI_ESCAPE_RE.sub("", clean_text)
+        clean_text = ANSI_ESCAPE_RE.sub("", clean_text)
 
         return ModelResult(
             text=clean_text,
@@ -864,7 +824,7 @@ class ClaudeCliBackend(ModelBackend):
                     result = await self._generate_batch(cmd, prompt)
                 elapsed = time.monotonic() - start
             finally:
-                self._cleanup_temp_files(cleanup)
+                cleanup_temp_files(cleanup)
 
             # The inner CLI ran the entire agentic loop. Hoist its tool_use
             # tally and turn count up so the bridge can log real numbers
@@ -949,7 +909,7 @@ class ClaudeCliBackend(ModelBackend):
                     stop_reason="error",
                 )
             finally:
-                self._cleanup_temp_files(cleanup)
+                cleanup_temp_files(cleanup)
 
             remaining_text, calls = parse_tool_calls(result.text)
 
@@ -1044,7 +1004,7 @@ class ClaudeCliBackend(ModelBackend):
                 except Exception:
                     remaining_text = results_text[:5000]
                 finally:
-                    self._cleanup_temp_files(cleanup)
+                    cleanup_temp_files(cleanup)
 
                 elapsed = time.monotonic() - start
                 return ModelResult(
@@ -1112,16 +1072,6 @@ def _build_tool_prompt(tools: list[dict[str, Any]]) -> str:
         lines.append("")
 
     return "\n".join(lines)
-
-
-def _try_int(val: str | None) -> int | None:
-    """Parse an int from a string, returning None on failure."""
-    if val is None:
-        return None
-    try:
-        return int(val)
-    except ValueError:
-        return None
 
 
 def create(**kwargs: Any) -> ClaudeCliBackend:

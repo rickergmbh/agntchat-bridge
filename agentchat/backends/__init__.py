@@ -176,6 +176,7 @@ _BACKEND_REGISTRY: dict[str, str] = {
     "openai": ".openai",
     "openclaw": ".openclaw",
     "claude_cli": ".claude_cli",
+    "codex_cli": ".codex_cli",
 }
 
 

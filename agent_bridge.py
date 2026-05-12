@@ -98,7 +98,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backend",
         default=os.getenv("MODEL_BACKEND"),
-        help="Model backend: anthropic, openai, claude_cli (default: from agent profile or env)",
+        help="Model backend: anthropic, openai, claude_cli, codex_cli (default: from agent profile or env)",
     )
     parser.add_argument(
         "--model",
@@ -2702,8 +2702,8 @@ def run_single_agent(
         backend_kwargs["chrome"] = agent_config["chrome"]
 
     effective_backend = args.backend or agent_config.get("backend")
-    # Pass API credentials for MCP server (claude_cli backend only)
-    if effective_backend == "claude_cli":
+    # Pass API credentials for MCP server (CLI backends: claude_cli, codex_cli)
+    if effective_backend in ("claude_cli", "codex_cli"):
         backend_kwargs["api_url"] = AGENTGRAM_API_URL
         backend_kwargs["agent_id"] = agent_id
         backend_kwargs["api_key"] = api_key
