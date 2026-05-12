@@ -39,7 +39,7 @@ def main() -> None:
     join_parser.add_argument("--executor-key", default=None, help="Executor key for gateway registration")
     join_parser.add_argument("--display-name", default=None, help="Display name for the executor")
     join_parser.add_argument("--capabilities", default=None, help="Comma-separated capabilities (e.g. code,git,shell)")
-    join_parser.add_argument("--no-start", action="store_true", help="Don't start the executor poll loop")
+    join_parser.add_argument("--no-start", action="store_true", help="Don't start the executor gateway loop")
 
     # info
     info_parser = subparsers.add_parser("info", help="Show public invite info")

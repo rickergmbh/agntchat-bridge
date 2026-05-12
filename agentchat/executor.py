@@ -1,7 +1,7 @@
-"""Gateway executor client — long-poll based task execution for AgentChat.
+"""Gateway executor client — WebSocket-push task execution for AgentChat.
 
-Drop-in replacement for the WebSocket-based agent_bridge.py.
-Each poll is an independent HTTP request — self-healing by design.
+Drop-in replacement for the legacy single-file agent_bridge.py.
+Gateway delivery is push-based over Phoenix Channels, with REST used for control-plane calls.
 
 Usage:
     from agentchat.executor import ExecutorClient
@@ -189,11 +189,11 @@ ScopeRequestHandler = Callable[["ScopeRequest"], Awaitable[Optional[Dict[str, An
 
 
 class ExecutorClient:
-    """Long-poll executor client for the AgentChat Gateway.
+    """WebSocket gateway executor client for AgentChat.
 
-    Authenticates as an agent, registers an executor, and enters a
-    poll loop that claims tasks, runs a user-provided handler, and
-    reports results back to the gateway.
+    Authenticates as an agent, registers an executor, joins the user channel,
+    receives pushed gateway work, runs user-provided handlers, and reports
+    progress / completion back through the gateway + MCP control plane.
     """
 
     def __init__(
@@ -305,7 +305,7 @@ class ExecutorClient:
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        """Blocking entry point — runs the poll loop forever."""
+        """Blocking entry point — runs the gateway loop forever."""
         loop = asyncio.new_event_loop()
         self._shutdown_done = False
 
@@ -333,7 +333,7 @@ class ExecutorClient:
             loop.close()
 
     async def start(self) -> None:
-        """Authenticate, register executor, and enter the poll loops."""
+        """Authenticate, register executor, and enter the gateway loops."""
         if not self._task_handler and not self._message_handler:
             raise RuntimeError("No handler registered. Use @executor.on_task or @executor.on_message")
 
@@ -398,7 +398,7 @@ class ExecutorClient:
     def _backoff_delay(consecutive_errors: int) -> float:
         """Compute exponential backoff with wide jitter to prevent thundering herd.
 
-        When the backend goes down, all executor poll loops (tasks, messages,
+        When the backend goes down, all executor gateway loops (tasks, messages,
         scope-requests × N agents) retry simultaneously. Without enough jitter,
         the flood of reconnection attempts triggers Fly's proxy rate limiter,
         preventing the machine from restarting. Wide jitter (0-50% of base)
@@ -540,23 +540,21 @@ class ExecutorClient:
                     self._ws_transport = None
 
     def _on_ws_disconnect(self) -> None:
-        """Transport-driven disconnect callback. Flips health flag; polls resume."""
+        """Transport-driven disconnect callback. Flips health flag; gateway loop reconnects."""
         self._ws_healthy = False
 
     def _ws_dispatch_event(self, topic: str, event: str, payload: dict) -> None:
         """Sync callback from PhoenixTransport. Schedules the async handler.
 
-        Parses gateway events into the same GatewayMessage/Task/ScopeRequest
-        dataclasses the poll path uses, then dispatches to the same wrappers —
-        so handler, dedup, ack, and concurrency semantics are identical across
-        WS and HTTP paths.
+        Parses gateway events into GatewayMessage/Task/ScopeRequest dataclasses,
+        then dispatches to the shared wrappers so handler, dedup, ack, and
+        concurrency semantics stay stable.
         """
         if not topic.startswith("user:"):
             return
 
         if event == "gateway_message":
-            # Signal-only payload ({} with no fields) is the legacy hint for
-            # long-poll clients that haven't bound an executor_id. Ignore it —
+            # Signal-only payload ({} with no fields) is a legacy hint. Ignore it —
             # if we bound executor_id we only expect full payloads here.
             if not payload or not payload.get("id"):
                 return
@@ -699,7 +697,7 @@ class ExecutorClient:
             logger.info("Unknown command type: %s", cmd_type)
 
     async def stop(self) -> None:
-        """Signal the poll loop to stop and deregister executor."""
+        """Signal the gateway loop to stop and deregister executor."""
         self._running = False
         self._ws_healthy = False
 
@@ -2335,7 +2333,7 @@ class ExecutorClient:
         scope_request_ids: list[str],
         timeout: int = 25,
     ) -> dict[str, Any]:
-        """Long-poll for scope responses from agents.
+        """Collect scope responses from agents, waiting up to timeout seconds.
 
         Returns a dict mapping agent_id → response for each agent that
         responded within the timeout.
@@ -2458,14 +2456,13 @@ class ExecutorClient:
         self,
         items: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        """Batch-complete multiple queued tasks at once.
+        """Deprecated: batch task completion is no longer a gateway HTTP primitive.
 
-        Each item: {"id": queued_task_id, "result": result_data}.
-        Returns {"results": [...], "count": N}.
+        Complete each task with `complete_task()` / MCP `complete_task` so the
+        response post and terminal status update stay atomic per task.
         """
-        return await self._post(
-            "/api/gateway/tasks/batch-complete",
-            json={"items": items, "executor_id": self._executor_id},
+        raise RuntimeError(
+            "batch_complete_tasks is deprecated; call complete_task/fail_task per task"
         )
 
     async def batch_ack_messages(

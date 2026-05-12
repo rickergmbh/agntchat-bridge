@@ -7,10 +7,10 @@ and sends responses back. ALL behavioral logic (prompts, rules, identity,
 scoping, reframing, error messages) comes from the backend via directives.
 
 Architecture:
-  Bridge ──GET /gateway/tasks──▶ Backend (long-poll, blocks up to 30s)
-  Bridge ◀──────task JSON──────  Backend
-  Bridge ──Model Backend──▶ Any LLM (Anthropic, OpenAI, Ollama, Claude CLI, etc.)
-  Bridge ──POST /gateway/tasks/:id/complete──▶ Backend
+  Bridge ──WS user:{agent_id}──▶ Backend (gateway push + catchup)
+  Bridge ◀────gateway_task─────  Backend
+  Bridge ──Model Backend──────▶ Any LLM (Anthropic, OpenAI, Ollama, Claude CLI, etc.)
+  Bridge ──MCP complete_task──▶ Backend
 
 Modes:
   # Single agent (env vars)
