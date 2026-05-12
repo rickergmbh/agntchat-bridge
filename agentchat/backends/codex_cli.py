@@ -541,6 +541,13 @@ class CodexCliBackend(ModelBackend):
                     thread_id = event.get("thread_id")
                 elif etype == "turn.started":
                     num_turns += 1
+                    # Codex's --json stream emits nothing during the
+                    # reasoning phase between turn.started and the first
+                    # item.completed — even with reasoning_effort=high.
+                    # Synthesize a "thinking" event so the task card has
+                    # something to render during that silent gap. (Bridge's
+                    # extract_progress_summary maps type=thinking → "Thinking...".)
+                    await self._safe_call(on_progress, {"type": "thinking"})
                 elif etype == "turn.completed":
                     u = event.get("usage") or {}
                     # Codex token fields: input_tokens, cached_input_tokens,
@@ -576,6 +583,11 @@ class CodexCliBackend(ModelBackend):
                                 "tool": "shell",
                                 "arguments": {"command": item.get("command", "")},
                             })
+                        elif etype == "item.completed":
+                            # Resume "Thinking..." between commands so the
+                            # card doesn't stay frozen on the last command
+                            # text during long reasoning gaps.
+                            await self._safe_call(on_progress, {"type": "thinking"})
 
                     elif itype == "mcp_tool_call":
                         item_id = item.get("id", "")
@@ -598,6 +610,9 @@ class CodexCliBackend(ModelBackend):
                                 tool_uses[idx]["result"] = item.get("result")
                                 if item.get("error"):
                                     tool_uses[idx]["error"] = item.get("error")
+                            # Same as command_execution: signal reasoning
+                            # is back so the card doesn't stay frozen.
+                            await self._safe_call(on_progress, {"type": "thinking"})
 
                     # file_change and other future types fall through to
                     # the generic forward below — listed in the docstring.
