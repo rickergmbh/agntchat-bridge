@@ -1985,6 +1985,8 @@ _PLATFORM_TOOL_LABELS: dict[str, str] = {
     "create_task": "Creating task",
     "update_task_status": "Updating task",
     "report_progress": "Reporting progress",
+    "complete_task": "Completing task",
+    "fail_task": "Failing task",
     "search_memory": "Searching memory",
     "save_agent_memory": "Saving memory",
     "get_memory": "Loading memory",
@@ -2048,6 +2050,12 @@ _PLATFORM_TOOL_LABELS: dict[str, str] = {
     "get_salary_data": "Checking salary data",
 }
 
+_FINAL_DELIVERY_TOOLS = {
+    "send_message",
+    "complete_task",
+    "fail_task",
+}
+
 
 def _strip_mcp_prefix(name: str) -> str:
     """Strip MCP server prefix from tool names (e.g. mcp__agentgram__send_message -> send_message)."""
@@ -2055,6 +2063,21 @@ def _strip_mcp_prefix(name: str) -> str:
         if name.startswith(prefix):
             return name[len(prefix):]
     return name
+
+
+def _normalized_tool_name(name: str) -> str:
+    """Normalize prefixed/kebab tool names for comparisons."""
+    return _strip_mcp_prefix(name).replace("-", "_")
+
+
+def _is_final_delivery_tool(name: str) -> bool:
+    """Tools whose arguments/result become the visible timeline response.
+
+    If text was streamed immediately before one of these tools, that text is
+    the final user-facing response being delivered through the tool — not
+    internal thinking to preserve above the tool phase.
+    """
+    return _normalized_tool_name(name) in _FINAL_DELIVERY_TOOLS
 
 
 def _humanize_snake(name: str) -> str:
@@ -2102,7 +2125,7 @@ def _summarize_tool(name: str, inp: dict[str, Any]) -> str:
         return "Updating task list"
 
     # Strip MCP prefix for platform tools
-    clean = _strip_mcp_prefix(name)
+    clean = _normalized_tool_name(name)
 
     # Check platform tool label mapping
     if clean in _PLATFORM_TOOL_LABELS:
@@ -2338,17 +2361,25 @@ def make_stream_callback(
             _had_tool_calls = True
             tool_name = event.get("tool", "")
             tool_args = event.get("arguments", {})
+            is_final_delivery = _is_final_delivery_tool(tool_name)
             # Streaming backends (claude_cli) emit an early empty-args
             # tool_call event at content_block_start to flip the phase
             # promptly, then a second populated event at content_block_stop
             # once input_json_delta finishes. Suppress phase_detail on the
             # early emit so generic fallbacks ("Searching for '...'",
             # "Reading file") don't pollute recentSteps before the real
-            # detail lands.
-            summary = _summarize_tool(tool_name, tool_args) if tool_args else None
+            # detail lands. Final-delivery tools are the exception: they post
+            # the visible response (send_message / complete_task / fail_task),
+            # so we include their label even on the early event and explicitly
+            # clear the live writing buffer. Otherwise clients snapshot the
+            # just-written final answer into `thoughts` when the phase flips
+            # writing -> tool_call, showing the reply inside a later
+            # "Thinking..." bubble.
+            summary = _summarize_tool(tool_name, tool_args) if (tool_args or is_final_delivery) else None
             if not suppress_stream:
                 _fire_and_forget(executor.send_stream_update(
                     conversation_id, stream_id,
+                    content="" if is_final_delivery else None,
                     status="streaming", phase="tool_call", phase_detail=summary,
                 ))
 
