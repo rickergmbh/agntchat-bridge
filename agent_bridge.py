@@ -733,15 +733,23 @@ def parse_task_requests(text: str) -> tuple[str, list[dict[str, Any]]]:
     return remaining, tasks
 
 
-def _task_metadata(tr: dict[str, Any]) -> dict[str, Any] | None:
+def _task_metadata(
+    tr: dict[str, Any],
+    trigger_message_id: str | None = None,
+) -> dict[str, Any] | None:
     """Extract metadata from a task_request dict for create_task.
 
     Passes response_template through so the receiving agent knows
-    what output format the delegator wants.
+    what output format the delegator wants. When provided,
+    trigger_message_id stamps the human message that triggered this
+    task request so the backend can dedup peer collisions
+    (TaskAutoCreateWorker uses this to absorb same-trigger duplicates).
     """
     meta: dict[str, Any] = {}
     if tr.get("response_template"):
         meta["response_template"] = tr["response_template"]
+    if trigger_message_id:
+        meta["trigger_message_id"] = trigger_message_id
     return meta if meta else None
 
 
@@ -3910,12 +3918,18 @@ def run_single_agent(
                             default_assignee = behavioral_config.get("defaultTaskAssignee", "self")
                             if default_assignee == "self":
                                 task_assigned_to = [my_participant_id]
+                        # msg.message_id defaults to "" (not None) on GatewayMessage.
+                        # Pass None when empty so downstream truthiness checks
+                        # correctly omit a missing trigger.
                         await executor.create_task(
                             msg.conversation_id,
                             tr["title"],
                             tr.get("description", ""),
                             assigned_to=task_assigned_to,
-                            metadata=_task_metadata(tr),
+                            metadata=_task_metadata(
+                                tr,
+                                trigger_message_id=(msg.message_id or None),
+                            ),
                         )
                         logger.info("[%s] Created task: %s", executor_key, tr["title"])
                     except Exception as e:
