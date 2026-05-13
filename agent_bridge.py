@@ -3176,18 +3176,7 @@ def run_single_agent(
                     except Exception as e:
                         logger.warning("[%s] Failed to create task '%s': %s", executor_key, tr["title"], e)
 
-            # Send remaining text as message in work conv.
-            # Skip for pulse tasks — the gateway handles routing the proactive
-            # message to the owner's DM. Posting here would put it in the pulse
-            # conversation (agent-to-agent), which is the wrong place.
             is_pulse = task_meta.get("source") == "pulse"
-            if remaining_text.strip() and not is_pulse:
-                task_conv = task.work_conversation_id or task.conversation_id
-                if task_conv:
-                    try:
-                        await executor.send_message(task_conv, remaining_text[:MAX_REPLY_CHARS])
-                    except Exception as e:
-                        logger.warning("[%s] Failed to send task text: %s", executor_key, e)
 
             # For pulse tasks, collect ALL text from the work conversation
             # so the gateway can extract the proactive message. result.text only
@@ -3239,6 +3228,9 @@ def run_single_agent(
                 "iterations": result.iterations,
                 "stop_reason": result.stop_reason,
             }
+
+            if remaining_text.strip() and not is_pulse:
+                completion_result["response"] = remaining_text[:MAX_REPLY_CHARS]
 
             if presentations:
                 completion_result["structured_results"] = presentations
@@ -3324,12 +3316,6 @@ def run_single_agent(
                     )
                     logger.info("[%s] Sent %d ResultPresentation(s) for task", executor_key, sent)
 
-                    if remaining_text:
-                        try:
-                            await executor.send_message(reply_conv, remaining_text[:MAX_REPLY_CHARS])
-                        except Exception as e:
-                            logger.warning("[%s] Failed to send remaining text: %s", executor_key, e)
-
             # Execute tool calls from tags (works with any backend including claude_cli)
             remaining_text, task_tool_calls = parse_tool_calls(remaining_text)
             if task_tool_calls:
@@ -3378,6 +3364,9 @@ def run_single_agent(
                 "elapsed_seconds": result.elapsed_seconds,
                 "usage": result.usage,
             }
+
+            if remaining_text.strip():
+                completion_result["response"] = remaining_text[:MAX_REPLY_CHARS]
 
         if presentations:
             completion_result["structured_results"] = presentations
