@@ -3475,7 +3475,7 @@ def run_single_agent(
 
         # --- MessageTriage short-circuit (server-decided routing, no LLM) ---
         # When the server's MessageTriage classifier (Agentchat.Gateway.MessageTriage)
-        # tags the trigger as TASK, create a self-task directly and ack — skip the
+        # tags the trigger as TASK, create a self-task directly — skip the
         # LLM for this turn. The TaskAssignmentWorker reopens the work in a focused
         # sub-conversation, where the agent gets clean context and platform-level
         # progress visibility. Prevents the "agent grinds the whole job inline"
@@ -3513,12 +3513,9 @@ def run_single_agent(
                     },
                     active_conversation_id=msg.conversation_id,
                 )
-                # Brief ack so the user sees this turn closed cleanly. The actual
-                # work happens in the work sub-conversation when the worker fires.
-                await executor.send_message(
-                    msg.conversation_id,
-                    f"Tracking as: {triage_title}",
-                )
+                # TaskAssignmentWorker posts the structured task card; that card is
+                # the user-visible acknowledgement. Avoid adding a redundant canned
+                # text message to the conversation.
                 await _cancel_signal_bubble()
                 return None
             except Exception:
