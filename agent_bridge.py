@@ -3379,7 +3379,7 @@ def run_single_agent(
             When a message is queued for an agent the backend paints a signal
             stream (`signal:{agent_id}:{int}`) so the bubble appears within
             ~50ms of send. If we then early-return without invoking the LLM,
-            nothing else cancels it and it ghosts for ~90s until the
+            nothing else cancels it and it ghosts for ~60s until the
             TimeoutServer sweep. The streaming endpoint cancels by senderId,
             not stream_id, so any cancel from this agent clears it.
             """
