@@ -757,6 +757,7 @@ class ClaudeCliBackend(ModelBackend):
                 "backend": "claude_cli",
                 "cli_path": self._cli_path,
                 "streaming": True,
+                "accumulated_text": ANSI_ESCAPE_RE.sub("", _accumulated_text).strip(),
                 "cli_tool_uses": _tool_uses,
                 "cli_num_turns": _num_turns,
             },

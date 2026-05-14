@@ -2080,6 +2080,30 @@ def _is_final_delivery_tool(name: str) -> bool:
     return _normalized_tool_name(name) in _FINAL_DELIVERY_TOOLS
 
 
+def _tool_was_called(result: Any, canonical_name: str) -> bool:
+    """Return true if a native/MCP tool was called during this model run."""
+    names: list[str] = []
+
+    for tc in getattr(result, "tool_calls", []) or []:
+        name = getattr(tc, "name", "")
+        if name:
+            names.append(str(name))
+
+    metadata = getattr(result, "metadata", None) or {}
+    for tu in metadata.get("cli_tool_uses") or []:
+        if isinstance(tu, dict) and tu.get("name"):
+            names.append(str(tu["name"]))
+
+    return any(_normalized_tool_name(name) == canonical_name for name in names)
+
+
+def _accumulated_stream_text(result: Any) -> str:
+    """Text accumulated from CLI streaming before a final tool call."""
+    metadata = getattr(result, "metadata", None) or {}
+    value = metadata.get("accumulated_text")
+    return value.strip() if isinstance(value, str) else ""
+
+
 def _humanize_snake(name: str) -> str:
     """Convert snake_case/kebab-case to title case (e.g. send_message -> Send message)."""
     words = name.replace("-", " ").replace("_", " ").split()
@@ -3129,7 +3153,23 @@ def run_single_agent(
                 result.iterations, len(result.tool_calls), result.stop_reason,
             )
 
+            is_pulse = task_meta.get("source") == "pulse"
             remaining_text = result.text[:MAX_REPLY_CHARS]
+            send_message_called = _tool_was_called(result, "send_message")
+
+            if (
+                not remaining_text.strip()
+                and not is_pulse
+                and not send_message_called
+            ):
+                stream_text = _accumulated_stream_text(result)
+                if stream_text:
+                    remaining_text = stream_text[:MAX_REPLY_CHARS]
+                    logger.warning(
+                        "[%s] Recovered %d chars from suppressed task stream because final result text was empty",
+                        executor_key,
+                        len(remaining_text),
+                    )
 
             # Preserve full text for pulse tasks — the gateway needs the
             # complete response (before tag stripping) to extract the proactive
@@ -3175,8 +3215,6 @@ def run_single_agent(
                             logger.info("[%s] Created sub-task (tool_use): %s", executor_key, tr["title"])
                     except Exception as e:
                         logger.warning("[%s] Failed to create task '%s': %s", executor_key, tr["title"], e)
-
-            is_pulse = task_meta.get("source") == "pulse"
 
             # For pulse tasks, collect ALL text from the work conversation
             # so the gateway can extract the proactive message. result.text only
@@ -3231,6 +3269,9 @@ def run_single_agent(
 
             if remaining_text.strip() and not is_pulse:
                 completion_result["response"] = remaining_text[:MAX_REPLY_CHARS]
+            elif send_message_called and not is_pulse:
+                completion_result["silent"] = True
+                completion_result["delivered_via_tool"] = "send_message"
 
             if presentations:
                 completion_result["structured_results"] = presentations

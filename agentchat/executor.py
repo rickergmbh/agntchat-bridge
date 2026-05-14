@@ -779,7 +779,8 @@ class ExecutorClient:
             #   any additional `result_data` fields. `response` is the
             #   canonical user-facing text; `summary` overrides the derived
             #   first-200-chars default for the parent-DM card.
-            # - None → silent completion (PULSE_OK-style; no work-conv post).
+            # - None → silent completion only for pulse tasks; non-pulse tasks
+            #   must return response text or prove a final delivery tool ran.
             response_text: str | None = None
             summary: str | None = None
             silent: bool = False
@@ -808,28 +809,33 @@ class ExecutorClient:
             else:
                 response_text = str(result)
 
-            # If the handler produced no usable text and didn't explicitly
-            # opt into silent, force silent so the task can terminate
-            # cleanly. The backend rejects empty-response non-silent
-            # completions (validate_content_args → :response_required),
-            # which otherwise traps the task in_progress and forces a
-            # fail_task fallback that may itself fail.
-            if not silent and not (response_text and response_text.strip()):
-                logger.warning(
-                    "Task %s: handler returned no response text; "
-                    "completing silently to avoid backend rejection",
-                    task.id,
-                )
-                silent = True
-                response_text = None
-                summary = None
-
             # MCP complete_task / fail_task want the underlying Task.id
             # (task.task_id), NOT the gateway queue entry id (task.id).
             # The HTTP /accept and /progress endpoints below take the
             # queue id; the atomic-completion MCP tools look up
             # `Repo.get(Task, task_id)` so they need the real one.
             real_task_id = task.task_id or task.id
+            task_source = (task.raw.get("task", {}).get("metadata") or {}).get("source")
+            delivered_via_tool = extra.get("delivered_via_tool")
+
+            if not (response_text and response_text.strip()):
+                if task_source == "pulse":
+                    silent = True
+                    response_text = None
+                    summary = None
+                elif silent and delivered_via_tool == "send_message":
+                    response_text = None
+                elif await self._task_is_terminal(real_task_id):
+                    logger.info(
+                        "Task %s already terminal after handler returned no response text",
+                        real_task_id,
+                    )
+                    return
+                else:
+                    raise RuntimeError(
+                        "Task handler returned no user-facing response text; refusing to "
+                        "silently complete a non-pulse task."
+                    )
 
             await self._invoke_complete_task(
                 real_task_id,
@@ -871,6 +877,15 @@ class ExecutorClient:
     # flip the task to terminal in one transaction. The bridge invokes
     # these via the platform's internal MCP-call endpoint so the same
     # backend code path serves bridge, hosted, and any future client.
+
+    async def _task_is_terminal(self, task_id: str) -> bool:
+        try:
+            data = await self._get(f"/api/tasks/{task_id}")
+            status = data.get("status") or (data.get("task") or {}).get("status")
+            return status in {"complete", "cancelled", "rejected", "exhausted"}
+        except Exception as e:
+            logger.debug("Failed to check task %s terminal status: %s", task_id, e)
+            return False
 
     async def _invoke_complete_task(
         self,

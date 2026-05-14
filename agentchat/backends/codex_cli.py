@@ -667,6 +667,7 @@ class CodexCliBackend(ModelBackend):
                 "backend": "codex_cli",
                 "cli_path": self._cli_path,
                 "thread_id": thread_id,
+                "accumulated_text": final_text,
                 "cli_tool_uses": tool_uses,
                 "cli_num_turns": num_turns,
                 "streaming": on_progress is not None,
