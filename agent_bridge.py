@@ -1084,7 +1084,15 @@ async def send_parsed_presentations(
     owner_lng: float | None = None,
     last_seen_message_id: str | None = None,
 ) -> int:
-    """Send parsed result presentation dicts via the executor."""
+    """Send parsed result presentation dicts via the executor.
+
+    Keep the model-emitted payload as raw JSON instead of round-tripping it
+    through the SDK's typed ResultPresentation dataclasses. Response templates
+    are user-defined (`screenplay_page`, `sports_update`, etc.), while the
+    dataclasses only know the old built-in result types. Coercing through that
+    static validator drops dynamic template cards on inline replies; the
+    backend already validates, normalizes, and hydrates detail templates.
+    """
     try:
         await asyncio.gather(
             *(enrich_presentation_photos(data, default_lat=owner_lat, default_lng=owner_lng)
@@ -1095,16 +1103,28 @@ async def send_parsed_presentations(
 
     sent = 0
     for data in presentations:
-        pres = build_presentation_from_json(data)
-        if pres is None:
-            continue
+        title = data.get("title") or data.get("result_type") or "results"
+        items = data.get("items")
+        item_count = len(items) if isinstance(items, list) else 0
+        content = f"[Results] {title} ({item_count} items)"
+        envelope = {
+            "schema_version": "2.0",
+            "type": "ResultPresentation",
+            "data": data,
+        }
+
         try:
-            await executor.send_result_presentation(
-                conversation_id, pres, correlation_id=correlation_id,
+            await executor.send_message(
+                conversation_id,
+                content,
+                content_type="structured",
+                message_type="ResultPresentation",
+                content_structured=envelope,
+                correlation_id=correlation_id,
                 last_seen_message_id=last_seen_message_id,
             )
             sent += 1
-            logger.info("Sent ResultPresentation: %s (%d items)", pres.title, len(pres.items))
+            logger.info("Sent ResultPresentation: %s (%d items)", title, item_count)
         except Exception as e:
             logger.warning("Failed to send ResultPresentation: %s", e)
     return sent
