@@ -227,6 +227,15 @@ class ToolExecutor:
             if not arguments.get("active_conversation_id"):
                 arguments["active_conversation_id"] = ctx_conv_id
 
+        # Auto-inject the message freshness anchor for visible delivery tools.
+        # This protects the "user sends a follow-up/attachment while the agent
+        # is tool-calling" path: if the model tries to post via send_message,
+        # the backend can 409 the stale draft instead of letting it land.
+        if executor_method in ("send_message", "send_result_presentation"):
+            last_seen = self._context.get("last_seen_message_id")
+            if last_seen and not arguments.get("last_seen_message_id"):
+                arguments["last_seen_message_id"] = last_seen
+
         # Find the ExecutorClient method
         method = getattr(self._client, executor_method, None)
         if not method:
@@ -252,7 +261,12 @@ class ToolExecutor:
             kw_args[pname] = val
 
         # Pass through auto-injected context values not in schema
-        for injected_key in ("conversation_id", "source_conversation_id", "active_conversation_id"):
+        for injected_key in (
+            "conversation_id",
+            "source_conversation_id",
+            "active_conversation_id",
+            "last_seen_message_id",
+        ):
             if injected_key in arguments and injected_key not in kw_args:
                 kw_args[injected_key] = arguments[injected_key]
 

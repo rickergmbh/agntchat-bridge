@@ -101,5 +101,7 @@ class TestIsStale:
         await token_mgr.get_token()
 
         # Simulate time passing beyond threshold
-        token_mgr._fetched_at = time.monotonic() - _REFRESH_THRESHOLD - 1
+        # TokenManager applies up to +60s refresh jitter; move past the
+        # maximum jitter so this assertion is deterministic.
+        token_mgr._fetched_at = time.monotonic() - _REFRESH_THRESHOLD - 61
         assert token_mgr.is_stale is True

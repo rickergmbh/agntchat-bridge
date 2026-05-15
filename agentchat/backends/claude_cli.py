@@ -215,6 +215,7 @@ class ClaudeCliBackend(ModelBackend):
         self._mcp_conversation_id: str = ""
         self._mcp_task_id: str = ""
         self._mcp_owner_id: str = ""
+        self._mcp_last_seen_message_id: str = ""
 
     @staticmethod
     def _find_mcp_server() -> str | None:
@@ -239,6 +240,7 @@ class ClaudeCliBackend(ModelBackend):
         conversation_id: str = "",
         task_id: str = "",
         owner_id: str = "",
+        last_seen_message_id: str = "",
     ) -> str:
         """Build MCP config JSON string for --mcp-config."""
         if not self._mcp_server_script:
@@ -261,6 +263,7 @@ class ClaudeCliBackend(ModelBackend):
                         "AGENTGRAM_CONVERSATION_ID": conversation_id,
                         "AGENTGRAM_TASK_ID": task_id,
                         "AGENTGRAM_OWNER_ID": owner_id,
+                        "AGENTGRAM_LAST_SEEN_MESSAGE_ID": last_seen_message_id,
                         "AGENTGRAM_TOOL_DEFS": json.dumps(resolved_tools),
                     },
                 }
@@ -343,6 +346,7 @@ class ClaudeCliBackend(ModelBackend):
         conversation_id: str = "",
         task_id: str = "",
         owner_id: str = "",
+        last_seen_message_id: str = "",
     ) -> tuple[list[str], str, list[str]]:
         """Build the base CLI command with all standard flags.
 
@@ -413,7 +417,7 @@ class ClaudeCliBackend(ModelBackend):
 
         if use_mcp:
             mcp_config = self._build_mcp_config(
-                resolved_tools, conversation_id, task_id, owner_id,
+                resolved_tools, conversation_id, task_id, owner_id, last_seen_message_id,
             )
             if mcp_config:
                 if sys.platform == "win32":
@@ -432,6 +436,7 @@ class ClaudeCliBackend(ModelBackend):
         conversation_id: str = "",
         task_id: str = "",
         owner_id: str = "",
+        last_seen_message_id: str = "",
     ) -> None:
         """Set MCP context for the next generate/chat_with_tools call.
 
@@ -443,6 +448,7 @@ class ClaudeCliBackend(ModelBackend):
         self._mcp_conversation_id = conversation_id
         self._mcp_task_id = task_id
         self._mcp_owner_id = owner_id
+        self._mcp_last_seen_message_id = last_seen_message_id
 
     async def generate(
         self,
@@ -456,6 +462,7 @@ class ClaudeCliBackend(ModelBackend):
             conversation_id=self._mcp_conversation_id,
             task_id=self._mcp_task_id,
             owner_id=self._mcp_owner_id,
+            last_seen_message_id=self._mcp_last_seen_message_id,
         )
 
         try:
@@ -801,6 +808,7 @@ class ClaudeCliBackend(ModelBackend):
                 conversation_id=self._mcp_conversation_id,
                 task_id=self._mcp_task_id,
                 owner_id=self._mcp_owner_id,
+                last_seen_message_id=self._mcp_last_seen_message_id,
             )
             # Let CLI handle the tool loop with max-turns.
             # _base_cmd already sets --max-turns if self._max_turns is configured.

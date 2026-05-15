@@ -1082,6 +1082,7 @@ async def send_parsed_presentations(
     correlation_id: str | None = None,
     owner_lat: float | None = None,
     owner_lng: float | None = None,
+    last_seen_message_id: str | None = None,
 ) -> int:
     """Send parsed result presentation dicts via the executor."""
     try:
@@ -1100,6 +1101,7 @@ async def send_parsed_presentations(
         try:
             await executor.send_result_presentation(
                 conversation_id, pres, correlation_id=correlation_id,
+                last_seen_message_id=last_seen_message_id,
             )
             sent += 1
             logger.info("Sent ResultPresentation: %s (%d items)", pres.title, len(pres.items))
@@ -2981,13 +2983,18 @@ def run_single_agent(
         logger.info("[%s] MCP mode: %d AgentGram tools will be exposed natively", executor_key, len(resolved_tools))
         _tool_prompt_suffix = ""
 
-    def _update_mcp_context(conv_id: str, task_id: str = "") -> None:
+    def _update_mcp_context(
+        conv_id: str,
+        task_id: str = "",
+        last_seen_message_id: str = "",
+    ) -> None:
         if _has_mcp:
             backend.set_mcp_context(
                 resolved_tools=resolved_tools,
                 conversation_id=conv_id,
                 task_id=task_id,
                 owner_id=agent_owner_id or "",
+                last_seen_message_id=last_seen_message_id,
             )
 
     @executor.on_task
@@ -3636,12 +3643,21 @@ def run_single_agent(
         logger.info("[%s] Calling %s with %d messages of context (mode=%s)",
                      executor_key, backend.model_name, len(chat_messages), execution_mode)
 
-        _update_mcp_context(msg.conversation_id or "")
+        freshness_anchor = msg.latest_seen_message_id or msg.message_id or ""
+        _update_mcp_context(
+            msg.conversation_id or "",
+            last_seen_message_id=freshness_anchor,
+        )
 
         presentations: list[dict[str, Any]] = []
 
         if execution_mode == "tool_use" and _tool_defs:
-            tool_context = {"conversation_id": msg.conversation_id, "owner_id": agent_owner_id, "source_type": "message"}
+            tool_context = {
+                "conversation_id": msg.conversation_id,
+                "owner_id": agent_owner_id,
+                "source_type": "message",
+                "last_seen_message_id": freshness_anchor,
+            }
             tool_exec = ToolExecutor(executor, context=tool_context, resolved_tools=resolved_tools)
             _tu_failed = False
             try:
@@ -3721,6 +3737,7 @@ def run_single_agent(
                 sent = await send_parsed_presentations(
                     executor, msg.conversation_id, presentations,
                     owner_lat=msg_owner_lat, owner_lng=msg_owner_lng,
+                    last_seen_message_id=msg.latest_seen_message_id or msg.message_id or None,
                 )
                 logger.info("[%s] Sent %d ResultPresentation(s) from tool_use", executor_key, sent)
 
@@ -3840,6 +3857,7 @@ def run_single_agent(
             sent = await send_parsed_presentations(
                 executor, msg.conversation_id, presentations,
                 owner_lat=msg_owner_lat, owner_lng=msg_owner_lng,
+                last_seen_message_id=msg.latest_seen_message_id or msg.message_id or None,
             )
             logger.info("[%s] Sent %d ResultPresentation(s)", executor_key, sent)
             if not remaining_text:

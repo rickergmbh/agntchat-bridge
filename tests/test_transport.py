@@ -11,6 +11,13 @@ from agentchat.errors import ChannelError, ConnectionError, NotMemberError
 from agentchat.transport import PhoenixTransport
 
 
+async def idle_ws_messages():
+    """Async iterator that stays open until the receive task is cancelled."""
+    while True:
+        await asyncio.sleep(3600)
+        yield ""
+
+
 @pytest.fixture
 def mock_token_manager():
     tm = AsyncMock(spec=TokenManager)
@@ -36,7 +43,8 @@ class TestConnect:
     async def test_connect_calls_websockets(self, transport, mock_token_manager):
         mock_ws = AsyncMock()
         mock_ws.open = True
-        mock_ws.__aiter__ = AsyncMock(return_value=iter([]))
+        mock_ws.close_code = None
+        mock_ws.__aiter__ = MagicMock(return_value=idle_ws_messages())
 
         with patch("agentchat.transport.websockets.connect", new_callable=AsyncMock) as mock_connect:
             mock_connect.return_value = mock_ws
@@ -64,7 +72,8 @@ class TestDisconnect:
     async def test_disconnect_cleans_up(self, transport):
         mock_ws = AsyncMock()
         mock_ws.open = True
-        mock_ws.__aiter__ = AsyncMock(return_value=iter([]))
+        mock_ws.close_code = None
+        mock_ws.__aiter__ = MagicMock(return_value=idle_ws_messages())
 
         with patch("agentchat.transport.websockets.connect", new_callable=AsyncMock) as mock_connect:
             mock_connect.return_value = mock_ws

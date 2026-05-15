@@ -215,6 +215,7 @@ class CodexCliBackend(ModelBackend):
         self._mcp_conversation_id: str = ""
         self._mcp_task_id: str = ""
         self._mcp_owner_id: str = ""
+        self._mcp_last_seen_message_id: str = ""
 
     @staticmethod
     def _find_mcp_server() -> str | None:
@@ -306,6 +307,7 @@ class CodexCliBackend(ModelBackend):
         conversation_id: str,
         task_id: str,
         owner_id: str,
+        last_seen_message_id: str,
         resolved_tools: list[dict[str, Any]],
     ) -> list[str]:
         """Build -c flags that register the AgentGram MCP server inline.
@@ -325,6 +327,7 @@ class CodexCliBackend(ModelBackend):
             "AGENTGRAM_CONVERSATION_ID": conversation_id,
             "AGENTGRAM_TASK_ID": task_id,
             "AGENTGRAM_OWNER_ID": owner_id,
+            "AGENTGRAM_LAST_SEEN_MESSAGE_ID": last_seen_message_id,
             "AGENTGRAM_TOOL_DEFS": json.dumps(resolved_tools),
         }
 
@@ -345,6 +348,7 @@ class CodexCliBackend(ModelBackend):
         conversation_id: str = "",
         task_id: str = "",
         owner_id: str = "",
+        last_seen_message_id: str = "",
         image_paths: list[str] | None = None,
     ) -> tuple[list[str], list[str]]:
         """Build the `codex exec` command and the list of temp files to clean up."""
@@ -384,7 +388,7 @@ class CodexCliBackend(ModelBackend):
         # global config).
         if resolved_tools and self._mcp_server_script:
             cmd.extend(self._mcp_overrides(
-                conversation_id, task_id, owner_id, resolved_tools,
+                conversation_id, task_id, owner_id, last_seen_message_id, resolved_tools,
             ))
 
         # Prompt is read from stdin
@@ -397,12 +401,14 @@ class CodexCliBackend(ModelBackend):
         conversation_id: str = "",
         task_id: str = "",
         owner_id: str = "",
+        last_seen_message_id: str = "",
     ) -> None:
         """Set MCP context for the next generate/chat_with_tools call."""
         self._mcp_resolved_tools = resolved_tools
         self._mcp_conversation_id = conversation_id
         self._mcp_task_id = task_id
         self._mcp_owner_id = owner_id
+        self._mcp_last_seen_message_id = last_seen_message_id
 
     # ------------------------------------------------------------------
     # Generation
@@ -420,6 +426,7 @@ class CodexCliBackend(ModelBackend):
             conversation_id=self._mcp_conversation_id,
             task_id=self._mcp_task_id,
             owner_id=self._mcp_owner_id,
+            last_seen_message_id=self._mcp_last_seen_message_id,
         )
 
         try:
@@ -739,6 +746,7 @@ class CodexCliBackend(ModelBackend):
             conversation_id=self._mcp_conversation_id,
             task_id=self._mcp_task_id,
             owner_id=self._mcp_owner_id,
+            last_seen_message_id=self._mcp_last_seen_message_id,
             image_paths=image_paths,
         )
         # Caller owns the image temp files too.

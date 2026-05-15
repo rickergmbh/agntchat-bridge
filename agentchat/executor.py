@@ -1121,6 +1121,7 @@ class ExecutorClient:
         presentation: Any,
         *,
         correlation_id: str | None = None,
+        last_seen_message_id: str | None = None,
     ) -> dict[str, Any]:
         """Send a ResultPresentation as a structured ACP v2 message."""
         data = presentation.to_dict()  # validates internally
@@ -1139,6 +1140,7 @@ class ExecutorClient:
             message_type="ResultPresentation",
             content_structured=envelope,
             correlation_id=correlation_id,
+            last_seen_message_id=last_seen_message_id,
         )
 
     async def find_or_create_dm(
@@ -2438,15 +2440,39 @@ class ExecutorClient:
             # Send reply if handler returned one
             # Handlers can return a str or a dict with "content" and optional "metadata"
             if reply:
+                freshness_anchor = msg.latest_seen_message_id or msg.message_id or None
                 if isinstance(reply, dict):
                     content = reply.get("content", "")
                     metadata = reply.get("metadata")
                     if content:
-                        await self.send_message(msg.conversation_id, content, metadata=metadata)
-                        logger.info("Replied to message in %s", msg.conversation_id)
+                        try:
+                            await self.send_message(
+                                msg.conversation_id,
+                                content,
+                                metadata=metadata,
+                                last_seen_message_id=freshness_anchor,
+                            )
+                            logger.info("Replied to message in %s", msg.conversation_id)
+                        except StaleContextError as sce:
+                            logger.info(
+                                "Dropped stale returned reply for %s — %d new message(s) arrived during draft",
+                                msg.id,
+                                len(sce.new_messages),
+                            )
                 elif isinstance(reply, str):
-                    await self.send_message(msg.conversation_id, reply)
-                    logger.info("Replied to message in %s", msg.conversation_id)
+                    try:
+                        await self.send_message(
+                            msg.conversation_id,
+                            reply,
+                            last_seen_message_id=freshness_anchor,
+                        )
+                        logger.info("Replied to message in %s", msg.conversation_id)
+                    except StaleContextError as sce:
+                        logger.info(
+                            "Dropped stale returned reply for %s — %d new message(s) arrived during draft",
+                            msg.id,
+                            len(sce.new_messages),
+                        )
 
         except BaseException as e:
             logger.exception("[MSG-HANDLE] Handler/ack failed for %s (%s): %s", msg.id, type(e).__name__, e)
