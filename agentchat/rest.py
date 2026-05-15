@@ -58,11 +58,19 @@ class RestClient:
         data = await self._post("/api/conversations", json=body)
         return Conversation.from_dict(data)
 
-    async def find_or_create_dm(self, peer_id: str) -> Conversation:
+    async def find_or_create_dm(
+        self,
+        peer_id: str,
+        source_conversation_id: str | None = None,
+        source_message_id: str | None = None,
+    ) -> Conversation:
         """Find or create a DM conversation with another participant."""
-        data = await self._post(
-            "/api/conversations/dm", json={"peerId": peer_id}
-        )
+        body: dict[str, Any] = {"peerId": peer_id}
+        if source_conversation_id:
+            body["sourceConversationId"] = source_conversation_id
+        if source_message_id:
+            body["sourceMessageId"] = source_message_id
+        data = await self._post("/api/conversations/dm", json=body)
         return Conversation.from_dict(data)
 
     # ------------------------------------------------------------------

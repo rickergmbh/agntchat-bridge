@@ -216,6 +216,8 @@ class ToolExecutor:
         if executor_method == "find_or_create_dm":
             if not arguments.get("source_conversation_id"):
                 arguments["source_conversation_id"] = self._context.get("conversation_id")
+            if not arguments.get("source_message_id"):
+                arguments["source_message_id"] = self._context.get("source_message_id")
 
         # Auto-inject active_conversation_id for create_task so the backend's
         # anti-misrouting guard can apply the in-process descendant check
@@ -264,6 +266,7 @@ class ToolExecutor:
         for injected_key in (
             "conversation_id",
             "source_conversation_id",
+            "source_message_id",
             "active_conversation_id",
             "last_seen_message_id",
         ):

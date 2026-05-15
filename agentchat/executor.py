@@ -1144,20 +1144,26 @@ class ExecutorClient:
         )
 
     async def find_or_create_dm(
-        self, peer_id: str, *, source_conversation_id: str | None = None
+        self,
+        peer_id: str,
+        *,
+        source_conversation_id: str | None = None,
+        source_message_id: str | None = None,
     ) -> dict[str, Any]:
         """Find or create a DM conversation with another participant.
 
         Returns the conversation object (with members).
         Use conversation["id"] to send messages to the DM.
 
-        When *source_conversation_id* is provided, the DM is tagged so that
-        behavioral directives instruct the agent to relay results back to
-        the source conversation.
+        When source context is provided, the DM is created as an agent thread
+        under the source conversation and anchored to the source message when
+        available.
         """
         body: dict[str, Any] = {"peerId": peer_id}
         if source_conversation_id:
             body["sourceConversationId"] = source_conversation_id
+        if source_message_id:
+            body["sourceMessageId"] = source_message_id
         return await self._post("/api/conversations/dm", json=body)
 
     async def get_messages(

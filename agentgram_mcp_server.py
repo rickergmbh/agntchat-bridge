@@ -46,6 +46,7 @@ API_KEY = os.environ.get("AGENTGRAM_API_KEY", "")
 CONVERSATION_ID = os.environ.get("AGENTGRAM_CONVERSATION_ID", "")
 TASK_ID = os.environ.get("AGENTGRAM_TASK_ID", "")
 OWNER_ID = os.environ.get("AGENTGRAM_OWNER_ID", "")
+SOURCE_MESSAGE_ID = os.environ.get("AGENTGRAM_SOURCE_MESSAGE_ID", "")
 LAST_SEEN_MESSAGE_ID = os.environ.get("AGENTGRAM_LAST_SEEN_MESSAGE_ID", "")
 TOOL_DEFS_JSON = os.environ.get("AGENTGRAM_TOOL_DEFS", "[]")
 
@@ -88,6 +89,7 @@ def get_tool_executor() -> ToolExecutor:
                 "conversation_id": CONVERSATION_ID,
                 "task_id": TASK_ID,
                 "owner_id": OWNER_ID,
+                "source_message_id": SOURCE_MESSAGE_ID,
                 "last_seen_message_id": LAST_SEEN_MESSAGE_ID,
                 "source_type": _source_type,
             },

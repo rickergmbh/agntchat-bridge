@@ -1250,16 +1250,17 @@ async def _route_dm_blocks(
     dm_blocks: list[dict[str, str]],
     conversation_members: list[dict[str, Any]],
     source_conversation_id: str,
+    source_message_id: str | None,
     executor_key: str,
     msg_meta: dict[str, str] | None = None,
     family_agents: list[dict[str, Any]] | None = None,
-) -> int:
-    """Route DM blocks to private conversations. Returns count of sent DMs.
+) -> list[str]:
+    """Route DM blocks to private conversations. Returns target names that were sent.
 
     Searches conversation_members first, then falls back to family_agents
     (which includes connected cross-owner agents from directives).
     """
-    sent = 0
+    sent_targets: list[str] = []
     for block in dm_blocks:
         target_name = block["target"]
         content = block["content"]
@@ -1274,7 +1275,9 @@ async def _route_dm_blocks(
         target_id = member["participantId"]
         try:
             dm_conv = await executor.find_or_create_dm(
-                target_id, source_conversation_id=source_conversation_id
+                target_id,
+                source_conversation_id=source_conversation_id,
+                source_message_id=source_message_id,
             )
             dm_conv_id = dm_conv.get("id")
             if not dm_conv_id:
@@ -1282,11 +1285,11 @@ async def _route_dm_blocks(
                 continue
 
             await executor.send_message(dm_conv_id, content, metadata=msg_meta or {})
-            sent += 1
+            sent_targets.append(target_name)
             logger.info("[%s] Routed DM to %s: %d chars", executor_key, target_name, len(content))
         except Exception as e:
             logger.warning("[%s] Failed to route DM to %s: %s", executor_key, target_name, e)
-    return sent
+    return sent_targets
 
 
 
@@ -3006,6 +3009,7 @@ def run_single_agent(
     def _update_mcp_context(
         conv_id: str,
         task_id: str = "",
+        source_message_id: str = "",
         last_seen_message_id: str = "",
     ) -> None:
         if _has_mcp:
@@ -3014,6 +3018,7 @@ def run_single_agent(
                 conversation_id=conv_id,
                 task_id=task_id,
                 owner_id=agent_owner_id or "",
+                source_message_id=source_message_id,
                 last_seen_message_id=last_seen_message_id,
             )
 
@@ -3151,7 +3156,13 @@ def run_single_agent(
         logger.info("[%s] Calling %s for task (with %d context messages, mode=%s)",
                      executor_key, backend.model_name, len(chat_messages) - 1, execution_mode)
 
-        _update_mcp_context(task.work_conversation_id or task.conversation_id or "", task.task_id or "")
+        task_source_message_id = task_meta.get("source_message_id") or task_meta.get("sourceMessageId") or ""
+
+        _update_mcp_context(
+            task.work_conversation_id or task.conversation_id or "",
+            task.task_id or "",
+            task_source_message_id,
+        )
 
         presentations: list[dict[str, Any]] = []
 
@@ -3161,6 +3172,7 @@ def run_single_agent(
                 "task_id": task.task_id,
                 "owner_id": agent_owner_id,
                 "source_type": "task",
+                "source_message_id": task_source_message_id,
             }
             tool_exec = ToolExecutor(executor, context=tool_context, resolved_tools=resolved_tools)
             result = await backend.chat_with_tools(
@@ -3666,6 +3678,7 @@ def run_single_agent(
         freshness_anchor = msg.latest_seen_message_id or msg.message_id or ""
         _update_mcp_context(
             msg.conversation_id or "",
+            source_message_id=msg.message_id or "",
             last_seen_message_id=freshness_anchor,
         )
 
@@ -3676,6 +3689,7 @@ def run_single_agent(
                 "conversation_id": msg.conversation_id,
                 "owner_id": agent_owner_id,
                 "source_type": "message",
+                "source_message_id": msg.message_id or "",
                 "last_seen_message_id": freshness_anchor,
             }
             tool_exec = ToolExecutor(executor, context=tool_context, resolved_tools=resolved_tools)
@@ -3938,20 +3952,22 @@ def run_single_agent(
 
         reply, dm_blocks = _parse_dm_blocks(reply or "")
         if dm_blocks:
-            # Apply redirect notice from server-provided template
-            targets = [b["target"] for b in dm_blocks]
-            dm_template = behavioral_config.get("dmRedirectTemplate", "[Continuing in DM with {targets}]")
-            reply = dm_template.replace("{targets}", ", ".join(targets))
-
             # Include familyAgents from directives so DMs can target
             # connected cross-owner agents not yet in the conversation
             delegate_agents = (directives or {}).get("familyAgents") or []
-            dm_sent = await _route_dm_blocks(
+            routed_targets = await _route_dm_blocks(
                 executor, dm_blocks, msg.conversation_members,
-                msg.conversation_id, executor_key, msg_meta_dm,
+                msg.conversation_id, msg.message_id or None, executor_key, msg_meta_dm,
                 family_agents=delegate_agents,
             )
-            logger.info("[%s] Routed %d/%d DM block(s)", executor_key, dm_sent, len(dm_blocks))
+            logger.info("[%s] Routed %d/%d DM block(s)", executor_key, len(routed_targets), len(dm_blocks))
+
+            if routed_targets:
+                dm_template = behavioral_config.get("dmRedirectTemplate", "[Continuing in DM with {targets}]")
+                reply = dm_template.replace("{targets}", ", ".join(routed_targets))
+            else:
+                targets = ", ".join(b["target"] for b in dm_blocks)
+                reply = f"[Could not start agent thread with {targets}]"
 
         # --- Outgoing filler filter ---
         # LLMs interpret "stay silent" as "tell them you're staying silent".
