@@ -107,7 +107,21 @@ class RestClient:
         message_type: str | None = None,
         content_structured: dict | None = None,
         correlation_id: str | None = None,
+        source_relay: bool = False,
     ) -> Message:
+        """Send a message to a conversation.
+
+        Pass ``source_relay=True`` when this message is a summary posted from
+        inside an active agent thread back to the source/parent conversation.
+        The backend then suppresses turn-triggering for other agents so the
+        relay doesn't echo into a ping-pong of duplicate responses.
+        """
+        # Merge source_relay into metadata rather than carrying a parallel
+        # field — backend Wake / GatewayMessageDeliveryWorker read it from
+        # message.metadata, and we want a single source of truth on the wire.
+        if source_relay:
+            metadata = dict(metadata or {})
+            metadata["source_relay"] = True
         body: dict[str, Any] = {"content": content, "contentType": content_type}
         if metadata:
             body["metadata"] = metadata

@@ -1048,13 +1048,25 @@ class ExecutorClient:
         content_structured: dict[str, Any] | None = None,
         correlation_id: str | None = None,
         last_seen_message_id: str | None = None,
+        source_relay: bool = False,
     ) -> dict[str, Any]:
         """Send a message to a conversation (call from within handler).
 
         If `last_seen_message_id` is provided and the backend determines that
         newer messages from other participants arrived since that anchor,
         raises `StaleContextError` with the new messages attached.
+
+        Pass ``source_relay=True`` when this message is a summary posted from
+        inside an active agent thread back to the source/parent conversation.
+        The backend suppresses Wake + GatewayMessageDeliveryWorker for the
+        relay so other agents don't get pulled into a ping-pong of duplicate
+        responses. The human still sees the message via channel broadcast.
         """
+        # Carry source_relay inside metadata — backend reads it from
+        # message.metadata.source_relay in Wake / delivery worker.
+        if source_relay:
+            metadata = dict(metadata or {})
+            metadata["source_relay"] = True
         body: dict[str, Any] = {"content": content, "contentType": content_type}
         if metadata:
             body["metadata"] = metadata
