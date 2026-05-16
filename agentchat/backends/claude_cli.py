@@ -36,6 +36,7 @@ from ._cli_utils import (
     ANSI_ESCAPE_RE,
     cleanup_temp_files,
     download_image_to_temp,
+    parse_add_dirs_env,
     resolve_cli_path,
     save_base64_image_to_temp,
     spawn_argv,
@@ -100,45 +101,6 @@ def _content_to_cli_text(content: str | list) -> str:
     return " ".join(parts) if parts else str(content)
 
 
-def download_image_to_temp(url: str) -> str | None:
-    """Download an image URL to a temp file. Returns the file path."""
-    try:
-        import urllib.request
-        ext_map = {".jpg": ".jpg", ".jpeg": ".jpg", ".png": ".png", ".gif": ".gif", ".webp": ".webp"}
-        # Guess extension from URL path
-        ext = ".jpg"
-        for suffix, mapped in ext_map.items():
-            if suffix in url.lower().split("?")[0]:
-                ext = mapped
-                break
-        fd, path = tempfile.mkstemp(suffix=ext, prefix="agentchat_img_")
-        os.close(fd)
-        urllib.request.urlretrieve(url, path)
-        # Verify we got some data
-        if os.path.getsize(path) < 100:
-            os.unlink(path)
-            return None
-        return path
-    except Exception:
-        return None
-
-
-def save_base64_image_to_temp(data: str, media_type: str) -> str | None:
-    """Save base64-encoded image data to a temp file. Returns the file path."""
-    try:
-        import base64
-        ext = {
-            "image/jpeg": ".jpg", "image/png": ".png",
-            "image/gif": ".gif", "image/webp": ".webp",
-        }.get(media_type, ".jpg")
-        fd, path = tempfile.mkstemp(suffix=ext, prefix="agentchat_img_")
-        os.write(fd, base64.b64decode(data))
-        os.close(fd)
-        return path
-    except Exception:
-        return None
-
-
 class ClaudeCliBackend(ModelBackend):
     """Backend using the Claude Code CLI via asyncio subprocess."""
 
@@ -187,9 +149,11 @@ class ClaudeCliBackend(ModelBackend):
         # Opt-in: only set if explicitly provided via kwarg or env var
         self._fallback_model = fallback_model or os.getenv("CLAUDE_CLI_FALLBACK_MODEL")
 
-        # Additional directories the CLI can access (--add-dir)
-        add_dirs_env = os.getenv("CLAUDE_CLI_ADD_DIRS", "")
-        self._add_dirs: list[str] = [d.strip() for d in add_dirs_env.split(",") if d.strip()]
+        # Additional directories the CLI can access (--add-dir). Parsed and
+        # validated centrally so missing paths produce a warning instead of
+        # a silent no-op. The model is told about these via the system
+        # prompt preamble built in agent_bridge._compose_system_prompt.
+        self._add_dirs: list[str] = parse_add_dirs_env()
 
         # Max output tokens — passed via --settings '{"maxOutputTokens": N}'
         self._max_tokens = (

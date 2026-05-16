@@ -42,6 +42,7 @@ from ._cli_utils import (
     ANSI_ESCAPE_RE,
     cleanup_temp_files,
     download_image_to_temp,
+    parse_add_dirs_env,
     resolve_cli_path,
     save_base64_image_to_temp,
     spawn_argv,
@@ -195,6 +196,14 @@ class CodexCliBackend(ModelBackend):
                 "no equivalent flag; the agentic loop runs to completion.",
                 self._max_turns,
             )
+
+        # Additional directories the agent can access. The desktop client
+        # sets this env var for any backend (env name is legacy — the value
+        # is backend-agnostic). We expand the sandbox's writable_roots so
+        # writes are allowed; disclosure to the model lives in
+        # agent_bridge._compose_system_prompt so every backend gets it
+        # consistently.
+        self._add_dirs: list[str] = parse_add_dirs_env()
 
         # MCP server context for native AgentGram tool integration
         self._api_url = api_url or os.getenv(
@@ -371,6 +380,12 @@ class CodexCliBackend(ModelBackend):
             cmd.append("--dangerously-bypass-approvals-and-sandbox")
         else:
             cmd.extend(["--sandbox", self._sandbox])
+            # workspace-write only writes to cwd by default. Expand to the
+            # operator-configured add_dirs so the agent can actually use
+            # the directories we're about to advertise in the prompt.
+            if self._add_dirs and self._sandbox == "workspace-write":
+                roots_toml = "[" + ", ".join(_toml_quote(d) for d in self._add_dirs) + "]"
+                cmd.extend(["-c", f"sandbox_workspace_write.writable_roots={roots_toml}"])
 
         if self._model:
             cmd.extend(["-m", self._model])

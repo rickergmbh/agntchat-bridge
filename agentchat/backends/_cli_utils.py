@@ -9,6 +9,7 @@ Windows users see divergent failures. Put the shared logic here.
 from __future__ import annotations
 
 import base64
+import logging
 import os
 import re
 import shutil
@@ -18,8 +19,43 @@ import urllib.request
 from typing import Iterable
 
 
+logger = logging.getLogger("agentchat.backends._cli_utils")
+
 # Matches ANSI escape sequences (colors, bold, cursor movement, etc.)
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+# Separator the desktop client uses to pack add_dirs into a single env var.
+# Newline is safer than `,` or `os.pathsep` — neither of those would survive
+# a path containing the separator character on macOS/Linux. Newlines in
+# filesystem paths are technically legal but absurd in practice.
+ADD_DIRS_ENV = "CLAUDE_CLI_ADD_DIRS"
+ADD_DIRS_SEP = "\n"
+
+
+def parse_add_dirs_env() -> list[str]:
+    """Read and validate the add_dirs env var.
+
+    Returns only directories that exist on disk. Missing or non-directory
+    entries are logged at WARNING so operators can see why an agent never
+    looked at a path they expected.
+    """
+    raw = os.getenv(ADD_DIRS_ENV, "")
+    if not raw:
+        return []
+    valid: list[str] = []
+    for entry in raw.split(ADD_DIRS_SEP):
+        d = entry.strip()
+        if not d:
+            continue
+        if os.path.isdir(d):
+            valid.append(d)
+        else:
+            logger.warning(
+                "%s entry %r is not an existing directory — agent will not be told about it",
+                ADD_DIRS_ENV, d,
+            )
+    return valid
 
 
 def resolve_cli_path(path: str) -> str:
@@ -136,9 +172,12 @@ def save_base64_image_to_temp(data: str, media_type: str) -> str | None:
 
 
 __all__ = [
+    "ADD_DIRS_ENV",
+    "ADD_DIRS_SEP",
     "ANSI_ESCAPE_RE",
     "cleanup_temp_files",
     "download_image_to_temp",
+    "parse_add_dirs_env",
     "resolve_cli_path",
     "save_base64_image_to_temp",
     "spawn_argv",
