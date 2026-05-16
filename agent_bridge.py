@@ -3825,6 +3825,41 @@ def run_single_agent(
                 msg_meta_out["backend"] = effective_backend
             msg_meta_out["stream_id"] = _msg_stream_id
 
+            # --- DM routing (tool_use mode) ---
+            # The model can emit <dm target="..." topic="...">…</dm> tags in
+            # tool_use mode too — the directive teaches the XML form in every
+            # mode, and models routinely use it. Without this strip+route,
+            # the raw <dm> tag passes through as parent-conversation text and
+            # the intended DM body is never delivered to the peer.
+            tu_msg_meta_dm: dict[str, str] = {}
+            if result and result.model:
+                tu_msg_meta_dm["model"] = result.model
+            if effective_backend:
+                tu_msg_meta_dm["backend"] = effective_backend
+
+            if reply:
+                reply, tu_dm_blocks = _parse_dm_blocks(reply)
+                if tu_dm_blocks:
+                    delegate_agents = (directives or {}).get("familyAgents") or []
+                    routed_targets = await _route_dm_blocks(
+                        executor, tu_dm_blocks, msg.conversation_members,
+                        msg.conversation_id, msg.message_id or None, executor_key, tu_msg_meta_dm,
+                        family_agents=delegate_agents,
+                    )
+                    logger.info(
+                        "[%s] Routed %d/%d DM block(s) [tool_use]",
+                        executor_key, len(routed_targets), len(tu_dm_blocks),
+                    )
+
+                    if routed_targets:
+                        dm_template = behavioral_config.get(
+                            "dmRedirectTemplate", "[Continuing in DM with {targets}]"
+                        )
+                        reply = dm_template.replace("{targets}", ", ".join(routed_targets))
+                    else:
+                        targets = ", ".join(b["target"] for b in tu_dm_blocks)
+                        reply = f"[Could not start agent thread with {targets}]"
+
             # Send structured results first, then text reply, then deferred tasks
             if presentations:
                 sent = await send_parsed_presentations(
