@@ -64,6 +64,7 @@ class RestClient:
         source_conversation_id: str | None = None,
         source_message_id: str | None = None,
         topic: str | None = None,
+        goal: str | None = None,
     ) -> Conversation:
         """Find or create a DM conversation with another participant.
 
@@ -72,6 +73,12 @@ class RestClient:
         a `topic` to deliberately open a new thread for a distinct subject —
         same (pair, source, topic) reuses the same thread; different topic
         creates a separate concurrent thread.
+
+        Pass a `goal` (one-sentence definition-of-done) to give the thread a
+        terminal target. The backend persists `metadata.thread_goal` and the
+        directive injection tells the agents in the thread to work toward
+        the goal and call `complete_thread` when achieved. Without a goal
+        the thread has no explicit completion target.
         """
         body: dict[str, Any] = {"peerId": peer_id}
         if source_conversation_id:
@@ -80,6 +87,8 @@ class RestClient:
             body["sourceMessageId"] = source_message_id
         if topic:
             body["threadTopic"] = topic
+        if goal:
+            body["threadGoal"] = goal
         data = await self._post("/api/conversations/dm", json=body)
         return Conversation.from_dict(data)
 

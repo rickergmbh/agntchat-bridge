@@ -1230,10 +1230,16 @@ def _parse_dm_blocks(reply: str) -> tuple[str, list[dict[str, str]]]:
         attrs = {m.group(1): m.group(2) for m in _DM_ATTR_RE.finditer(attrs_str)}
         target = (attrs.get("target") or "").strip()
         topic = (attrs.get("topic") or "").strip()
+        # `goal` is the thread's definition-of-done. When supplied the
+        # backend persists `metadata.thread_goal` so agents in the thread
+        # know what they're working toward and when to call complete_thread.
+        goal = (attrs.get("goal") or "").strip()
         if target and content:
             block: dict[str, str] = {"target": target, "content": content}
             if topic:
                 block["topic"] = topic
+            if goal:
+                block["goal"] = goal
             dm_blocks.append(block)
 
     if dm_blocks:
@@ -1275,6 +1281,7 @@ async def _route_dm_blocks(
         target_name = block["target"]
         content = block["content"]
         topic = block.get("topic") or None
+        goal = block.get("goal") or None
 
         member = _find_member_by_name(target_name, conversation_members)
         if not member and family_agents:
@@ -1290,6 +1297,7 @@ async def _route_dm_blocks(
                 source_conversation_id=source_conversation_id,
                 source_message_id=source_message_id,
                 topic=topic,
+                goal=goal,
             )
             dm_conv_id = dm_conv.get("id")
             if not dm_conv_id:
@@ -1818,18 +1826,41 @@ def _format_message_timestamp(msg: dict[str, Any]) -> str:
 def _extract_structured_text(msg: dict[str, Any], sender_label: str) -> str | None:
     """Extract human-readable text from structured/status_update messages.
 
-    Converts ResultPresentation items, task completion summaries, and other
-    structured content into plain text so the LLM can reference them in context.
-    """
-    message_type = msg.get("messageType") or msg.get("message_type") or ""
-    raw = msg.get("content", "")
+    The backend pre-renders this via `MessageEnvelope.render_readable_text/1`
+    and ships it as `readableText` on both the gateway payload and the REST
+    serializer — prefer that so the bridge, hosted runtime, and any future
+    SDK all surface identical content to the LLM.
 
-    try:
-        data = json.loads(raw) if isinstance(raw, str) else raw
-    except (json.JSONDecodeError, TypeError):
+    Falls back to in-process rendering from `contentStructured` for older
+    server builds that don't yet emit `readableText`.
+    """
+    readable = msg.get("readableText") or msg.get("readable_text")
+    if isinstance(readable, str) and readable.strip():
+        return f"{sender_label}: {readable}"
+
+    message_type = msg.get("messageType") or msg.get("message_type") or ""
+
+    # Prefer the structured payload (the brief `content` column is just a
+    # label like "[Results] title (5 items)" — useless for the LLM).
+    structured = msg.get("contentStructured") or msg.get("content_structured") or {}
+    if isinstance(structured, dict):
+        data = structured.get("data") or structured.get("payload") or structured
+        if not isinstance(data, dict):
+            data = {}
+    else:
         data = {}
 
-    if not isinstance(data, dict):
+    if not data:
+        raw = msg.get("content", "")
+        try:
+            decoded = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(decoded, dict):
+                data = decoded
+        except (json.JSONDecodeError, TypeError):
+            data = {}
+
+    raw = msg.get("content", "")
+    if not data:
         # Fallback: if content is just a string summary, use it
         return f"{sender_label}: {raw[:2000]}" if raw else None
 
@@ -1844,7 +1875,9 @@ def _extract_structured_text(msg: dict[str, Any], sender_label: str) -> str | No
             price = item.get("price", {})
             price_str = ""
             if isinstance(price, dict) and price.get("amount"):
-                price_str = f" — {price.get('currency', '$')}{price['amount']}"
+                # Default currency mirrors backend's `render_readable_text` /
+                # `ResultPresentation.normalize_price/1` (USD).
+                price_str = f" — {price.get('currency', 'USD')} {price['amount']}"
                 if price.get("per"):
                     price_str += f"/{price['per']}"
             details = item.get("details", {})
@@ -3693,12 +3726,13 @@ def run_single_agent(
         chat_messages = await history_task
         live_loc_ctx, msg_owner_lat, msg_owner_lng = await location_task
 
-        if not chat_messages or chat_messages[-1].content != msg.content:
+        trigger_body = msg.readable_text or msg.content
+        if not chat_messages or chat_messages[-1].content != trigger_body:
             sender_label = _format_speaker_label(
                 msg.sender_name or "Someone", msg.sender_type
             )
             chat_messages.append(
-                ChatMessage(role="user", content=f"{sender_label}: {msg.content}")
+                ChatMessage(role="user", content=f"{sender_label}: {trigger_body}")
             )
 
         # --- Agent decides task vs reply inline ---

@@ -88,6 +88,12 @@ class GatewayMessage:
     message_id: str  # underlying message ID
     conversation_id: str
     content: str = ""
+    # LLM-readable rendering of the message. For structured payloads
+    # (ResultPresentation, TaskComplete, etc.) this expands the full body;
+    # for plain text it equals `content`. Prefer this over `content` when
+    # building chat history so structured deliverables aren't reduced to
+    # a one-line label.
+    readable_text: str = ""
     content_type: str = "text"
     message_type: str | None = None
     content_structured: dict[str, Any] | None = None
@@ -120,6 +126,7 @@ class GatewayMessage:
             message_id=d.get("messageId", ""),
             conversation_id=d.get("conversationId", ""),
             content=d.get("content", ""),
+            readable_text=d.get("readableText") or d.get("content", "") or "",
             content_type=d.get("contentType", "text"),
             message_type=d.get("messageType"),
             content_structured=d.get("contentStructured"),
@@ -1155,6 +1162,37 @@ class ExecutorClient:
             last_seen_message_id=last_seen_message_id,
         )
 
+    async def complete_thread(
+        self,
+        thread_id: str,
+        summary: str,
+        *,
+        outcome: str = "resolved",
+    ) -> dict[str, Any]:
+        """Mark an agent thread as resolved and relay the summary to its parent.
+
+        Idempotent — calling on an already-resolved thread is a no-op.
+        Routes through the backend tool host (which calls into
+        `Agentchat.Messaging.complete_thread/3`). The platform handles the
+        source_relay, the parent-conversation StatusUpdate card, and the
+        thread UI state.
+
+        Args:
+            thread_id: The agent thread to close. Use the conversation_id
+                you're currently in when called from inside the thread.
+            summary: Short readable wrap-up posted to the parent.
+            outcome: "resolved" (default), "agreed", "blocked", "deferred",
+                or "abandoned".
+        """
+        return await self._post(
+            "/api/threads/complete",
+            json={
+                "threadId": thread_id,
+                "summary": summary,
+                "outcome": outcome,
+            },
+        )
+
     async def find_or_create_dm(
         self,
         peer_id: str,
@@ -1162,6 +1200,7 @@ class ExecutorClient:
         source_conversation_id: str | None = None,
         source_message_id: str | None = None,
         topic: str | None = None,
+        goal: str | None = None,
     ) -> dict[str, Any]:
         """Find or create a DM conversation with another participant.
 
@@ -1173,6 +1212,10 @@ class ExecutorClient:
         thread for a distinct subject — same (pair, source, topic) reuses the
         same thread; different topic creates a separate concurrent thread.
         When `topic` is omitted, falls back to anchoring on `source_message_id`.
+
+        Pass `goal` (definition-of-done) to give the thread a terminal target.
+        Agents in the thread will be told to call `complete_thread` when the
+        goal is achieved, which triggers an auto-relay back to the parent.
         """
         body: dict[str, Any] = {"peerId": peer_id}
         if source_conversation_id:
@@ -1181,6 +1224,8 @@ class ExecutorClient:
             body["sourceMessageId"] = source_message_id
         if topic:
             body["threadTopic"] = topic
+        if goal:
+            body["threadGoal"] = goal
         return await self._post("/api/conversations/dm", json=body)
 
     async def get_messages(
