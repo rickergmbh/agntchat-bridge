@@ -1135,9 +1135,10 @@ async def send_parsed_presentations(
 # ---------------------------------------------------------------------------
 
 _DM_BLOCK_RE = re.compile(
-    r'<dm\s+target="([^"]+)">(.*?)</dm>',
+    r'<dm\b([^>]*)>(.*?)</dm>',
     re.DOTALL,
 )
+_DM_ATTR_RE = re.compile(r'(\w+)\s*=\s*"([^"]*)"')
 
 
 # --- Outgoing filler detection ---
@@ -1211,20 +1212,29 @@ def _is_outgoing_filler(reply: str) -> bool:
 
 
 def _parse_dm_blocks(reply: str) -> tuple[str, list[dict[str, str]]]:
-    """Parse <dm target="AgentName">content</dm> blocks from LLM response.
+    """Parse <dm target="AgentName" [topic="..."]>content</dm> blocks.
 
-    Returns the reply with DM tags stripped and the list of DM blocks.
-    The caller is responsible for applying the redirect notice template
-    from server-provided behavioralConfig.
+    Returns the reply with DM tags stripped and the list of DM blocks. The
+    optional `topic` attribute lets the model open a distinct concurrent
+    thread for a separate subject — same (pair, source, topic) reuses the
+    same thread, different topic opens a new one. The caller is responsible
+    for applying the redirect notice template from server-provided
+    behavioralConfig.
     """
     dm_blocks: list[dict[str, str]] = []
     remaining = reply
 
     for match in _DM_BLOCK_RE.finditer(reply):
-        target = match.group(1).strip()
-        content = match.group(2).strip()
+        attrs_str = match.group(1) or ""
+        content = (match.group(2) or "").strip()
+        attrs = {m.group(1): m.group(2) for m in _DM_ATTR_RE.finditer(attrs_str)}
+        target = (attrs.get("target") or "").strip()
+        topic = (attrs.get("topic") or "").strip()
         if target and content:
-            dm_blocks.append({"target": target, "content": content})
+            block: dict[str, str] = {"target": target, "content": content}
+            if topic:
+                block["topic"] = topic
+            dm_blocks.append(block)
 
     if dm_blocks:
         remaining = _DM_BLOCK_RE.sub("", remaining).strip()
@@ -1264,6 +1274,7 @@ async def _route_dm_blocks(
     for block in dm_blocks:
         target_name = block["target"]
         content = block["content"]
+        topic = block.get("topic") or None
 
         member = _find_member_by_name(target_name, conversation_members)
         if not member and family_agents:
@@ -1278,6 +1289,7 @@ async def _route_dm_blocks(
                 target_id,
                 source_conversation_id=source_conversation_id,
                 source_message_id=source_message_id,
+                topic=topic,
             )
             dm_conv_id = dm_conv.get("id")
             if not dm_conv_id:
@@ -2586,6 +2598,53 @@ def _build_system_prompt_from_directives(
     return "".join(prompt_directives)
 
 
+# Cached at first build so we don't re-scan the filesystem and re-log a
+# warning for every task. The desktop bridge restarts when the operator
+# changes addDirs, so caching for the process lifetime is safe.
+_WORKING_DIRS_PREAMBLE: str | None = None
+
+
+def _build_working_dirs_preamble() -> str:
+    """System-prompt block disclosing filesystem-accessible directories.
+
+    Capability disclosure, not behavioral logic. The CLI flag (--add-dir
+    for Claude, sandbox_workspace_write.writable_roots for Codex) grants
+    permission but doesn't tell the model anything; without this block the
+    agent never learns those paths exist and falls back to guessing or cwd.
+
+    Read once, cached: bridge restarts when the operator changes the dirs.
+    """
+    global _WORKING_DIRS_PREAMBLE
+    if _WORKING_DIRS_PREAMBLE is not None:
+        return _WORKING_DIRS_PREAMBLE
+    # Imported lazily so the bridge can boot without backends being importable.
+    from agentchat.backends._cli_utils import parse_add_dirs_env
+    dirs = parse_add_dirs_env()
+    if not dirs:
+        _WORKING_DIRS_PREAMBLE = ""
+        return ""
+    bullets = "\n".join(f"- {d}" for d in dirs)
+    _WORKING_DIRS_PREAMBLE = (
+        "## Working directories\n"
+        "You have filesystem access to the following directories. "
+        "When the user references files or asks you to find or open something, "
+        "look in these locations first instead of guessing or using cwd:\n"
+        f"{bullets}\n\n"
+    )
+    return _WORKING_DIRS_PREAMBLE
+
+
+def _compose_system_prompt(directives: dict[str, Any] | None) -> str:
+    """Single funnel for building the agent's system prompt.
+
+    Combines (in order):
+      1. The working-directories preamble (bridge-side capability disclosure)
+      2. Server-provided promptDirectives, or _FALLBACK_SYSTEM_PROMPT
+    """
+    base = _build_system_prompt_from_directives(directives) or _FALLBACK_SYSTEM_PROMPT
+    return _build_working_dirs_preamble() + base
+
+
 # ---------------------------------------------------------------------------
 # Credential resolution
 # ---------------------------------------------------------------------------
@@ -3049,7 +3108,7 @@ def run_single_agent(
         execution_plan = task_meta.get("execution_plan")
         if execution_plan and execution_plan.get("steps"):
             # Build prompt from directives
-            task_prompt = _build_system_prompt_from_directives(task_directives) or _FALLBACK_SYSTEM_PROMPT
+            task_prompt = _compose_system_prompt(task_directives)
             return await _handle_compound_task(
                 task, execution_plan, executor, backend, task_prompt,
                 executor_key, history_limit, my_participant_id,
@@ -3062,7 +3121,7 @@ def run_single_agent(
         task_description = task.description
 
         # --- Build system prompt from server directives ---
-        task_prompt = _build_system_prompt_from_directives(task_directives) or _FALLBACK_SYSTEM_PROMPT
+        task_prompt = _compose_system_prompt(task_directives)
 
         if _tool_prompt_suffix:
             task_prompt += _tool_prompt_suffix
@@ -3650,7 +3709,7 @@ def run_single_agent(
         # when to self-task vs just reply.
 
         # --- Build system prompt from server directives ---
-        msg_prompt = _build_system_prompt_from_directives(directives) or _FALLBACK_SYSTEM_PROMPT
+        msg_prompt = _compose_system_prompt(directives)
 
         # Inject tool definitions for single-shot mode
         if _tool_prompt_suffix:

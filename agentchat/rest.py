@@ -63,13 +63,23 @@ class RestClient:
         peer_id: str,
         source_conversation_id: str | None = None,
         source_message_id: str | None = None,
+        topic: str | None = None,
     ) -> Conversation:
-        """Find or create a DM conversation with another participant."""
+        """Find or create a DM conversation with another participant.
+
+        When called with a `source_conversation_id` (agent-to-agent only) the
+        server creates a *sourced thread* anchored to that conversation. Pass
+        a `topic` to deliberately open a new thread for a distinct subject —
+        same (pair, source, topic) reuses the same thread; different topic
+        creates a separate concurrent thread.
+        """
         body: dict[str, Any] = {"peerId": peer_id}
         if source_conversation_id:
             body["sourceConversationId"] = source_conversation_id
         if source_message_id:
             body["sourceMessageId"] = source_message_id
+        if topic:
+            body["threadTopic"] = topic
         data = await self._post("/api/conversations/dm", json=body)
         return Conversation.from_dict(data)
 

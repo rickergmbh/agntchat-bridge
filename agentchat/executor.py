@@ -1149,6 +1149,7 @@ class ExecutorClient:
         *,
         source_conversation_id: str | None = None,
         source_message_id: str | None = None,
+        topic: str | None = None,
     ) -> dict[str, Any]:
         """Find or create a DM conversation with another participant.
 
@@ -1156,14 +1157,18 @@ class ExecutorClient:
         Use conversation["id"] to send messages to the DM.
 
         When source context is provided, the DM is created as an agent thread
-        under the source conversation and anchored to the source message when
-        available.
+        under the source conversation. Pass `topic` to deliberately open a new
+        thread for a distinct subject — same (pair, source, topic) reuses the
+        same thread; different topic creates a separate concurrent thread.
+        When `topic` is omitted, falls back to anchoring on `source_message_id`.
         """
         body: dict[str, Any] = {"peerId": peer_id}
         if source_conversation_id:
             body["sourceConversationId"] = source_conversation_id
         if source_message_id:
             body["sourceMessageId"] = source_message_id
+        if topic:
+            body["threadTopic"] = topic
         return await self._post("/api/conversations/dm", json=body)
 
     async def get_messages(
