@@ -224,7 +224,7 @@ class ToolExecutor:
         # IS the thread when the call originates from inside a thread; the
         # backend errors with :not_a_thread if the agent is in a non-thread
         # conversation, so falling back to ctx_conv_id is safe.
-        if executor_method in ("complete_thread", "set_thread_goal"):
+        if executor_method == "complete_thread":
             llm_thread_id = arguments.get("thread_id")
             if _is_placeholder_conv_id(llm_thread_id):
                 ctx_conv = self._context.get("conversation_id")
@@ -250,11 +250,18 @@ class ToolExecutor:
             if last_seen and not arguments.get("last_seen_message_id"):
                 arguments["last_seen_message_id"] = last_seen
 
-        # Find the ExecutorClient method
+        # Find the ExecutorClient method. When the SDK doesn't have one,
+        # fall back to the generic platform-tool passthrough — the backend
+        # dispatches via ToolRegistry the same way an in-process MCP call
+        # would. This lets new server-side tools work without shipping a
+        # bridge SDK method, and replaces the old "no method" error with
+        # an actual round-trip.
         method = getattr(self._client, executor_method, None)
         if not method:
-            return json.dumps(
-                {"error": f"ExecutorClient has no method: {executor_method}"}
+            return await self._invoke_via_passthrough(
+                tool_name=tool_name,
+                executor_method=executor_method,
+                arguments=arguments,
             )
 
         # All arguments passed as kwargs (simple, works with all executor methods)
@@ -339,6 +346,69 @@ class ToolExecutor:
         })
 
         return result_str
+
+    async def _invoke_via_passthrough(
+        self,
+        *,
+        tool_name: str,
+        executor_method: str,
+        arguments: dict[str, Any],
+    ) -> str:
+        """Generic-tool fallback: POST {tool_name, args, context} to the
+        backend so it can dispatch through `ToolRegistry`. Used when the
+        SDK has no matching method — lets new server-registered tools
+        work without bridge code updates.
+
+        Context is built from the bridge's invocation context the same
+        way the SDK-method path auto-injects values. The backend
+        whitelists which keys make it into the in-process context.
+        """
+        # Forward the same context keys the in-process MCP path uses.
+        context = {
+            k: v
+            for k, v in {
+                "conversation_id": self._context.get("conversation_id"),
+                "source_message_id": self._context.get("source_message_id"),
+                "task_id": self._context.get("task_id"),
+                "active_conversation_id": self._context.get("active_conversation_id"),
+                "last_seen_message_id": self._context.get("last_seen_message_id"),
+            }.items()
+            if v
+        }
+
+        payload = {
+            "tool_name": tool_name,
+            "args": arguments,
+            "context": context,
+        }
+
+        try:
+            response = await self._client._post("/api/mcp/call", json=payload)
+        except Exception as e:
+            logger.warning(
+                "[ToolExecutor] Passthrough call failed for %s: %s", tool_name, e
+            )
+            return json.dumps(
+                {"error": f"Passthrough call to {tool_name} failed: {e}"}
+            )
+
+        # The endpoint returns `{ok, content: [...]}` where content is the
+        # MCP standard shape. Unwrap to plain text so the LLM sees the
+        # same thing it would for an SDK-backed tool.
+        if isinstance(response, dict):
+            blocks = response.get("content") or []
+            text_parts = [
+                b.get("text", "")
+                for b in blocks
+                if isinstance(b, dict) and b.get("type") == "text"
+            ]
+            joined = "\n".join(p for p in text_parts if p)
+            if joined:
+                return joined
+            if not response.get("ok", True):
+                return json.dumps({"error": response.get("error", "tool failed")})
+
+        return _serialize(response)
 
 
 def _serialize(value: Any) -> str:

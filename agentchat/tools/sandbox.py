@@ -173,13 +173,6 @@ def complete_thread(thread_id, summary, *, outcome="resolved"):
     )
 
 
-def set_thread_goal(thread_id, goal):
-    """Stamp a goal on an agent thread that doesn't have one yet.
-
-    Refuses to overwrite an existing goal — complete the thread and start
-    a new one if the work has pivoted.
-    """
-    return _api("POST", "/api/threads/goal", {"threadId": thread_id, "goal": goal})
 
 
 def update_task_status(task_id, status, summary=None):
