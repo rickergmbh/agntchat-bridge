@@ -1222,8 +1222,7 @@ def _parse_dm_blocks(reply: str) -> tuple[str, list[dict[str, str]]]:
     optional `topic` attribute lets the model open a distinct concurrent
     thread for a separate subject — same (pair, source, topic) reuses the
     same thread, different topic opens a new one. The caller is responsible
-    for applying the redirect notice template from server-provided
-    behavioralConfig.
+    for posting any hidden turn-queue redirect signal.
     """
     dm_blocks: list[dict[str, str]] = []
     remaining = reply
@@ -1336,6 +1335,55 @@ async def _route_dm_blocks(
         except Exception as e:
             logger.warning("[%s] Failed to route DM to %s: %s", executor_key, target_name, e)
     return sent_targets
+
+
+def _thread_redirect_notice(targets: list[str], behavioral_config: dict[str, Any] | None) -> str:
+    """Build the internal thread-redirect signal used for turn-queue summaries."""
+    joined = ", ".join(targets)
+    template = (behavioral_config or {}).get("dmRedirectTemplate") or "[Continuing in DM with {targets}]"
+    notice = template.replace("{targets}", joined).strip()
+    return notice or f"[Continuing in DM with {joined}]"
+
+
+async def _send_hidden_thread_redirect(
+    executor: ExecutorClient,
+    conversation_id: str,
+    targets: list[str],
+    executor_key: str,
+    metadata: dict[str, Any] | None = None,
+    behavioral_config: dict[str, Any] | None = None,
+    last_seen_message_id: str | None = None,
+) -> None:
+    """Persist a hidden EndTurn after thread creation instead of a visible ack.
+
+    The EndTurn keeps TurnQueue / loop-prevention state moving and preserves a
+    "DM with ..." summary for later agents, while the backend hides internal
+    message types from broadcasts and transcript listings.
+    """
+    if not targets:
+        return
+
+    notice = _thread_redirect_notice(targets, behavioral_config)
+    msg_metadata = dict(metadata or {})
+    msg_metadata["thread_redirect_ack_hidden"] = True
+
+    try:
+        await executor.send_message(
+            conversation_id,
+            notice,
+            content_type="structured",
+            message_type="EndTurn",
+            metadata=msg_metadata,
+            last_seen_message_id=last_seen_message_id,
+        )
+        logger.info("[%s] Posted hidden thread redirect for %s", executor_key, ", ".join(targets))
+    except StaleContextError as sce:
+        logger.info(
+            "[%s] Dropped stale hidden thread redirect — %d new message(s) arrived during DM routing",
+            executor_key, len(sce.new_messages),
+        )
+    except Exception as e:
+        logger.warning("[%s] Failed to post hidden thread redirect: %s", executor_key, e)
 
 
 
@@ -3912,10 +3960,16 @@ def run_single_agent(
                     )
 
                     if routed_targets:
-                        dm_template = behavioral_config.get(
-                            "dmRedirectTemplate", "[Continuing in DM with {targets}]"
+                        await _send_hidden_thread_redirect(
+                            executor,
+                            msg.conversation_id,
+                            routed_targets,
+                            executor_key,
+                            metadata=msg_meta_out,
+                            behavioral_config=behavioral_config,
+                            last_seen_message_id=msg.latest_seen_message_id or msg.message_id or None,
                         )
-                        reply = dm_template.replace("{targets}", ", ".join(routed_targets))
+                        reply = None
                     else:
                         targets = ", ".join(b["target"] for b in tu_dm_blocks)
                         reply = f"[Could not start agent thread with {targets}]"
@@ -4117,8 +4171,23 @@ def run_single_agent(
             logger.info("[%s] Routed %d/%d DM block(s)", executor_key, len(routed_targets), len(dm_blocks))
 
             if routed_targets:
-                dm_template = behavioral_config.get("dmRedirectTemplate", "[Continuing in DM with {targets}]")
-                reply = dm_template.replace("{targets}", ", ".join(routed_targets))
+                msg_meta_redirect: dict[str, str] = {}
+                if result and result.model:
+                    msg_meta_redirect["model"] = result.model
+                if effective_backend:
+                    msg_meta_redirect["backend"] = effective_backend
+                msg_meta_redirect["stream_id"] = _msg_stream_id
+
+                await _send_hidden_thread_redirect(
+                    executor,
+                    msg.conversation_id,
+                    routed_targets,
+                    executor_key,
+                    metadata=msg_meta_redirect,
+                    behavioral_config=behavioral_config,
+                    last_seen_message_id=msg.latest_seen_message_id or msg.message_id or None,
+                )
+                reply = None
             else:
                 targets = ", ".join(b["target"] for b in dm_blocks)
                 reply = f"[Could not start agent thread with {targets}]"
