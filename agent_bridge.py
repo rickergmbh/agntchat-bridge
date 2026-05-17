@@ -1138,7 +1138,11 @@ _DM_BLOCK_RE = re.compile(
     r'<dm\b([^>]*)>(.*?)</dm>',
     re.DOTALL,
 )
-_DM_ATTR_RE = re.compile(r'(\w+)\s*=\s*"([^"]*)"')
+# Tolerate single and double quotes around attribute values (LLMs emit
+# whichever the prompt example showed last). Captured value lives in the
+# named group `val` so we can read it without juggling group indices for
+# the two alternatives.
+_DM_ATTR_RE = re.compile(r'(\w+)\s*=\s*(?:"(?P<dq>[^"]*)"|\'(?P<sq>[^\']*)\')')
 
 
 # --- Outgoing filler detection ---
@@ -1227,7 +1231,22 @@ def _parse_dm_blocks(reply: str) -> tuple[str, list[dict[str, str]]]:
     for match in _DM_BLOCK_RE.finditer(reply):
         attrs_str = match.group(1) or ""
         content = (match.group(2) or "").strip()
-        attrs = {m.group(1): m.group(2) for m in _DM_ATTR_RE.finditer(attrs_str)}
+        # Read the captured value from whichever quote variant fired
+        # (`dq` for double, `sq` for single). Exactly one is non-None
+        # per match per the alternation.
+        attrs = {
+            m.group(1): (m.group("dq") if m.group("dq") is not None else m.group("sq") or "")
+            for m in _DM_ATTR_RE.finditer(attrs_str)
+        }
+        # If the attribute string clearly contains `name=` tokens but we
+        # extracted zero pairs, the model probably emitted an unrecognized
+        # quote form (curly quotes, no quotes, escaped quotes). Log so we
+        # don't silently drop a routing intent.
+        if not attrs and "=" in attrs_str:
+            logger.warning(
+                "[DM] Could not parse attributes in <dm> tag: %r — block dropped",
+                attrs_str[:200],
+            )
         target = (attrs.get("target") or "").strip()
         topic = (attrs.get("topic") or "").strip()
         # `goal` is the thread's definition-of-done. When supplied the

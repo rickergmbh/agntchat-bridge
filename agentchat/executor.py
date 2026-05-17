@@ -1162,6 +1162,23 @@ class ExecutorClient:
             last_seen_message_id=last_seen_message_id,
         )
 
+    async def set_thread_goal(
+        self,
+        thread_id: str,
+        goal: str,
+    ) -> dict[str, Any]:
+        """Stamp a goal (definition-of-done) on an agent thread.
+
+        Use this for threads opened without an explicit goal (the
+        AGENT THREAD CONTEXT directive will nudge you to do so). Refuses
+        to overwrite an existing goal — open a fresh thread via
+        `find_or_create_dm` with a new `topic` if the work has pivoted.
+        """
+        return await self._post(
+            "/api/threads/goal",
+            json={"threadId": thread_id, "goal": goal},
+        )
+
     async def complete_thread(
         self,
         thread_id: str,

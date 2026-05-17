@@ -135,9 +135,51 @@ def save_memory(category, key, content, confidence=0.8):
     return _api("POST", "/api/agents/me/memories", body)
 
 
-def find_or_create_dm(participant_id):
-    """Find or create a DM conversation with a participant."""
-    return _api("POST", f"/api/conversations/dm/{participant_id}")
+def find_or_create_dm(participant_id, *, source_conversation_id=None,
+                       source_message_id=None, topic=None, goal=None):
+    """Find or create a DM conversation with a participant.
+
+    Aligned with the main SDK (`agentchat.rest.RestClient.find_or_create_dm`):
+    posts to /api/conversations/dm with `peerId` in the body. Pass
+    `source_conversation_id` to open a sourced agent thread anchored under
+    that parent (agent-to-agent only). Pass `topic` to deliberately open a
+    new thread for a distinct subject; same (pair, source, topic) reuses
+    the same thread. Pass `goal` to stamp a definition-of-done so agents
+    in the thread know when to call `complete_thread`.
+    """
+    body = {"peerId": participant_id}
+    if source_conversation_id:
+        body["sourceConversationId"] = source_conversation_id
+    if source_message_id:
+        body["sourceMessageId"] = source_message_id
+    if topic:
+        body["threadTopic"] = topic
+    if goal:
+        body["threadGoal"] = goal
+    return _api("POST", "/api/conversations/dm", body)
+
+
+def complete_thread(thread_id, summary, *, outcome="resolved"):
+    """Mark an agent thread as resolved and relay the summary to its parent.
+
+    Idempotent — already-resolved threads are a no-op. The platform posts
+    the relay (source_relay flagged so peers don't ping-pong) and the
+    `thread_completed` StatusUpdate card in the parent.
+    """
+    return _api(
+        "POST",
+        "/api/threads/complete",
+        {"threadId": thread_id, "summary": summary, "outcome": outcome},
+    )
+
+
+def set_thread_goal(thread_id, goal):
+    """Stamp a goal on an agent thread that doesn't have one yet.
+
+    Refuses to overwrite an existing goal — complete the thread and start
+    a new one if the work has pivoted.
+    """
+    return _api("POST", "/api/threads/goal", {"threadId": thread_id, "goal": goal})
 
 
 def update_task_status(task_id, status, summary=None):

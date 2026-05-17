@@ -219,12 +219,12 @@ class ToolExecutor:
             if not arguments.get("source_message_id"):
                 arguments["source_message_id"] = self._context.get("source_message_id")
 
-        # Auto-inject thread_id for complete_thread when the model didn't
-        # supply one (or used a placeholder). The current conversation IS
-        # the thread when the call originates from inside a thread; the
-        # tool errors with :not_a_thread if the agent is in a non-thread
+        # Auto-inject thread_id for thread lifecycle verbs when the model
+        # didn't supply one (or used a placeholder). The current conversation
+        # IS the thread when the call originates from inside a thread; the
+        # backend errors with :not_a_thread if the agent is in a non-thread
         # conversation, so falling back to ctx_conv_id is safe.
-        if executor_method == "complete_thread":
+        if executor_method in ("complete_thread", "set_thread_goal"):
             llm_thread_id = arguments.get("thread_id")
             if _is_placeholder_conv_id(llm_thread_id):
                 ctx_conv = self._context.get("conversation_id")
