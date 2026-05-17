@@ -1238,14 +1238,21 @@ def _parse_dm_blocks(reply: str) -> tuple[str, list[dict[str, str]]]:
             m.group(1): (m.group("dq") if m.group("dq") is not None else m.group("sq") or "")
             for m in _DM_ATTR_RE.finditer(attrs_str)
         }
-        # If the attribute string clearly contains `name=` tokens but we
-        # extracted zero pairs, the model probably emitted an unrecognized
-        # quote form (curly quotes, no quotes, escaped quotes). Log so we
-        # don't silently drop a routing intent.
-        if not attrs and "=" in attrs_str:
+        # Detect parse failures.
+        #
+        # (a) Zero attrs but `=` is present → bad quoting or no quotes at all.
+        # (b) Fewer parsed attrs than `=` tokens → partial parse, e.g.
+        #     `target='Bob's friend'` (apostrophe inside single-quoted value
+        #     closes the value early; remaining tokens get silently dropped)
+        #     or `goal="agree on \"tier\""` (escaped inner quote truncates).
+        #
+        # The old guard only caught (a) — the (b) case silently corrupted
+        # values because `attrs` was non-empty.
+        equals_count = attrs_str.count("=")
+        if equals_count and len(attrs) < equals_count:
             logger.warning(
-                "[DM] Could not parse attributes in <dm> tag: %r — block dropped",
-                attrs_str[:200],
+                "[DM] Partial <dm> attribute parse: extracted %d/%d, raw=%r",
+                len(attrs), equals_count, attrs_str[:200],
             )
         target = (attrs.get("target") or "").strip()
         topic = (attrs.get("topic") or "").strip()
