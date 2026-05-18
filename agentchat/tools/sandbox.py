@@ -160,11 +160,12 @@ def find_or_create_dm(participant_id, *, source_conversation_id=None,
 
 
 def complete_thread(thread_id, summary, *, outcome="resolved"):
-    """Mark an agent thread as resolved and relay the summary to its parent.
+    """Mark an agent thread as resolved and deliver the summary to its parent.
 
-    Idempotent — already-resolved threads are a no-op. The platform posts
-    the relay (source_relay flagged so peers don't ping-pong) and the
-    `thread_completed` StatusUpdate card in the parent.
+    Idempotent — already-resolved threads are a no-op. The platform posts a
+    `thread_completed` StatusUpdate card (carrying the summary) into the
+    parent and wakes the agent that opened the thread so they continue
+    the parent work. No separate text relay is posted.
     """
     return _api(
         "POST",
