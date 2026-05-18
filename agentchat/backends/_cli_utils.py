@@ -128,23 +128,31 @@ def cleanup_temp_files(paths: Iterable[str]) -> None:
 
 def download_image_to_temp(url: str) -> str | None:
     """Download an image URL to a temp file. Returns the file path or None."""
+    return download_to_temp(url, prefix="agentchat_img_", default_ext=".jpg")
+
+
+def download_to_temp(
+    url: str,
+    *,
+    prefix: str = "agentchat_file_",
+    default_ext: str = ".bin",
+    suffix_override: str | None = None,
+) -> str | None:
+    """Download a URL to a temp file, preserving the file's natural extension.
+
+    The extension matters for Claude Code CLI's Read tool, which dispatches
+    PDF/image/text handlers by suffix. `suffix_override` takes precedence —
+    callers that know the filename (e.g. an attachment with `.docx`) should
+    pass it explicitly rather than letting URL sniffing guess.
+
+    Returns the local path on success, None on failure.
+    """
     try:
-        ext_map = {
-            ".jpg": ".jpg",
-            ".jpeg": ".jpg",
-            ".png": ".png",
-            ".gif": ".gif",
-            ".webp": ".webp",
-        }
-        ext = ".jpg"
-        for suffix, mapped in ext_map.items():
-            if suffix in url.lower().split("?")[0]:
-                ext = mapped
-                break
-        fd, path = tempfile.mkstemp(suffix=ext, prefix="agentchat_img_")
+        suffix = suffix_override or _guess_ext_from_url(url, default_ext)
+        fd, path = tempfile.mkstemp(suffix=suffix, prefix=prefix)
         os.close(fd)
         urllib.request.urlretrieve(url, path)
-        # Defensive: a missing-image redirect or 200-OK-but-empty body
+        # Defensive: a missing-resource redirect or 200-OK-but-empty body
         # produces a near-zero-byte file. Treat it as a failed download.
         if os.path.getsize(path) < 100:
             os.unlink(path)
@@ -152,6 +160,16 @@ def download_image_to_temp(url: str) -> str | None:
         return path
     except Exception:
         return None
+
+
+def _guess_ext_from_url(url: str, default_ext: str) -> str:
+    path_part = url.lower().split("?")[0]
+    for known in (".pdf", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".docx",
+                  ".xlsx", ".pptx", ".doc", ".xls", ".ppt", ".txt", ".csv",
+                  ".json", ".xml", ".yaml", ".yml", ".md"):
+        if path_part.endswith(known):
+            return ".jpg" if known == ".jpeg" else known
+    return default_ext
 
 
 def save_base64_image_to_temp(data: str, media_type: str) -> str | None:
@@ -177,6 +195,7 @@ __all__ = [
     "ANSI_ESCAPE_RE",
     "cleanup_temp_files",
     "download_image_to_temp",
+    "download_to_temp",
     "parse_add_dirs_env",
     "resolve_cli_path",
     "save_base64_image_to_temp",

@@ -148,11 +148,11 @@ class OpenAIBackend(ModelBackend):
         self, system_prompt: str, messages: list[ChatMessage], on_progress=None
     ) -> ModelResult:
         """Native multi-turn conversation via OpenAI chat completions API."""
-        api_messages: list[dict[str, str]] = [
+        api_messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt}
         ]
         for msg in messages:
-            api_messages.append({"role": msg.role, "content": msg.content})
+            api_messages.append({"role": msg.role, "content": _translate_content(msg.content)})
 
         # Ensure there's at least one user message
         if len(api_messages) == 1:
@@ -210,7 +210,7 @@ class OpenAIBackend(ModelBackend):
             {"role": "system", "content": system_prompt}
         ]
         for msg in messages:
-            api_messages.append({"role": msg.role, "content": msg.content})
+            api_messages.append({"role": msg.role, "content": _translate_content(msg.content)})
         if len(api_messages) == 1:
             api_messages.append({"role": "user", "content": "Hello"})
 
@@ -364,6 +364,52 @@ class OpenAIBackend(ModelBackend):
             iterations=iteration,
             stop_reason="max_iterations",
         )
+
+
+def _translate_content(content: Any) -> Any:
+    """Convert ChatMessage content for OpenAI chat-completions.
+
+    Plain strings pass through. Lists may contain internal `attachment`
+    blocks (bridge-emitted, uniform across backends); translate them
+    to `image_url` blocks for images and text references with the
+    `read_attachment` hint for everything else.
+    """
+    from . import _attachment as att
+
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return content
+
+    out: list[dict[str, Any]] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+
+        if btype == "text":
+            out.append({"type": "text", "text": block.get("text", "")})
+
+        elif btype == "image":
+            source = block.get("source") or {}
+            url = source.get("url") if source.get("type") == "url" else None
+            if url:
+                out.append({"type": "image_url", "image_url": {"url": url}})
+
+        elif btype == "attachment":
+            url = block.get("url")
+            if url and att.is_image_attachment(block):
+                out.append({"type": "image_url", "image_url": {"url": url}})
+                out.append({"type": "text", "text": att.attachment_label(block)})
+            else:
+                out.append({"type": "text", "text": att.fallback_text(block)})
+
+    # Collapse to plain string if there's only text — many providers
+    # accept that shape with broader compatibility.
+    if out and all(b.get("type") == "text" for b in out):
+        return "\n".join(b.get("text", "") for b in out)
+
+    return out or content
 
 
 def _try_int(val: str | None) -> int | None:

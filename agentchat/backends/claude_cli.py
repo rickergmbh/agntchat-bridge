@@ -36,6 +36,7 @@ from ._cli_utils import (
     ANSI_ESCAPE_RE,
     cleanup_temp_files,
     download_image_to_temp,
+    download_to_temp,
     parse_add_dirs_env,
     resolve_cli_path,
     save_base64_image_to_temp,
@@ -59,13 +60,23 @@ _DEFAULT_TIMEOUT = 900  # 15 minutes — complex tasks need time
 _STREAM_LIMIT = 10 * 1024 * 1024  # 10 MB — CLI can emit large JSON lines
 
 
-def _content_to_cli_text(content: str | list) -> str:
+def _content_to_cli_text(content: str | list, cleanup_paths: list[str] | None = None) -> str:
     """Convert ChatMessage content to plain text for the CLI prompt.
 
-    Handles both plain strings and multimodal content blocks (images + text).
-    For URL image blocks, downloads to a temp file so the CLI's Read tool
-    can view the image directly.
+    Handles plain strings, internal `attachment` blocks (emitted by the
+    bridge for every uploaded file), and pre-translated `image` blocks.
+    Files are downloaded to temp paths so Claude Code's native Read tool
+    handles them with full PDF/image rendering — same quality as the
+    Anthropic Messages API's document blocks, just delivered through
+    the CLI's tool surface.
+
+    Callers should pass a `cleanup_paths` list so temp files are unlinked
+    after the turn. Omitting it leaks one file per attached file per
+    turn — historically accepted for the image-only path but worth
+    closing now that arbitrary file types flow through here.
     """
+    from . import _attachment as att
+
     if isinstance(content, str):
         return content
 
@@ -74,31 +85,72 @@ def _content_to_cli_text(content: str | list) -> str:
         if not isinstance(block, dict):
             continue
         btype = block.get("type")
+
         if btype == "text":
             parts.append(block.get("text", ""))
+
+        elif btype == "attachment":
+            parts.append(_attachment_to_cli_pointer(block, cleanup_paths))
+
         elif btype == "image":
             source = block.get("source", {})
             src_type = source.get("type")
             if src_type == "url":
                 url = source.get("url", "")
-                # Download image to temp file for CLI's Read tool
                 path = download_image_to_temp(url)
                 if path:
+                    if cleanup_paths is not None:
+                        cleanup_paths.append(path)
                     parts.append(f"[Image saved to: {path} — use Read to view it]")
                 else:
                     parts.append(f"[Image URL: {url}]")
             elif src_type == "base64":
-                # Legacy base64 — save to temp file to avoid bloating the prompt
                 path = save_base64_image_to_temp(
                     source.get("data", ""),
                     source.get("media_type", "image/jpeg"),
                 )
                 if path:
+                    if cleanup_paths is not None:
+                        cleanup_paths.append(path)
                     parts.append(f"[Image saved to: {path} — use Read to view it]")
                 else:
                     parts.append("[Image: unable to save for viewing]")
 
+    # `att` import used so static analysis sees it as live; the label
+    # path lives in _attachment_to_cli_pointer.
+    _ = att
+
     return " ".join(parts) if parts else str(content)
+
+
+def _attachment_to_cli_pointer(block: dict, cleanup_paths: list[str] | None = None) -> str:
+    """Translate an internal `attachment` block to a CLI-readable pointer.
+
+    Downloads the file to a temp path (preserving extension) so the CLI's
+    Read tool can open it; the path is appended to `cleanup_paths` so
+    the caller can unlink after the turn. Falls back to a text label
+    + read_attachment hint when no URL is available or download fails.
+    """
+    from . import _attachment as att
+
+    filename = block.get("filename") or "file"
+    url = block.get("url")
+    label = att.attachment_label(block)
+
+    suffix = os.path.splitext(filename)[1] or ".bin"
+
+    if url:
+        path = download_to_temp(
+            url,
+            prefix="agentchat_attach_",
+            suffix_override=suffix,
+        )
+        if path:
+            if cleanup_paths is not None:
+                cleanup_paths.append(path)
+            return f"{label} (saved to: {path} — use Read to view it)"
+
+    return att.fallback_text(block)
 
 
 class ClaudeCliBackend(ModelBackend):
@@ -769,9 +821,12 @@ class ClaudeCliBackend(ModelBackend):
         mcp_tools = self._mcp_resolved_tools
         if mcp_tools and self._mcp_server_script:
             conversation = []
+            attachment_cleanup: list[str] = []
             for msg in messages:
                 prefix = "User" if msg.role == "user" else "Assistant"
-                conversation.append(f"{prefix}: {_content_to_cli_text(msg.content)}")
+                conversation.append(
+                    f"{prefix}: {_content_to_cli_text(msg.content, attachment_cleanup)}"
+                )
             user_prompt = "\n\n".join(conversation)
 
             cmd, prompt, cleanup = self._base_cmd(
@@ -783,6 +838,7 @@ class ClaudeCliBackend(ModelBackend):
                 source_message_id=self._mcp_source_message_id,
                 last_seen_message_id=self._mcp_last_seen_message_id,
             )
+            cleanup.extend(attachment_cleanup)
             # Let CLI handle the tool loop with max-turns.
             # _base_cmd already sets --max-turns if self._max_turns is configured.
             # Only add it here if _base_cmd didn't (i.e., no agent-level max_turns).
@@ -854,11 +910,19 @@ class ClaudeCliBackend(ModelBackend):
         total_budget = self._timeout * 1.5
         iteration = 0
 
-        # Build initial user prompt from messages
+        # Build initial user prompt from messages. Attachment temp files
+        # must outlive every iteration (each spawn references the same
+        # paths). Each iteration's `cleanup` list inherits them so the
+        # LAST iteration to run also unlinks the attachments — every
+        # return / break path goes through a `cleanup_temp_files(cleanup)`
+        # finally block.
         conversation: list[str] = []
+        attachment_cleanup: list[str] = []
         for msg in messages:
             prefix = "User" if msg.role == "user" else "Assistant"
-            conversation.append(f"{prefix}: {_content_to_cli_text(msg.content)}")
+            conversation.append(
+                f"{prefix}: {_content_to_cli_text(msg.content, attachment_cleanup)}"
+            )
 
         while iteration < max_iterations:
             iteration += 1
@@ -869,6 +933,7 @@ class ClaudeCliBackend(ModelBackend):
             elapsed_so_far = time.monotonic() - start
             if elapsed_so_far > total_budget:
                 logger.warning("Total time budget (%.0fs) exceeded", total_budget)
+                cleanup_temp_files(attachment_cleanup)
                 break
 
             user_prompt = "\n\n".join(conversation)
@@ -882,6 +947,7 @@ class ClaudeCliBackend(ModelBackend):
             except (TimeoutError, RuntimeError) as e:
                 logger.warning("CLI iteration %d failed: %s", iteration, e)
                 elapsed = time.monotonic() - start
+                cleanup_temp_files(attachment_cleanup)
                 return ModelResult(
                     text=f"[Tool loop aborted: {e}]",
                     model=self._model or "claude-cli",
@@ -907,7 +973,7 @@ class ClaudeCliBackend(ModelBackend):
             if not calls:
                 elapsed = time.monotonic() - start
                 final_text = remaining_text or result.text
-
+                cleanup_temp_files(attachment_cleanup)
                 return ModelResult(
                     text=final_text,
                     model=result.model,
@@ -989,6 +1055,7 @@ class ClaudeCliBackend(ModelBackend):
                     cleanup_temp_files(cleanup)
 
                 elapsed = time.monotonic() - start
+                cleanup_temp_files(attachment_cleanup)
                 return ModelResult(
                     text=remaining_text,
                     model=self._model or "claude-cli",
@@ -1001,6 +1068,7 @@ class ClaudeCliBackend(ModelBackend):
         # Exceeded max iterations
         elapsed = time.monotonic() - start
         logger.warning("Max iterations (%d) reached", max_iterations)
+        cleanup_temp_files(attachment_cleanup)
         return ModelResult(
             text="[Agent exceeded maximum iterations without completing]",
             model=self._model or "claude-cli",

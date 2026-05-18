@@ -168,16 +168,42 @@ class OpenClawBackend(ModelBackend):
     async def chat(
         self, system_prompt: str, messages: list[ChatMessage], on_progress=None
     ) -> ModelResult:
-        api_messages: list[dict[str, str]] = [
+        api_messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt}
         ]
         for msg in messages:
-            api_messages.append({"role": msg.role, "content": msg.content})
+            api_messages.append({"role": msg.role, "content": _flatten_to_text(msg.content)})
 
         if len(api_messages) == 1:
             api_messages.append({"role": "user", "content": "Hello"})
 
         return await self._stream_completion(api_messages)
+
+
+def _flatten_to_text(content: Any) -> str:
+    """Flatten ChatMessage content to a plain string.
+
+    OpenClaw's HTTP wire format doesn't support content blocks, so we
+    inline everything as text. Attachment blocks become a text reference
+    + `read_attachment` hint via the shared attachment helper.
+    """
+    from . import _attachment as att
+
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            parts.append(block.get("text", ""))
+        elif btype == "attachment":
+            parts.append(att.fallback_text(block))
+    return "\n".join(parts) if parts else ""
 
 
 def _try_int(val: str | None) -> int | None:

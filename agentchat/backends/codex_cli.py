@@ -126,6 +126,22 @@ def _content_to_cli(content: str | list) -> tuple[str, list[str]]:
                 image_paths.append(path)
             else:
                 text_parts.append("[Image: unable to attach]")
+        elif btype == "attachment":
+            # Bridge-uniform file block. Codex's `-i` flag is image-only,
+            # so non-image attachments fall through to a text reference +
+            # read_attachment hint.
+            from . import _attachment as att
+
+            url = block.get("url")
+            if url and att.is_image_attachment(block):
+                path = download_image_to_temp(url)
+                if path:
+                    image_paths.append(path)
+                    text_parts.append(att.attachment_label(block))
+                else:
+                    text_parts.append(f"{att.attachment_label(block)} [image unavailable]")
+            else:
+                text_parts.append(att.fallback_text(block))
     text = " ".join(text_parts) if text_parts else (str(content) if content else "")
     return text, image_paths
 

@@ -9,7 +9,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-anthropic = ["anthropic>=0.39.0"]
+# 0.50+ has GA PDF support via `document` blocks with URL source.
+# Older versions need an `anthropic-beta: pdfs-2024-09-25` header.
+anthropic = ["anthropic>=0.50.0"]
 openai = ["openai>=1.50.0"]
 dev = [
     "pytest>=8.0",

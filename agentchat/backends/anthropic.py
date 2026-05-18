@@ -206,7 +206,7 @@ class AnthropicBackend(ModelBackend):
         SDK supports streaming, the response is streamed so that intermediate
         progress events can be emitted to the live activity feed.
         """
-        api_messages = _coalesce_messages(messages)
+        api_messages = _coalesce_messages(_translate_attachments(messages))
         start = time.monotonic()
 
         # Stream for real-time progress when a callback is provided
@@ -443,7 +443,7 @@ class AnthropicBackend(ModelBackend):
         3. If stop_reason != "tool_use": return final text response
         4. Repeat until max_iterations or max_tool_calls hit
         """
-        api_messages = _coalesce_messages(messages)
+        api_messages = _coalesce_messages(_translate_attachments(messages))
         all_tool_calls: list[ToolCall] = []
         total_usage = {
             "input_tokens": 0, "output_tokens": 0,
@@ -624,6 +624,61 @@ def _serialize_content_blocks(content_blocks: Any) -> list[dict[str, Any]]:
                     "input": dict(block.input) if block.input else {},
                 })
     return result
+
+
+def _translate_attachments(messages: list[ChatMessage]) -> list[ChatMessage]:
+    """Translate internal `attachment` blocks into Anthropic-native blocks.
+
+    The bridge's `messages_to_chat_history` emits a uniform attachment
+    block for every file. Each backend adapter is responsible for
+    converting that to whatever its underlying API natively accepts.
+
+    Anthropic Messages API:
+      * `image/*` → `image` block with URL source
+      * `application/pdf` → `document` block with URL source
+      * everything else → a plain text reference (the model can call
+        `read_attachment` for the server-extracted body)
+
+    Messages that don't contain an attachment block are returned as-is.
+    """
+    out: list[ChatMessage] = []
+    for msg in messages:
+        if not isinstance(msg.content, list):
+            out.append(msg)
+            continue
+
+        new_blocks: list[dict[str, Any]] = []
+        for block in msg.content:
+            if isinstance(block, dict) and block.get("type") == "attachment":
+                new_blocks.extend(_attachment_to_anthropic_blocks(block))
+            else:
+                new_blocks.append(block)
+
+        out.append(ChatMessage(role=msg.role, content=new_blocks))
+
+    return out
+
+
+def _attachment_to_anthropic_blocks(block: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expand one internal attachment block into Anthropic content blocks."""
+    from . import _attachment as att
+
+    url = block.get("url")
+    label = att.attachment_label(block)
+
+    if url and att.is_image_attachment(block):
+        return [
+            {"type": "image", "source": {"type": "url", "url": url}},
+            {"type": "text", "text": label},
+        ]
+
+    if url and att.is_pdf_attachment(block):
+        return [
+            {"type": "document", "source": {"type": "url", "url": url}},
+            {"type": "text", "text": label},
+        ]
+
+    return [{"type": "text", "text": att.fallback_text(block)}]
 
 
 def _coalesce_messages(messages: list[ChatMessage]) -> list[dict]:

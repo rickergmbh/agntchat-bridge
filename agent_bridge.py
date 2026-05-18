@@ -1819,14 +1819,14 @@ async def _cached_get_messages(
     return msgs
 
 
-async def _get_image_url(
+async def _get_attachment_download_url(
     attachment_id: str, base_url: str, token: str
 ) -> str | None:
-    """Get a signed download URL for an image attachment.
+    """Get a signed download URL for any file attachment.
 
-    Returns the signed Supabase URL, or None on failure. The URL is passed
-    directly to the model as a URL image source — no downloading or
-    base64 encoding needed.
+    Returns the presigned Supabase Storage URL, or None on failure. The URL
+    is passed directly to the model — as an image `url` source for images,
+    or as a document `url` source for PDFs.
     """
     try:
         import httpx
@@ -1837,7 +1837,7 @@ async def _get_image_url(
                 headers={"Authorization": f"Bearer {token}"},
             )
             if resp.status_code != 200:
-                log.warning("[Vision] Failed to get download URL for %s: %s", attachment_id, resp.status_code)
+                log.warning("[Attachment] Failed to get download URL for %s: %s", attachment_id, resp.status_code)
                 return None
             download_url = resp.json().get("url")
             if not download_url:
@@ -1845,7 +1845,7 @@ async def _get_image_url(
             return download_url
 
     except Exception as exc:
-        log.warning("[Vision] Image URL fetch failed for %s: %s", attachment_id, exc)
+        log.warning("[Attachment] Download URL fetch failed for %s: %s", attachment_id, exc)
         return None
 
 
@@ -2000,8 +2000,9 @@ async def messages_to_chat_history(
 ) -> list[ChatMessage]:
     """Convert API message dicts to ChatMessage list for the model.
 
-    Handles multimodal content: image file messages are converted to
-    vision content blocks with base64-encoded image data.
+    Handles multimodal content: image attachments become `image` content
+    blocks and PDF attachments become `document` content blocks, both
+    pointing at presigned Supabase Storage URLs.
 
     When `my_display_name` is provided, appends a final identity-anchor
     user turn that reminds the model whose voice it must speak in. This
@@ -2035,28 +2036,34 @@ async def messages_to_chat_history(
             filename = file_info.get("filename", "file")
             attachment_id = file_info.get("attachmentId")
 
-            if file_ct.startswith("image/") and attachment_id and base_url and token:
-                # Get signed URL for image — no downloading or base64 encoding
-                image_url = await _get_image_url(attachment_id, base_url, token)
-                if image_url:
-                    label = f"{ts_prefix}{sender_label} shared an image: {filename}" if role == "user" else f"{ts_prefix}I shared an image: {filename}"
-                    content_blocks: list[dict[str, Any]] = [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "url",
-                                "url": image_url,
-                            },
-                        },
-                        {"type": "text", "text": label},
-                    ]
-                    history.append(ChatMessage(role=role, content=content_blocks))
-                    continue
-                # Fall through to text-only if URL fetch failed
+            # Uniform attachment representation. The bridge does NOT
+            # know how each model accepts files — each backend adapter
+            # translates this internal `attachment` block into whatever
+            # its underlying API natively supports (Anthropic: image /
+            # document blocks; Claude CLI: temp-file + Read pointer;
+            # OpenAI: image_url; others: plain text reference).
+            #
+            # `read_attachment(attachment_id)` is the universal fallback
+            # any agent on any backend can call.
+            signed_url = None
+            if attachment_id and base_url and token:
+                signed_url = await _get_attachment_download_url(attachment_id, base_url, token)
 
-            # Non-image file or failed image fetch — add as text description
-            text = f"{ts_prefix}{sender_label} shared a file: {filename}" if role == "user" else f"{ts_prefix}I shared a file: {filename}"
-            history.append(ChatMessage(role=role, content=text))
+            label = (
+                f"{ts_prefix}{sender_label} shared a file: {filename}"
+                if role == "user"
+                else f"{ts_prefix}I shared a file: {filename}"
+            )
+
+            attachment_block = {
+                "type": "attachment",
+                "filename": filename,
+                "content_type": file_ct,
+                "attachment_id": attachment_id,
+                "url": signed_url,
+                "label": label,
+            }
+            history.append(ChatMessage(role=role, content=[attachment_block]))
             continue
 
         # Structured messages (ResultPresentation, StatusUpdate, TaskComplete, etc.)
