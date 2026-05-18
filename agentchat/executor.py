@@ -1329,61 +1329,6 @@ class ExecutorClient:
         data = await self._post("/api/agents/me/memories", body)
         return data
 
-    async def delete_agent_memory(
-        self,
-        *,
-        category: str,
-        key: str,
-    ) -> dict[str, Any]:
-        """Delete a persistent memory by category+key.
-
-        Finds the memory matching the category+key combo and deletes it.
-        Returns the response dict (including ``memoryPrompt``) on success,
-        or an empty dict if the memory was not found.
-        """
-        # List memories filtered by category, find by key, then delete by id
-        memories = await self.get_agent_memories(category=category)
-        for mem in memories:
-            if mem.get("key") == key:
-                mem_id = mem.get("id")
-                if mem_id:
-                    return await self._delete(f"/api/agents/me/memories/{mem_id}")
-        return {}
-
-    async def save_family_memory(
-        self,
-        category: str,
-        key: str,
-        content: str,
-        *,
-        confidence: float | None = None,
-        description: str | None = None,
-        tags: list[str] | None = None,
-        reason: str | None = None,
-        source_conversation_id: str | None = None,
-    ) -> dict[str, Any]:
-        """Save a family-scoped memory (shared across every agent in the family).
-
-        Upserts on (category, key) keyed on family_root_id — the latest write
-        replaces the older one. Every write is appended to the audit trail.
-        """
-        body: dict[str, Any] = {
-            "category": category,
-            "key": key,
-            "content": content,
-        }
-        if confidence is not None:
-            body["confidence"] = confidence
-        if description:
-            body["description"] = description
-        if tags:
-            body["tags"] = tags
-        if reason:
-            body["reason"] = reason
-        if source_conversation_id:
-            body["sourceConversationId"] = source_conversation_id
-        return await self._post("/api/family/memories", body)
-
     async def get_family_memories(
         self,
         *,

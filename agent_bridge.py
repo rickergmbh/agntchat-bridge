@@ -599,20 +599,14 @@ _TOOL_CALL_TAG_RE = re.compile(
     re.DOTALL,
 )
 
-# Flexible regex: matches <memory ...>content</memory> with ANY attributes in any order.
-# We extract named attributes (category, key, tags, description, related) in parse_memory_operations.
-_MEMORY_SAVE_TAG_RE = re.compile(
-    r"<memory\s+(?![^>]*action=\"forget\")[^>]*>(.*?)</memory>",
-    re.DOTALL,
-)
-
-_MEMORY_FORGET_TAG_RE = re.compile(
-    r'<memory\s+[^>]*action="forget"[^>]*/?>',
-    re.DOTALL,
-)
-
-# Helper to extract named attributes from a <memory ...> opening tag
-_MEMORY_ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
+# <memory> / <family_memory> tag extraction lives entirely server-side in
+# Agentchat.Agents.OutputEnvelope. The backend's Messaging.send_message
+# chokepoint parses these tags from agent text and applies them via the
+# same MCP tool handlers (save_agent_memory / save_family_memory) that
+# native tool_use uses — one path for every model and connection method.
+# The bridge sends raw text and never inspects the model's output for
+# tags. Native tool_use calls are dispatched through MCP HTTP, not
+# `executor.save_agent_memory`.
 
 
 def _try_repair_json(text: str) -> dict[str, Any] | None:
@@ -829,131 +823,6 @@ def _format_tool_results_for_followup(results: list[dict[str, Any]]) -> str:
         else:
             parts.append(f"Tool `{name}` completed (no result data)")
     return "\n\n".join(parts)
-
-
-def parse_memory_operations(text: str) -> tuple[str, list[dict[str, Any]]]:
-    """Extract <memory> save/forget tags from LLM output.
-
-    Handles any attribute order and extra attributes (tags, description, related).
-    """
-    operations: list[dict[str, Any]] = []
-    remaining = text
-
-    # Save operations: <memory category="..." key="..." [tags="..." description="..." related="..."]>content</memory>
-    for match in _MEMORY_SAVE_TAG_RE.finditer(text):
-        full_tag = match.group(0)
-        content = match.group(1).strip()
-        # Extract attributes from the opening tag
-        open_tag = full_tag[: full_tag.index(">")] if ">" in full_tag else full_tag
-        attrs = dict(_MEMORY_ATTR_RE.findall(open_tag))
-
-        category = attrs.get("category", "").strip()
-        key = attrs.get("key", "").strip()
-        if category and key and content:
-            op: dict[str, Any] = {
-                "action": "save",
-                "category": category,
-                "key": key,
-                "content": content,
-            }
-            # Optional graph fields
-            if attrs.get("tags"):
-                op["tags"] = [t.strip() for t in attrs["tags"].split(",") if t.strip()]
-            if attrs.get("description"):
-                op["description"] = attrs["description"].strip()
-            if attrs.get("related"):
-                op["related"] = attrs["related"].strip()
-            operations.append(op)
-
-    # Forget operations: <memory action="forget" key="..." category="..." />
-    for match in _MEMORY_FORGET_TAG_RE.finditer(text):
-        full_tag = match.group(0)
-        attrs = dict(_MEMORY_ATTR_RE.findall(full_tag))
-        key = attrs.get("key", "").strip()
-        category = attrs.get("category", "").strip()
-        if key and category:
-            operations.append({
-                "action": "forget",
-                "category": category,
-                "key": key,
-            })
-
-    if operations:
-        remaining = _MEMORY_SAVE_TAG_RE.sub("", remaining)
-        remaining = _MEMORY_FORGET_TAG_RE.sub("", remaining).strip()
-
-    return remaining, operations
-
-
-async def execute_memory_operations(
-    executor: "ExecutorClient",
-    operations: list[dict[str, Any]],
-    source_conversation_id: str | None = None,
-    executor_key: str = "",
-) -> tuple[int, str | None]:
-    """Execute parsed memory save/forget operations.
-
-    Returns (count_of_successful_ops, latest_memory_prompt_or_None).
-    The memory prompt is the server-formatted prompt block reflecting the
-    agent's updated memory set after all operations.
-    """
-    executed = 0
-    latest_memory_prompt: str | None = None
-
-    # Pre-compute keys being saved so we never delete a memory that's also
-    # being saved in the same batch. LLMs often emit both forget+save for
-    # the same key when "updating" a memory — the forget would undo the save.
-    saved_keys: set[tuple[str, str]] = {
-        (op["category"], op["key"]) for op in operations if op["action"] == "save"
-    }
-
-    for op in operations:
-        try:
-            if op["action"] == "save":
-                save_kwargs: dict[str, Any] = {
-                    "category": op["category"],
-                    "key": op["key"],
-                    "content": op["content"],
-                    "confidence": 0.8,
-                    "source_conversation_id": source_conversation_id,
-                }
-                if op.get("tags"):
-                    save_kwargs["tags"] = op["tags"]
-                if op.get("description"):
-                    save_kwargs["description"] = op["description"]
-                result = await executor.save_agent_memory(**save_kwargs)
-                executed += 1
-                if result.get("memoryPrompt"):
-                    latest_memory_prompt = result["memoryPrompt"]
-                logger.info(
-                    "[%s] Saved memory: [%s/%s] %s",
-                    executor_key, op["category"], op["key"], op["content"][:60],
-                )
-            elif op["action"] == "forget":
-                ck = (op["category"], op["key"])
-                if ck in saved_keys:
-                    logger.info(
-                        "[%s] Skipping forget for [%s/%s] — just saved in same batch",
-                        executor_key, op["category"], op["key"],
-                    )
-                    continue
-                result = await executor.delete_agent_memory(
-                    category=op["category"],
-                    key=op["key"],
-                )
-                executed += 1
-                if isinstance(result, dict) and result.get("memoryPrompt"):
-                    latest_memory_prompt = result["memoryPrompt"]
-                logger.info(
-                    "[%s] Forgot memory: [%s/%s]",
-                    executor_key, op["category"], op["key"],
-                )
-        except Exception as e:
-            logger.warning(
-                "[%s] Memory operation failed (%s %s/%s): %s",
-                executor_key, op["action"], op.get("category"), op.get("key"), e,
-            )
-    return executed, latest_memory_prompt
 
 
 def _build_price(raw: dict[str, Any] | float | int | None) -> Price | None:
@@ -3391,16 +3260,9 @@ def run_single_agent(
             # Parse result presentations and task requests from tool_use output
             remaining_text, presentations = parse_result_presentations(remaining_text)
 
-            # Parse and execute memory operations (strip <memory> tags before sending)
-            remaining_text, tu_memory_ops = parse_memory_operations(remaining_text)
-            if tu_memory_ops:
-                tu_mem_conv = task.work_conversation_id or task.conversation_id
-                mem_count, mem_prompt = await execute_memory_operations(
-                    executor, tu_memory_ops,
-                    source_conversation_id=tu_mem_conv,
-                    executor_key=executor_key,
-                )
-                logger.info("[%s] Executed %d/%d memory operations from task (tool_use)", executor_key, mem_count, len(tu_memory_ops))
+            # <memory> / <family_memory> tags are extracted server-side in
+            # Messaging.send_message via Agentchat.Agents.OutputEnvelope.
+            # The bridge is a dumb pipe — tags flow through unchanged.
 
             if presentations:
                 reply_conv = task.work_conversation_id or task.conversation_id
@@ -3548,16 +3410,9 @@ def run_single_agent(
 
             remaining_text, presentations = parse_result_presentations(result.text)
 
-            # Parse and execute memory operations from task response
-            remaining_text, task_memory_ops = parse_memory_operations(remaining_text)
-            if task_memory_ops:
-                task_conv_id = task.work_conversation_id or task.conversation_id
-                mem_count, mem_prompt = await execute_memory_operations(
-                    executor, task_memory_ops,
-                    source_conversation_id=task_conv_id,
-                    executor_key=executor_key,
-                )
-                logger.info("[%s] Executed %d/%d memory operations from task", executor_key, mem_count, len(task_memory_ops))
+            # <memory> / <family_memory> tags are extracted server-side in
+            # Messaging.send_message via Agentchat.Agents.OutputEnvelope.
+            # The bridge is a dumb pipe — tags flow through unchanged.
 
             if presentations:
                 reply_conv = task.work_conversation_id or task.conversation_id
@@ -3916,15 +3771,9 @@ def run_single_agent(
             if not _tu_failed and reply:
                 reply, presentations = parse_result_presentations(reply)
 
-                # Strip memory tags (execute operations + remove from reply)
-                reply, tu_memory_ops = parse_memory_operations(reply)
-                if tu_memory_ops:
-                    mem_count, mem_prompt = await execute_memory_operations(
-                        executor, tu_memory_ops,
-                        source_conversation_id=msg.conversation_id,
-                        executor_key=executor_key,
-                    )
-                    logger.info("[%s] Executed %d/%d memory operations (tool_use)", executor_key, mem_count, len(tu_memory_ops))
+                # <memory> / <family_memory> tags are extracted server-side
+                # in Messaging.send_message via OutputEnvelope. Bridge is a
+                # dumb pipe — tags flow through to the backend unchanged.
 
             _tu_task_requests: list[dict[str, Any]] = []
             if reply:
@@ -4114,15 +3963,10 @@ def run_single_agent(
             else:
                 reply = remaining_text
 
-        # Detect and execute memory operations (<memory> tags)
-        reply, memory_ops = parse_memory_operations(reply or "")
-        if memory_ops:
-            mem_count, mem_prompt = await execute_memory_operations(
-                executor, memory_ops,
-                source_conversation_id=msg.conversation_id,
-                executor_key=executor_key,
-            )
-            logger.info("[%s] Executed %d/%d memory operations", executor_key, mem_count, len(memory_ops))
+        # <memory> / <family_memory> tags are extracted server-side in
+        # Messaging.send_message via OutputEnvelope — same persistence
+        # path as native tool_use. Bridge is a dumb pipe — tags flow
+        # through to the backend unchanged.
 
         # Detect and execute tool calls (<tool_call> tags — works with any backend)
         reply, tool_calls = parse_tool_calls(reply or "")
