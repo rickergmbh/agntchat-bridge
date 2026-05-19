@@ -263,15 +263,37 @@ def _redact_terminal_windows(image_path: str) -> tuple[int, str | None]:
         return 0, "display scale lookup failed; refusing screenshot to avoid partial redaction"
     try:
         img = Image.open(image_path).convert("RGB")
+        img_w, img_h = img.size
         draw = ImageDraw.Draw(img)
+        drawn = 0
         for (x, y, w, h) in bounds:
-            x0 = max(0, int(x * scale))
-            y0 = max(0, int(y * scale))
-            x1 = int((x + w) * scale)
-            y1 = int((y + h) * scale)
+            # Convert points → pixels and normalize. Several edge cases
+            # produce coordinates that PIL would reject:
+            #   - Negative X on a secondary display arranged left of the
+            #     main one (screencapture writes all displays into one
+            #     image whose origin is the union top-left; CGWindowBounds
+            #     are in the global point space).
+            #   - Reversed bounds (rare CGWindow API quirk).
+            #   - Off-screen / minimized windows.
+            # min/max normalizes, then we clip to image bounds, then skip
+            # degenerate rectangles (entirely outside or zero-area).
+            x0_raw = int(x * scale)
+            y0_raw = int(y * scale)
+            x1_raw = int((x + w) * scale)
+            y1_raw = int((y + h) * scale)
+            x0 = max(0, min(x0_raw, x1_raw))
+            y0 = max(0, min(y0_raw, y1_raw))
+            x1 = min(img_w, max(x0_raw, x1_raw))
+            y1 = min(img_h, max(y0_raw, y1_raw))
+            if x1 <= x0 or y1 <= y0:
+                # Window entirely outside the screenshot (off-screen on a
+                # secondary display, minimized, or zero-area). Nothing
+                # visible to redact.
+                continue
             draw.rectangle((x0, y0, x1, y1), fill=(0, 0, 0))
+            drawn += 1
         img.save(image_path, "PNG")
-        return len(bounds), None
+        return drawn, None
     except Exception as exc:  # noqa: BLE001
         logger.warning("terminal redaction draw failed: %s", exc)
         return 0, f"PIL redaction draw failed: {exc}"
