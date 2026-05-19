@@ -408,5 +408,5 @@ class RestClient:
             except Exception:
                 body = {"error": resp.text}
             msg = body.get("error", {}).get("message", resp.text) if isinstance(body.get("error"), dict) else str(body)
-            raise AgentChatError(f"API error {resp.status_code}: {msg}")
+            raise AgentChatError(f"API error {resp.status_code}: {msg}", status_code=resp.status_code)
         return resp.json()

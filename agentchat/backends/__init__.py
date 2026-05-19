@@ -35,6 +35,17 @@ from typing import Any, Awaitable, Callable, Union
 ProgressCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
 
+# Tools that finalize a task on the backend (visible reply already posted via
+# Tasks.complete_task_atomic / fail_task_atomic). Once one fires, the tool-use
+# loop should stop — any further model output is dead weight and keeps the
+# gateway message claim open, deferring incoming user messages.
+#
+# SOURCE OF TRUTH: backend/lib/agentchat/tasks.ex `terminal_tool_names/0`.
+# Bridge is a separate Python runtime so the list is duplicated here. Update
+# both files together if a third terminal tool is ever added.
+TERMINAL_TOOL_NAMES = frozenset({"complete_task", "fail_task"})
+
+
 @dataclass
 class ChatMessage:
     """A single message in a multi-turn conversation.

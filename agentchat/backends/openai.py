@@ -18,7 +18,7 @@ import os
 import time
 from typing import Any
 
-from . import ChatMessage, ModelBackend, ModelResult, ToolCall
+from . import TERMINAL_TOOL_NAMES, ChatMessage, ModelBackend, ModelResult, ToolCall
 
 logger = logging.getLogger("agentchat.backends.openai")
 
@@ -312,6 +312,26 @@ class OpenAIBackend(ModelBackend):
                     "Tool %s completed in %.1fs (call %d/%d)",
                     tc.function.name, tc_elapsed,
                     len(all_tool_calls), max_tool_calls,
+                )
+
+            # Terminal-tool short-circuit — see anthropic.py for rationale.
+            terminal_hit = next(
+                (tc.name for tc in all_tool_calls if tc.name in TERMINAL_TOOL_NAMES),
+                None,
+            )
+            if terminal_hit:
+                elapsed = time.monotonic() - start
+                logger.info(
+                    "Terminal tool %s called — short-circuiting tool loop", terminal_hit,
+                )
+                return ModelResult(
+                    text="",
+                    model=self._model,
+                    elapsed_seconds=round(elapsed, 1),
+                    usage=total_usage,
+                    tool_calls=all_tool_calls,
+                    iterations=iteration,
+                    stop_reason="terminal_tool",
                 )
 
             # If max tool calls reached, force final text-only call

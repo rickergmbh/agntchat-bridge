@@ -15,7 +15,7 @@ import re
 import time
 from typing import Any
 
-from . import ChatMessage, ModelBackend, ModelResult, ToolCall
+from . import TERMINAL_TOOL_NAMES, ChatMessage, ModelBackend, ModelResult, ToolCall
 
 logger = logging.getLogger("agentchat.backends.anthropic")
 
@@ -549,6 +549,29 @@ class AnthropicBackend(ModelBackend):
 
             # Add tool results as user message
             api_messages.append({"role": "user", "content": tool_results})
+
+            # Terminal-tool short-circuit: complete_task / fail_task finalize
+            # the task on the backend (visible reply already posted). Keep
+            # spinning past that and we hold the message claim open, defer
+            # follow-ups, and risk a server-side StreamTimeout.
+            terminal_hit = next(
+                (tc.name for tc in all_tool_calls if tc.name in TERMINAL_TOOL_NAMES),
+                None,
+            )
+            if terminal_hit:
+                elapsed = time.monotonic() - start
+                logger.info(
+                    "Terminal tool %s called — short-circuiting tool loop", terminal_hit,
+                )
+                return ModelResult(
+                    text="",
+                    model=self._model,
+                    elapsed_seconds=round(elapsed, 1),
+                    usage=total_usage,
+                    tool_calls=all_tool_calls,
+                    iterations=iteration,
+                    stop_reason="terminal_tool",
+                )
 
             # If we hit the tool call limit, force a final text-only call
             if len(all_tool_calls) >= max_tool_calls:

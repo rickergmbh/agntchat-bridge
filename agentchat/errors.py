@@ -4,7 +4,17 @@ from __future__ import annotations
 
 
 class AgentChatError(Exception):
-    """Base exception for all AgentChat SDK errors."""
+    """Base exception for all AgentChat SDK errors.
+
+    `status_code` is the HTTP status from the failing response, if any.
+    Callers should branch on this (e.g., `err.status_code == 403`) rather
+    than substring-matching the message text — a 500 whose body contains a
+    referenced "403" would otherwise false-positive.
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class AuthError(AgentChatError):
@@ -34,5 +44,5 @@ class StaleContextError(AgentChatError):
     whether to revise, skip, or re-post with an updated anchor."""
 
     def __init__(self, message: str, new_messages: list | None = None):
-        super().__init__(message)
+        super().__init__(message, status_code=409)
         self.new_messages = new_messages or []

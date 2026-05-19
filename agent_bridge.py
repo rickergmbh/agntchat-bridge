@@ -66,7 +66,7 @@ for _env_candidate in [
 import time as _time  # noqa: E402
 
 from agentchat.auth import TokenManager  # noqa: E402
-from agentchat.errors import AuthError, StaleContextError  # noqa: E402
+from agentchat.errors import AgentChatError, AuthError, StaleContextError  # noqa: E402
 from agentchat.backends import ChatMessage, create_backend  # noqa: E402
 from agentchat.executor import ExecutorClient, GatewayMessage, GatewayTask, ScopeRequest  # noqa: E402
 from agentchat.tools.executor import ToolExecutor  # noqa: E402
@@ -2237,10 +2237,14 @@ def make_progress_callback(
     last_summary: str = "Working..."
     _heartbeat_task: asyncio.Task[None] | None = None
 
+    _task_terminal = False
+
     async def _heartbeat_loop() -> None:
-        nonlocal last_sent
+        nonlocal last_sent, _task_terminal
         while True:
             await asyncio.sleep(heartbeat_seconds)
+            if _task_terminal:
+                return
             now = _time.monotonic()
             if now - last_sent >= heartbeat_seconds - 0.5:
                 elapsed_ms = int((now - start_time) * 1000)
@@ -2251,9 +2255,14 @@ def make_progress_callback(
                         "elapsed_ms": elapsed_ms,
                     })
                 except Exception as e:
-                    # Stop heartbeat if task is gone (403/404 = terminal)
-                    err_str = str(e)
-                    if "403" in err_str or "404" in err_str:
+                    # 403/404 = task is terminal on the backend. Flip the
+                    # shared flag so on_progress stops respawning us via
+                    # _ensure_heartbeat on every subsequent LLM event.
+                    # Branch on structured status_code, not substring on the
+                    # message — a 500 whose body references "403" would
+                    # otherwise false-trigger.
+                    if isinstance(e, AgentChatError) and e.status_code in (403, 404):
+                        _task_terminal = True
                         logger.debug("Heartbeat stopping — task %s is terminal", queued_task_id)
                         return
 
@@ -2261,8 +2270,6 @@ def make_progress_callback(
         nonlocal _heartbeat_task
         if _heartbeat_task is None or _heartbeat_task.done():
             _heartbeat_task = asyncio.create_task(_heartbeat_loop())
-
-    _task_terminal = False
 
     def _event_to_phase(event: dict[str, Any]) -> str | None:
         """Map a progress event to a streaming phase for task card parity."""
@@ -2286,8 +2293,6 @@ def make_progress_callback(
         elapsed_ms = int((now - start_time) * 1000)
         last_summary = summary
 
-        _ensure_heartbeat()
-
         force = event.get("force", False)
         phase = _event_to_phase(event)
         progress_data: dict[str, Any] = {
@@ -2301,18 +2306,27 @@ def make_progress_callback(
             pending = progress_data
             return
 
+        # Only arm the heartbeat once we're actually going to send. A
+        # throttled event must not resurrect a dead heartbeat — that's how
+        # we ended up in a 403-respawn loop after the task went terminal.
+        _ensure_heartbeat()
+
         last_sent = now
         pending = None
         try:
             await executor.report_progress(queued_task_id, progress_data)
         except Exception as e:
-            err_str = str(e)
-            if "403" in err_str or "404" in err_str:
+            if isinstance(e, AgentChatError) and e.status_code in (403, 404):
                 _task_terminal = True
             logger.debug("Failed to report progress: %s", summary)
 
     async def flush_pending() -> None:
-        nonlocal pending
+        nonlocal pending, _task_terminal
+        # Defensively mark terminal so any late on_progress event that races
+        # in after we tear down the heartbeat doesn't respawn it. By the
+        # time flush_pending is called, the caller has decided the run is
+        # over — no future progress should reach the wire.
+        _task_terminal = True
         if _heartbeat_task and not _heartbeat_task.done():
             _heartbeat_task.cancel()
             try:
@@ -2362,6 +2376,7 @@ def make_stream_callback(
     _pending_tasks: list[asyncio.Task[None]] = []
     _iteration = 0
     _had_tool_calls = False  # Whether ANY iteration so far used tools
+    _stream_terminal = False  # Set by complete()/cancel() — no more deltas to wire
 
     def _fire_and_forget(coro) -> None:
         """Schedule a coroutine without blocking the caller."""
@@ -2371,6 +2386,14 @@ def make_stream_callback(
 
     async def on_progress(event: dict[str, Any]) -> None:
         nonlocal _started, _iteration, _had_tool_calls
+        # Once the stream is terminal (complete()/cancel() called, or the
+        # task is over), drop any late events. Without this, a delta that
+        # races in after complete() spawns a fresh HTTP task against a
+        # stream_id the server has already cancelled (StreamTimeout) or
+        # closed, wasting a request and masking failures via the
+        # send_stream_update except-pass swallow.
+        if _stream_terminal:
+            return
         event_type = event.get("type", "")
 
         # Forward to task progress callback too (if task-based)
@@ -2437,6 +2460,8 @@ def make_stream_callback(
 
     async def complete() -> None:
         """Signal the stream is done. Called after the final message is sent."""
+        nonlocal _stream_terminal
+        _stream_terminal = True
         if suppress_stream:
             return
         # Wait for any in-flight streaming updates to finish before signaling complete
@@ -2448,6 +2473,8 @@ def make_stream_callback(
 
     async def cancel() -> None:
         """Signal the stream was cancelled (error/empty response)."""
+        nonlocal _stream_terminal
+        _stream_terminal = True
         if suppress_stream:
             return
         if _pending_tasks:

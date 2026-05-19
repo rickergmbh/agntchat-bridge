@@ -2707,5 +2707,5 @@ class ExecutorClient:
                 body = resp.json()
             except Exception:
                 body = {"error": resp.text}
-            raise AgentChatError(f"API error {resp.status_code}: {body}")
+            raise AgentChatError(f"API error {resp.status_code}: {body}", status_code=resp.status_code)
         return resp.json()
