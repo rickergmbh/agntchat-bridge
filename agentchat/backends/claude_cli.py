@@ -371,24 +371,43 @@ class ClaudeCliBackend(ModelBackend):
         # Set at construction; an unset value would have raised already.
         assert self._computer_use_script is not None
 
+        # Claude CLI spawns stdio MCP servers with ONLY the explicit `env`
+        # dict from this block plus a small POSIX default set (HOME, PATH,
+        # USER). Anything we want the MCP server to see has to be listed
+        # here — ambient env on the bridge process does NOT propagate.
+        env: dict[str, str] = {
+            "AGENTGRAM_AGENT_ID": self._agent_id,
+            # The desktop app (or user) can pause computer use at any
+            # time by touching this file; the server re-checks on every
+            # action AND immediately before the driver call.
+            "AGENTGRAM_COMPUTER_USE_PAUSE": os.getenv(
+                "AGENTGRAM_COMPUTER_USE_PAUSE",
+                os.path.expanduser("~/.agentgram/computer_use.paused"),
+            ),
+            "AGENTGRAM_COMPUTER_USE_AUDIT": os.getenv(
+                "AGENTGRAM_COMPUTER_USE_AUDIT",
+                os.path.expanduser("~/.agentgram/computer_use_audit.log"),
+            ),
+        }
+
+        # Per-agent allow-list. Set by Tauri at bridge spawn from
+        # `agent.metadata.computer_use_allowed_apps`. Must be forwarded
+        # here explicitly — see the env-inheritance note above.
+        allowed_apps = os.getenv("AGENTGRAM_COMPUTER_USE_ALLOWED_APPS")
+        if allowed_apps:
+            env["AGENTGRAM_COMPUTER_USE_ALLOWED_APPS"] = allowed_apps
+
+        # Optional lock-file override (mostly for tests). Same propagation
+        # rule: ambient env doesn't reach the MCP server unless listed here.
+        lock_file = os.getenv("AGENTGRAM_COMPUTER_USE_LOCK")
+        if lock_file:
+            env["AGENTGRAM_COMPUTER_USE_LOCK"] = lock_file
+
         return {
             "type": "stdio",
             "command": sys.executable,
             "args": [self._computer_use_script],
-            "env": {
-                "AGENTGRAM_AGENT_ID": self._agent_id,
-                # The desktop app (or user) can pause computer use at any
-                # time by touching this file; the server re-checks on every
-                # action AND immediately before the driver call.
-                "AGENTGRAM_COMPUTER_USE_PAUSE": os.getenv(
-                    "AGENTGRAM_COMPUTER_USE_PAUSE",
-                    os.path.expanduser("~/.agentgram/computer_use.paused"),
-                ),
-                "AGENTGRAM_COMPUTER_USE_AUDIT": os.getenv(
-                    "AGENTGRAM_COMPUTER_USE_AUDIT",
-                    os.path.expanduser("~/.agentgram/computer_use_audit.log"),
-                ),
-            },
+            "env": env,
         }
 
     @property

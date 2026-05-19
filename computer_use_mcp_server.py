@@ -90,14 +90,16 @@ SENSITIVE_APP_PATTERNS = (
 # interactive action to proceed. Set by Tauri at spawn time from
 # `agent.metadata.computer_use_allowed_apps`. Empty = no allow-list
 # restriction (deny list still enforced).
-def _parse_allowed_apps() -> tuple[str, ...]:
+#
+# Read per-call (not cached at import) so that future IPC plumbing
+# (file-based or signal-driven) can update the env in-place without
+# requiring an MCP server restart. Today the spawn-time env is fixed,
+# but the dynamic wiring is the cheap part — keep it ready.
+def _allowed_app_patterns() -> tuple[str, ...]:
     raw = os.environ.get("AGENTGRAM_COMPUTER_USE_ALLOWED_APPS", "")
     if not raw:
         return ()
-    entries = [s.strip().lower() for s in raw.split("\n") if s.strip()]
-    return tuple(entries)
-
-ALLOWED_APP_PATTERNS = _parse_allowed_apps()
+    return tuple(s.strip().lower() for s in raw.split("\n") if s.strip())
 
 # Downscale target. Mirrors what the built-in computer-use does
 # (~1370x880 from Retina 3456x2234) so token cost stays bounded.
@@ -207,10 +209,21 @@ def _terminal_window_bounds() -> list[tuple[int, int, int, int]]:
         return []
 
 
-def _backing_scale_factor() -> float:
-    """Pixels-per-point on the main display. Defaults to 1 if unknown."""
+def _backing_scale_factor() -> float | None:
+    """Pixels-per-point on the main display.
+
+    Returns None on lookup failure so callers can fail-closed. Returning
+    1.0 silently would put black rectangles in the wrong place on Retina
+    displays (1440x900 bounds drawn over a 2880x1800 PNG cover only the
+    top-left quarter — terminal text in the rest stays visible).
+
+    Known limitation: multi-monitor setups with a secondary display at a
+    different scale will still mis-place rectangles for windows on that
+    secondary display, since this function only reads the main display.
+    Documented in docs/reference/computer-use-guide.md § 5.
+    """
     if not _quartz_available:
-        return 1.0
+        return None
     try:
         main = Quartz.CGMainDisplayID()
         b = Quartz.CGDisplayBounds(main)
@@ -218,25 +231,37 @@ def _backing_scale_factor() -> float:
         pixels_wide = float(Quartz.CGDisplayPixelsWide(main))
         if points_wide > 0:
             return pixels_wide / points_wide
-    except Exception:  # noqa: BLE001
-        pass
-    return 1.0
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("_backing_scale_factor lookup failed: %s", exc)
+    return None
 
 
-def _redact_terminal_windows(image_path: str) -> int:
+def _redact_terminal_windows(image_path: str) -> tuple[int, str | None]:
     """Paint over the bridge's ancestor windows in `image_path` (in-place).
 
-    Returns the number of rectangles drawn. Zero is normal in packaged
-    builds (no visible terminal). Soft-fails when PIL or Quartz is
-    unavailable, or when bounds enumeration / drawing throws.
+    Returns (rect_count, error_message). `error_message` is None on
+    success or when redaction is a no-op (no bounds to draw / deps
+    missing). It's set when redaction was *needed* but failed — the
+    caller should refuse to ship the screenshot in that case.
     """
-    if not (_quartz_available and _pil_available):
-        return 0
+    if not _quartz_available:
+        return 0, None  # no-op path, not an error
+    if not _pil_available:
+        # Bounds COULD be enumerated, but we can't draw. Refuse the
+        # screenshot rather than ship un-redacted pixels.
+        if _terminal_window_bounds():
+            return 0, "terminal windows are visible but Pillow is not installed; refusing screenshot"
+        return 0, None
     bounds = _terminal_window_bounds()
     if not bounds:
-        return 0
+        return 0, None
+    scale = _backing_scale_factor()
+    if scale is None:
+        # Fail-closed: bounds exist but we can't translate them to pixel
+        # space, so partial redaction would leave most of the terminal
+        # text exposed. Refuse.
+        return 0, "display scale lookup failed; refusing screenshot to avoid partial redaction"
     try:
-        scale = _backing_scale_factor()
         img = Image.open(image_path).convert("RGB")
         draw = ImageDraw.Draw(img)
         for (x, y, w, h) in bounds:
@@ -246,10 +271,10 @@ def _redact_terminal_windows(image_path: str) -> int:
             y1 = int((y + h) * scale)
             draw.rectangle((x0, y0, x1, y1), fill=(0, 0, 0))
         img.save(image_path, "PNG")
-        return len(bounds)
+        return len(bounds), None
     except Exception as exc:  # noqa: BLE001
-        logger.warning("terminal redaction failed: %s", exc)
-        return 0
+        logger.warning("terminal redaction draw failed: %s", exc)
+        return 0, f"PIL redaction draw failed: {exc}"
 
 
 def _quartz_post_mouse(event_type: int, x: int, y: int, button: int) -> bool:
@@ -391,8 +416,11 @@ def _try_acquire_lock() -> dict[str, Any] | None:
                 LOCK_FILE.unlink()
             except OSError:
                 pass
-    # Repeated theft attempts failed; surface the most recent holder.
-    return _read_lock_holder() or {"agent_id": "unknown"}
+    # Repeated theft attempts failed — the lock file is wedged or being
+    # rewritten faster than we can claim it. Distinguish from a real
+    # conflict so the user gets actionable guidance instead of seeing
+    # "held by agent_id=unknown".
+    return {"_exhausted": True, "last_holder": _read_lock_holder()}
 
 
 def _release_lock() -> None:
@@ -453,27 +481,36 @@ def _screening_refusal(app_name: str | None) -> str | None:
     """Return refusal reason string when this action must not run.
 
     Three gates, in order:
-      1. Unknown app (fail-closed): refuse.
+      1. Unknown app (fail-closed): refuse. When an allow-list is also
+         configured, the message mentions both so the user knows the
+         allow-list isn't being enforced either.
       2. Hardcoded deny list (absolute): refuse — no allow-list override.
       3. Per-agent allow-list (when non-empty): refuse if no match.
     """
+    allow_list = _allowed_app_patterns()
+
     if app_name is None:
-        return (
+        msg = (
             "Refused: could not determine focused application "
             "(osascript may lack Automation permission). Grant it in "
             "System Settings → Privacy & Security → Automation."
         )
+        if allow_list:
+            msg += (
+                " Note: this agent's allow-list cannot be enforced either "
+                "until Automation permission is granted."
+            )
+        return msg
     lower = app_name.lower()
     for pattern in SENSITIVE_APP_PATTERNS:
         if pattern in lower:
             return f"Refused: focused app '{app_name}' matches sensitive-app pattern '{pattern}'."
-    if ALLOWED_APP_PATTERNS:
-        if not any(p in lower for p in ALLOWED_APP_PATTERNS):
-            return (
-                f"Refused: focused app '{app_name}' is not in this agent's "
-                f"allow-list. Add it in AgentConfig → Computer-use allowed "
-                f"apps to grant access."
-            )
+    if allow_list and not any(p in lower for p in allow_list):
+        return (
+            f"Refused: focused app '{app_name}' is not in this agent's "
+            f"allow-list. Add it in AgentConfig → Computer-use allowed "
+            f"apps to grant access."
+        )
     return None
 
 
@@ -488,21 +525,27 @@ class _Driver:
     """
 
     @staticmethod
-    def screenshot() -> str:
-        """Return base64 PNG of the current screen, downscaled.
+    def screenshot() -> tuple[str, dict[str, Any]]:
+        """Return (base64-PNG, audit-detail dict).
 
         Pipeline:
           1. Real perm probe via CGPreflightScreenCaptureAccess (when
              Quartz is available). Refuses early — no blind capture.
           2. screencapture -x -C → raw.png
-          3. Terminal-window redaction (PIL + Quartz, soft-fails to no-op)
-             — paints over the bridge's ancestor windows in raw PIXELS so
-             coordinate-scaling stays correct after sips.
+          3. Terminal-window redaction (PIL + Quartz). If bounds exist
+             but redaction can't succeed (scale lookup failed, PIL
+             missing, draw threw), refuse the screenshot — partial
+             redaction is worse than no redaction.
           4. sips -Z 1400 → out.png (separate file; never in-place).
           5. Size-threshold backstop catches degenerate captures.
           6. base64.
+
+        The audit-detail dict lets callers log what protection level
+        was actually in force — `perm_probe`, `redaction_attempted`,
+        `redaction_count`, `redaction_error`.
         """
         perm = _screen_recording_permitted()
+        perm_state = "granted" if perm is True else "denied" if perm is False else "unavailable"
         if perm is False:
             raise RuntimeError(
                 "Screen Recording permission is denied. Grant it in "
@@ -523,9 +566,17 @@ class _Driver:
 
             # Redact bridge-ancestor terminal windows BEFORE downscale so
             # CGWindowBounds (in points) and the raw PNG (in pixels) stay
-            # related by a clean scale factor. No-op when PIL/Quartz are
-            # missing or no matching windows are visible.
-            redacted_count = _redact_terminal_windows(raw_path)
+            # related by a clean scale factor. Fail-closed: when bounds
+            # exist but redaction can't succeed, refuse to ship the
+            # screenshot — partial redaction is the worst outcome.
+            redacted_count, redact_err = _redact_terminal_windows(raw_path)
+            if redact_err:
+                logger.warning("terminal redaction refused: %s", redact_err)
+                raise RuntimeError(
+                    f"Screenshot blocked: {redact_err}. "
+                    "Install pyobjc-framework-Quartz and Pillow on the bridge, "
+                    "or terminate the visible terminal window first."
+                )
             if redacted_count:
                 logger.info("redacted %d terminal-ancestor window(s)", redacted_count)
 
@@ -540,7 +591,14 @@ class _Driver:
                     "Screen Recording permission may be denied; grant it in "
                     "System Settings → Privacy & Security → Screen Recording."
                 )
-            return base64.b64encode(data).decode("ascii")
+            audit_detail = {
+                "perm_probe": perm_state,
+                "redaction_attempted": _quartz_available and _pil_available,
+                "redaction_count": redacted_count,
+                "redaction_error": None,
+                "bytes": len(data),
+            }
+            return base64.b64encode(data).decode("ascii"), audit_detail
         finally:
             for p in (raw_path, out_path):
                 try:
@@ -872,8 +930,8 @@ def execute_action(args: dict[str, Any]) -> dict[str, Any]:
 
     try:
         if action == "screenshot":
-            b64 = _Driver.screenshot()
-            _audit("ok", action=action)
+            b64, detail = _Driver.screenshot()
+            _audit("ok", action=action, **detail)
             return _image_block(b64)
 
         if action == "mouse_move":
@@ -1045,11 +1103,22 @@ def main() -> None:
     # as a tool error to the model.
     holder = _try_acquire_lock()
     if holder is not None:
-        _audit("lock_conflict", holder=holder)
-        logger.error(
-            "computer-use lock held by another agent (agent_id=%s pid=%s); exiting",
-            holder.get("agent_id"), holder.get("pid"),
-        )
+        if holder.get("_exhausted"):
+            _audit("lock_exhausted", lock_file=str(LOCK_FILE),
+                   last_holder=holder.get("last_holder"))
+            logger.error(
+                "computer-use lock acquisition exhausted retries against %s. "
+                "The file may be repeatedly corrupt or contended. If no other "
+                "agent is actually running computer use, remove the file and "
+                "restart this agent.",
+                LOCK_FILE,
+            )
+        else:
+            _audit("lock_conflict", holder=holder)
+            logger.error(
+                "computer-use lock held by another agent (agent_id=%s pid=%s); exiting",
+                holder.get("agent_id"), holder.get("pid"),
+            )
         sys.exit(2)
     _audit("lock_acquired", lock_file=str(LOCK_FILE))
 
