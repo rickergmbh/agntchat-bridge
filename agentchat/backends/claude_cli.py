@@ -37,6 +37,7 @@ from ._cli_utils import (
     cleanup_temp_files,
     download_image_to_temp,
     download_to_temp,
+    find_sibling_script,
     parse_add_dirs_env,
     resolve_cli_path,
     save_base64_image_to_temp,
@@ -226,6 +227,54 @@ class ClaudeCliBackend(ModelBackend):
         self._api_key = api_key or os.getenv("AGENT_API_KEY", "")
         self._mcp_server_script = self._find_mcp_server()
 
+        # Computer-use mode:
+        #   "off"     — no computer control (default)
+        #   "local"   — spawn our computer_use_mcp_server.py (works in -p mode)
+        #   "builtin" — RESERVED for Anthropic's built-in `computer-use` MCP
+        #               server. That server requires an interactive CLI
+        #               session today; selecting this mode raises so a user
+        #               who flips the env var doesn't ship a silently-disabled
+        #               agent. When -p support lands, the constructor flips
+        #               to wiring the built-in (the only change needed) and
+        #               the rest of the bridge keeps working unchanged.
+        #
+        # NOTE on granularity: this is read once at backend construction
+        # from a process-wide env var, so it applies to every agent this
+        # bridge process serves. A multi-persona bridge can't enable it
+        # for one agent and not another — that needs per-agent capability
+        # gating (same pattern as `google` via `Credentials.resolve_token/2`).
+        # Adequate for a single-user spike; revisit before multi-agent.
+        self._computer_use_mode = (
+            os.getenv("AGENTGRAM_COMPUTER_USE", "off").strip().lower()
+        )
+        if self._computer_use_mode not in ("off", "local", "builtin"):
+            logger.warning(
+                "Invalid AGENTGRAM_COMPUTER_USE=%r — treating as 'off'",
+                self._computer_use_mode,
+            )
+            self._computer_use_mode = "off"
+        elif self._computer_use_mode == "builtin":
+            raise RuntimeError(
+                "AGENTGRAM_COMPUTER_USE=builtin is reserved for Anthropic's "
+                "built-in computer-use MCP server, which requires an "
+                "interactive CLI session and does NOT work with `claude -p`. "
+                "Selecting it today would silently disable computer use. "
+                "Use 'local' until Anthropic supports -p mode."
+            )
+
+        self._computer_use_script: str | None = None
+        if self._computer_use_mode == "local":
+            self._computer_use_script = find_sibling_script("computer_use_mcp_server.py")
+            if not self._computer_use_script:
+                # Fail loud: the user opted into computer use, but the script
+                # isn't on disk. Silently no-op'ing leaves the agent confused.
+                raise FileNotFoundError(
+                    "AGENTGRAM_COMPUTER_USE=local set but computer_use_mcp_server.py "
+                    "could not be found in any of the expected locations. "
+                    "Ensure desktop/bridge/computer_use_mcp_server.py exists, "
+                    "or place it under scripts/."
+                )
+
         # MCP context (set per-invocation via set_mcp_context)
         self._mcp_resolved_tools: list[dict[str, Any]] | None = None
         self._mcp_conversation_id: str = ""
@@ -237,19 +286,7 @@ class ClaudeCliBackend(ModelBackend):
     @staticmethod
     def _find_mcp_server() -> str | None:
         """Locate the agentgram_mcp_server.py script."""
-        candidates = [
-            # Co-located in desktop/bridge/ (primary — self-contained)
-            os.path.join(os.path.dirname(__file__), "..", "..", "agentgram_mcp_server.py"),
-            # From desktop/bridge/agentchat/backends/ → ../../../../scripts/
-            os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "scripts", "agentgram_mcp_server.py"),
-            os.path.join(os.getcwd(), "scripts", "agentgram_mcp_server.py"),
-            os.path.join(os.getcwd(), "..", "scripts", "agentgram_mcp_server.py"),
-        ]
-        for c in candidates:
-            p = os.path.realpath(c)
-            if os.path.isfile(p):
-                return p
-        return None
+        return find_sibling_script("agentgram_mcp_server.py")
 
     def _build_mcp_config(
         self,
@@ -260,35 +297,99 @@ class ClaudeCliBackend(ModelBackend):
         source_message_id: str = "",
         last_seen_message_id: str = "",
     ) -> str:
-        """Build MCP config JSON string for --mcp-config."""
+        """Build MCP config JSON string for --mcp-config.
+
+        Composes one or more stdio MCP servers under `mcpServers`. The
+        AgentGram server (platform tools, backend-routed) and the local
+        computer-use server (desktop control, mode-gated) coexist here.
+        """
+        servers: dict[str, Any] = {}
+
+        agentgram_entry = self._mcp_agentgram_entry(
+            resolved_tools,
+            conversation_id=conversation_id,
+            task_id=task_id,
+            owner_id=owner_id,
+            source_message_id=source_message_id,
+            last_seen_message_id=last_seen_message_id,
+        )
+        if agentgram_entry:
+            servers["agentgram"] = agentgram_entry
+
+        computer_use_entry = self._mcp_computer_use_entry()
+        if computer_use_entry:
+            servers["computer_use"] = computer_use_entry
+
+        if not servers:
+            return ""
+        return json.dumps({"mcpServers": servers})
+
+    def _mcp_agentgram_entry(
+        self,
+        resolved_tools: list[dict[str, Any]],
+        *,
+        conversation_id: str,
+        task_id: str,
+        owner_id: str,
+        source_message_id: str,
+        last_seen_message_id: str,
+    ) -> dict[str, Any] | None:
         if not self._mcp_server_script:
             logger.warning("MCP server script not found — AgentGram tools won't be available")
-            return ""
-
+            return None
         # Use the interpreter currently running the bridge — guaranteed to
         # exist on every platform (vs. hardcoded `python3`, which isn't on
         # Windows by default) and shares the bridge's installed deps.
-        config = {
-            "mcpServers": {
-                "agentgram": {
-                    "type": "stdio",
-                    "command": sys.executable,
-                    "args": [self._mcp_server_script],
-                    "env": {
-                        "AGENTGRAM_API_URL": self._api_url,
-                        "AGENTGRAM_AGENT_ID": self._agent_id,
-                        "AGENTGRAM_API_KEY": self._api_key,
-                        "AGENTGRAM_CONVERSATION_ID": conversation_id,
-                        "AGENTGRAM_TASK_ID": task_id,
-                        "AGENTGRAM_OWNER_ID": owner_id,
-                        "AGENTGRAM_SOURCE_MESSAGE_ID": source_message_id,
-                        "AGENTGRAM_LAST_SEEN_MESSAGE_ID": last_seen_message_id,
-                        "AGENTGRAM_TOOL_DEFS": json.dumps(resolved_tools),
-                    },
-                }
-            }
+        return {
+            "type": "stdio",
+            "command": sys.executable,
+            "args": [self._mcp_server_script],
+            "env": {
+                "AGENTGRAM_API_URL": self._api_url,
+                "AGENTGRAM_AGENT_ID": self._agent_id,
+                "AGENTGRAM_API_KEY": self._api_key,
+                "AGENTGRAM_CONVERSATION_ID": conversation_id,
+                "AGENTGRAM_TASK_ID": task_id,
+                "AGENTGRAM_OWNER_ID": owner_id,
+                "AGENTGRAM_SOURCE_MESSAGE_ID": source_message_id,
+                "AGENTGRAM_LAST_SEEN_MESSAGE_ID": last_seen_message_id,
+                "AGENTGRAM_TOOL_DEFS": json.dumps(resolved_tools),
+            },
         }
-        return json.dumps(config)
+
+    def _mcp_computer_use_entry(self) -> dict[str, Any] | None:
+        """Return the computer-use MCP server entry, or None when disabled.
+
+        Mode validation is done at construction time — by the time we get
+        here, `local` means we have a verified script path on disk and
+        `off`/`builtin` simply skip wiring this server (`builtin` already
+        raised). So the branch logic here stays trivial.
+        """
+        if self._computer_use_mode != "local":
+            return None
+
+        # Set at construction; an unset value would have raised already.
+        assert self._computer_use_script is not None
+
+        return {
+            "type": "stdio",
+            "command": sys.executable,
+            "args": [self._computer_use_script],
+            "env": {
+                "AGENTGRAM_AGENT_ID": self._agent_id,
+                # The desktop app (or user) can pause computer use at any
+                # time by touching this file; the server re-checks on every
+                # action AND immediately before the driver call.
+                "AGENTGRAM_COMPUTER_USE_PAUSE": os.getenv(
+                    "AGENTGRAM_COMPUTER_USE_PAUSE",
+                    os.path.expanduser("~/.agentgram/computer_use.paused"),
+                ),
+                "AGENTGRAM_COMPUTER_USE_AUDIT": os.getenv(
+                    "AGENTGRAM_COMPUTER_USE_AUDIT",
+                    os.path.expanduser("~/.agentgram/computer_use_audit.log"),
+                ),
+            },
+        }
 
     @property
     def model_name(self) -> str:
@@ -433,11 +534,15 @@ class ClaudeCliBackend(ModelBackend):
         # tools (send_message, create_task, etc.) are also exposed via MCP.
         cmd.extend(["--tools", ",".join(self._CLI_TOOLS)])
 
-        use_mcp = bool(resolved_tools) and bool(self._mcp_server_script)
+        want_agentgram_mcp = bool(resolved_tools) and bool(self._mcp_server_script)
+        want_computer_use_mcp = (
+            self._computer_use_mode == "local" and bool(self._computer_use_script)
+        )
+        use_mcp = want_agentgram_mcp or want_computer_use_mcp
 
         if use_mcp:
             mcp_config = self._build_mcp_config(
-                resolved_tools, conversation_id, task_id, owner_id,
+                resolved_tools or [], conversation_id, task_id, owner_id,
                 source_message_id, last_seen_message_id,
             )
             if mcp_config:

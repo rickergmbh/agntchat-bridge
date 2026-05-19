@@ -104,6 +104,32 @@ def try_int(val: str | None) -> int | None:
         return None
 
 
+def find_sibling_script(filename: str) -> str | None:
+    """Locate a script that ships alongside this package.
+
+    Checks the bridge install (`desktop/bridge/<filename>`), the repo's
+    top-level `scripts/` dir (for dev runs from a checkout), and CWD-relative
+    fallbacks (for `python -m` style invocations). Returns the realpath of
+    the first hit, or None if every candidate is missing.
+
+    Callers that opt the user into a feature backed by a script MUST treat
+    None as a hard error — silently no-op'ing the capability the user just
+    enabled is worse than failing fast with the candidate list logged.
+    """
+    here = os.path.dirname(__file__)
+    candidates = [
+        os.path.join(here, "..", "..", filename),                                     # desktop/bridge/<file>
+        os.path.join(here, "..", "..", "..", "..", "scripts", filename),              # repo scripts/
+        os.path.join(os.getcwd(), "scripts", filename),
+        os.path.join(os.getcwd(), "..", "scripts", filename),
+    ]
+    for c in candidates:
+        p = os.path.realpath(c)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
 def write_temp(content: str, suffix: str, prefix: str, cleanup: list[str]) -> str:
     """Write `content` to a new temp file (utf-8) and record it for cleanup.
 
@@ -196,6 +222,7 @@ __all__ = [
     "cleanup_temp_files",
     "download_image_to_temp",
     "download_to_temp",
+    "find_sibling_script",
     "parse_add_dirs_env",
     "resolve_cli_path",
     "save_base64_image_to_temp",
