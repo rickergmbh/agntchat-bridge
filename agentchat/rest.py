@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
@@ -9,6 +10,8 @@ import httpx
 from .auth import TokenManager
 from .errors import AuthError, RateLimitError, AgentChatError
 from .models import Conversation, Message, Participant
+
+logger = logging.getLogger(__name__)
 
 
 class RestClient:
@@ -379,6 +382,26 @@ class RestClient:
             raise AuthError("Unauthorized — invalid or expired token")
         if resp.status_code == 204:
             return {}
+        if resp.status_code == 409:
+            # Mirror ExecutorClient._handle_response: a 409 carrying a
+            # WriteGuard duplicate_detected payload is NOT an error from
+            # the LLM's perspective — it's a structured "please confirm"
+            # signal. Return the body as the tool result so the LLM
+            # surfaces the existing item to the user. Raising would
+            # send "AgentChatError: API error 409: ..." back to the
+            # LLM and lose the structured payload.
+            try:
+                body = resp.json()
+            except Exception as e:
+                logger.warning(
+                    "[RestClient] 409 response body failed to parse as JSON: %s — "
+                    "falling through to generic raise. WriteGuard dedupe signal lost.",
+                    e,
+                )
+                body = {}
+            if isinstance(body, dict) and body.get("status") == "duplicate_detected":
+                return body
+            # non-WriteGuard 409 → fall through to generic error path
         if resp.status_code >= 400:
             try:
                 body = resp.json()

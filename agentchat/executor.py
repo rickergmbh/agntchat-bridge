@@ -2676,13 +2676,31 @@ class ExecutorClient:
         if resp.status_code == 409:
             try:
                 body = resp.json()
-            except Exception:
+            except Exception as e:
+                # MED-11 fix: a 409 with a non-JSON body (typically a
+                # reverse-proxy HTML error page, or a backend crash
+                # before the JSON encoder ran) silently falls through
+                # to the generic raise — losing both the stale-context
+                # and duplicate_detected signals. Log so we can see it
+                # in production rather than guessing why the LLM got a
+                # generic AgentChatError.
+                logger.warning(
+                    "[ExecutorClient] 409 response body failed to parse as JSON: %s — "
+                    "stale-context / WriteGuard signal lost, falling through to generic raise",
+                    e,
+                )
                 body = {}
             if body.get("stale"):
                 raise StaleContextError(
                     f"API error 409: {body}",
                     new_messages=body.get("newMessages") or [],
                 )
+            # WriteGuard duplicate-detected payload — return it as the
+            # tool result so the LLM can surface the existing item to
+            # the user. Same shape as the MCP-path response. Raising
+            # would hand the LLM `{"error": ...}` instead.
+            if body.get("status") == "duplicate_detected":
+                return body
             # non-stale 409 falls through to generic error path
         if resp.status_code >= 400:
             try:

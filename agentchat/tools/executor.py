@@ -302,13 +302,23 @@ class ToolExecutor:
             result_str = json.dumps({"error": str(e)})
             call_failed = True
 
+        # Skip verification when the backend returned a WriteGuard
+        # duplicate-detected payload — no resource was created, the
+        # tool result is a structured "please confirm" message that
+        # the LLM must surface to the user. Verifying would 404 on a
+        # nonexistent resource_id and mislead the model.
+        duplicate_detected = (
+            isinstance(result, dict)
+            and result.get("status") == "duplicate_detected"
+        )
+
         # Post-action verification for side-effecting tools.
         # If the method is in the verification registry, read back the
         # created resource to confirm it actually exists. Skip when the
         # call itself raised — there's nothing to verify, and passing
         # the unset `result` would mask the real error with a confusing
         # UnboundLocalError that the LLM then surfaces as "tools are down".
-        if not call_failed and needs_verification(executor_method):
+        if not call_failed and not duplicate_detected and needs_verification(executor_method):
             verification = await verify_action(
                 self._client, executor_method, result
             )
