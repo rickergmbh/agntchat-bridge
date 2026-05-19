@@ -71,15 +71,33 @@ except Exception as _exc:  # noqa: BLE001
 _STATE_DIR = Path(os.environ.get("AGENTGRAM_STATE_DIR", str(Path.home() / ".agentgram")))
 PAUSE_FILE = Path(os.environ.get("AGENTGRAM_COMPUTER_USE_PAUSE", str(_STATE_DIR / "computer_use.paused")))
 AUDIT_LOG = Path(os.environ.get("AGENTGRAM_COMPUTER_USE_AUDIT", str(_STATE_DIR / "computer_use_audit.log")))
+# Machine-wide lock: only one agent can hold computer control at a time.
+# Mirrors Anthropic's built-in computer-use server, which holds a similar
+# machine-wide lock. Stale locks (dead PID) are stolen automatically.
+LOCK_FILE = Path(os.environ.get("AGENTGRAM_COMPUTER_USE_LOCK", str(_STATE_DIR / "computer_use.lock")))
 
 # Sensitive-app deny list. The deny list runs AFTER fail-closed unknown-app
 # refusal, so it only fires when we successfully identified an app and the
-# name matches one of these substrings. Cheap foot-gun protection until we
-# ship a per-app approval UI like the official server.
+# name matches one of these substrings. Always absolute — no allow-list
+# override can unblock it.
 SENSITIVE_APP_PATTERNS = (
     "1password", "keychain access", "bitwarden", "lastpass",
     "ledger live", "exodus",
 )
+
+# Optional per-agent allow-list. When non-empty, the focused app must
+# substring-match (case-insensitive) one of these entries for any
+# interactive action to proceed. Set by Tauri at spawn time from
+# `agent.metadata.computer_use_allowed_apps`. Empty = no allow-list
+# restriction (deny list still enforced).
+def _parse_allowed_apps() -> tuple[str, ...]:
+    raw = os.environ.get("AGENTGRAM_COMPUTER_USE_ALLOWED_APPS", "")
+    if not raw:
+        return ()
+    entries = [s.strip().lower() for s in raw.split("\n") if s.strip()]
+    return tuple(entries)
+
+ALLOWED_APP_PATTERNS = _parse_allowed_apps()
 
 # Downscale target. Mirrors what the built-in computer-use does
 # (~1370x880 from Retina 3456x2234) so token cost stays bounded.
@@ -88,10 +106,178 @@ SCREENSHOT_MAX_DIM = 1400
 # Sanity threshold below which a downscaled PNG is almost certainly corrupt
 # or a single-color image. A real desktop screencap at 1400px is typically
 # 200KB–2MB. Wallpaper-only (no windows) is ~30–80KB. A truly blank/all-
-# black 1400x880 PNG is ~3KB. We refuse anything <8KB. This does NOT detect
-# wallpaper-only captures (the most common failure mode when Screen
-# Recording permission is denied) — that requires pyobjc.
+# black 1400x880 PNG is ~3KB. We refuse anything <8KB. This is a backstop —
+# the primary Screen Recording check is `_screen_recording_permitted` below
+# (via Quartz) which catches the wallpaper-only failure mode.
 SCREENSHOT_MIN_BYTES = 8 * 1024
+
+
+# --- Optional Quartz / PIL: real perm probe, native input, terminal redaction ---
+
+# All three follow-ups (Screen Recording probe, Quartz scroll/right-click,
+# terminal-window exclusion) need pyobjc-framework-Quartz. PIL is needed
+# only for the terminal redaction path. Soft-imports keep the server
+# operable without these deps — features degrade with a clear warning.
+
+try:
+    import Quartz  # type: ignore
+    _quartz_available = True
+except ImportError:
+    Quartz = None  # type: ignore
+    _quartz_available = False
+    logger.warning(
+        "pyobjc Quartz not available — falling back to cliclick for "
+        "scroll/right-click, file-size heuristic for screenshot perm, "
+        "and no terminal-window redaction. Install with: "
+        "pip install pyobjc-framework-Quartz Pillow"
+    )
+
+try:
+    from PIL import Image, ImageDraw  # type: ignore
+    _pil_available = True
+except ImportError:
+    Image = None  # type: ignore
+    ImageDraw = None  # type: ignore
+    _pil_available = False
+
+
+def _screen_recording_permitted() -> bool | None:
+    """Returns True/False when we can probe, or None when probing isn't available.
+
+    Uses CGPreflightScreenCaptureAccess which returns the user's grant state
+    without triggering a permission dialog. The legacy file-size heuristic
+    is still applied as a backstop after capture.
+    """
+    if not _quartz_available:
+        return None
+    try:
+        return bool(Quartz.CGPreflightScreenCaptureAccess())
+    except (AttributeError, Exception) as exc:  # noqa: BLE001
+        logger.warning("CGPreflightScreenCaptureAccess failed: %s", exc)
+        return None
+
+
+def _ancestor_pids(cap: int = 32) -> set[int]:
+    """Walk up the process parent chain. Capped to avoid pathological loops."""
+    pids: set[int] = set()
+    pid = os.getpid()
+    for _ in range(cap):
+        if pid <= 1 or pid in pids:
+            break
+        pids.add(pid)
+        try:
+            out = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "ppid="],
+                capture_output=True, text=True, timeout=2, check=True,
+            )
+            pid = int((out.stdout or "0").strip())
+        except (subprocess.SubprocessError, ValueError):
+            break
+    return pids
+
+
+def _terminal_window_bounds() -> list[tuple[int, int, int, int]]:
+    """Returns (x, y, w, h) in screen POINTS for windows owned by the
+    bridge's ancestor processes — the terminal that started Tauri, the
+    Tauri app itself, the bridge subprocess, the CLI. These are what we
+    black out so the model can't read its own logs.
+    """
+    if not _quartz_available:
+        return []
+    try:
+        pids = _ancestor_pids()
+        options = (
+            Quartz.kCGWindowListOptionOnScreenOnly
+            | Quartz.kCGWindowListExcludeDesktopElements
+        )
+        windows = Quartz.CGWindowListCopyWindowInfo(options, Quartz.kCGNullWindowID) or []
+        bounds: list[tuple[int, int, int, int]] = []
+        for w in windows:
+            owner_pid = w.get("kCGWindowOwnerPID")
+            if owner_pid not in pids:
+                continue
+            b = w.get("kCGWindowBounds") or {}
+            x = int(b.get("X", 0)); y = int(b.get("Y", 0))
+            ww = int(b.get("Width", 0)); hh = int(b.get("Height", 0))
+            if ww > 0 and hh > 0:
+                bounds.append((x, y, ww, hh))
+        return bounds
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("terminal-window enumeration failed: %s", exc)
+        return []
+
+
+def _backing_scale_factor() -> float:
+    """Pixels-per-point on the main display. Defaults to 1 if unknown."""
+    if not _quartz_available:
+        return 1.0
+    try:
+        main = Quartz.CGMainDisplayID()
+        b = Quartz.CGDisplayBounds(main)
+        points_wide = float(b.size.width)
+        pixels_wide = float(Quartz.CGDisplayPixelsWide(main))
+        if points_wide > 0:
+            return pixels_wide / points_wide
+    except Exception:  # noqa: BLE001
+        pass
+    return 1.0
+
+
+def _redact_terminal_windows(image_path: str) -> int:
+    """Paint over the bridge's ancestor windows in `image_path` (in-place).
+
+    Returns the number of rectangles drawn. Zero is normal in packaged
+    builds (no visible terminal). Soft-fails when PIL or Quartz is
+    unavailable, or when bounds enumeration / drawing throws.
+    """
+    if not (_quartz_available and _pil_available):
+        return 0
+    bounds = _terminal_window_bounds()
+    if not bounds:
+        return 0
+    try:
+        scale = _backing_scale_factor()
+        img = Image.open(image_path).convert("RGB")
+        draw = ImageDraw.Draw(img)
+        for (x, y, w, h) in bounds:
+            x0 = max(0, int(x * scale))
+            y0 = max(0, int(y * scale))
+            x1 = int((x + w) * scale)
+            y1 = int((y + h) * scale)
+            draw.rectangle((x0, y0, x1, y1), fill=(0, 0, 0))
+        img.save(image_path, "PNG")
+        return len(bounds)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("terminal redaction failed: %s", exc)
+        return 0
+
+
+def _quartz_post_mouse(event_type: int, x: int, y: int, button: int) -> bool:
+    """Synthesize a mouse event via Quartz. Returns True on success."""
+    if not _quartz_available:
+        return False
+    try:
+        event = Quartz.CGEventCreateMouseEvent(None, event_type, (x, y), button)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Quartz mouse event failed: %s", exc)
+        return False
+
+
+def _quartz_scroll(dy: int) -> bool:
+    """Synthesize a scroll-wheel event via Quartz."""
+    if not _quartz_available:
+        return False
+    try:
+        event = Quartz.CGEventCreateScrollWheelEvent(
+            None, Quartz.kCGScrollEventUnitLine, 1, dy,
+        )
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Quartz scroll event failed: %s", exc)
+        return False
 
 
 # --- Audit (load-bearing: refusal-on-write-failure) ---
@@ -128,6 +314,96 @@ def _audit(event: str, **kwargs: Any) -> bool:
     except OSError as exc:
         logger.warning("audit write failed (%s): %s", AUDIT_LOG, exc)
         return False
+
+
+# --- Machine-wide concurrency lock ---
+
+_lock_owner = False
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort liveness check for a PID."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but is owned by someone we can't signal.
+        return True
+    except OSError:
+        return False
+
+
+def _read_lock_holder() -> dict[str, Any] | None:
+    """Returns holder info or None when the lock is unreadable/corrupt."""
+    try:
+        return json.loads(LOCK_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _try_acquire_lock() -> dict[str, Any] | None:
+    """Acquire the lock. Returns None on success, or the holder info on
+    conflict (lock held by a *live* other-PID).
+
+    Stale locks (file exists but PID is dead) are stolen automatically.
+    """
+    global _lock_owner
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    info = {
+        "agent_id": AGENT_ID,
+        "pid": os.getpid(),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    # Cap retries: with a fast loop on persistent corruption we'd burn CPU.
+    for _ in range(5):
+        try:
+            fd = os.open(
+                LOCK_FILE,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o644,
+            )
+            os.write(fd, json.dumps(info).encode())
+            os.close(fd)
+            _lock_owner = True
+            return None
+        except FileExistsError:
+            holder = _read_lock_holder()
+            if holder is None:
+                # Corrupt lock — steal it.
+                try:
+                    LOCK_FILE.unlink()
+                except OSError:
+                    pass
+                continue
+            pid = holder.get("pid")
+            try:
+                pid_int = int(pid) if pid is not None else 0
+            except (TypeError, ValueError):
+                pid_int = 0
+            if pid_int and _pid_alive(pid_int):
+                return holder  # legitimate conflict
+            # Stale — steal it.
+            try:
+                LOCK_FILE.unlink()
+            except OSError:
+                pass
+    # Repeated theft attempts failed; surface the most recent holder.
+    return _read_lock_holder() or {"agent_id": "unknown"}
+
+
+def _release_lock() -> None:
+    if not _lock_owner:
+        return
+    holder = _read_lock_holder()
+    if holder and holder.get("pid") == os.getpid():
+        try:
+            LOCK_FILE.unlink()
+        except OSError as exc:
+            logger.warning("lock release failed: %s", exc)
 
 
 # --- Pause check (fail-closed via lstat) ---
@@ -176,7 +452,10 @@ def _frontmost_app_name() -> str | None:
 def _screening_refusal(app_name: str | None) -> str | None:
     """Return refusal reason string when this action must not run.
 
-    Fail-closed: `None` (unknown app) is refused, not allowed.
+    Three gates, in order:
+      1. Unknown app (fail-closed): refuse.
+      2. Hardcoded deny list (absolute): refuse — no allow-list override.
+      3. Per-agent allow-list (when non-empty): refuse if no match.
     """
     if app_name is None:
         return (
@@ -188,6 +467,13 @@ def _screening_refusal(app_name: str | None) -> str | None:
     for pattern in SENSITIVE_APP_PATTERNS:
         if pattern in lower:
             return f"Refused: focused app '{app_name}' matches sensitive-app pattern '{pattern}'."
+    if ALLOWED_APP_PATTERNS:
+        if not any(p in lower for p in ALLOWED_APP_PATTERNS):
+            return (
+                f"Refused: focused app '{app_name}' is not in this agent's "
+                f"allow-list. Add it in AgentConfig → Computer-use allowed "
+                f"apps to grant access."
+            )
     return None
 
 
@@ -205,26 +491,44 @@ class _Driver:
     def screenshot() -> str:
         """Return base64 PNG of the current screen, downscaled.
 
-        Writes the raw capture and the downscaled output to two separate
-        temp files so an in-place rewrite quirk in `sips` on any macOS
-        version cannot truncate the file mid-pipeline.
-
-        Raises RuntimeError when the resulting PNG is suspiciously small
-        (likely indicates capture failed silently).
+        Pipeline:
+          1. Real perm probe via CGPreflightScreenCaptureAccess (when
+             Quartz is available). Refuses early — no blind capture.
+          2. screencapture -x -C → raw.png
+          3. Terminal-window redaction (PIL + Quartz, soft-fails to no-op)
+             — paints over the bridge's ancestor windows in raw PIXELS so
+             coordinate-scaling stays correct after sips.
+          4. sips -Z 1400 → out.png (separate file; never in-place).
+          5. Size-threshold backstop catches degenerate captures.
+          6. base64.
         """
+        perm = _screen_recording_permitted()
+        if perm is False:
+            raise RuntimeError(
+                "Screen Recording permission is denied. Grant it in "
+                "System Settings → Privacy & Security → Screen Recording, "
+                "then restart the parent app that launched the bridge."
+            )
+
         with tempfile.NamedTemporaryFile(suffix=".raw.png", delete=False) as f_raw:
             raw_path = f_raw.name
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f_out:
             out_path = f_out.name
         try:
             # -x: silent shutter. -C: include cursor (model needs to see it).
-            # Fullscreen capture; no -w/-W/-i/-R/-o relevant here.
             subprocess.run(
                 ["screencapture", "-x", "-C", raw_path],
                 check=True, capture_output=True, timeout=10,
             )
-            # -Z: max-dim resample (aspect-preserving, downscale-only).
-            # Output goes to a separate file to avoid in-place rewrite.
+
+            # Redact bridge-ancestor terminal windows BEFORE downscale so
+            # CGWindowBounds (in points) and the raw PNG (in pixels) stay
+            # related by a clean scale factor. No-op when PIL/Quartz are
+            # missing or no matching windows are visible.
+            redacted_count = _redact_terminal_windows(raw_path)
+            if redacted_count:
+                logger.info("redacted %d terminal-ancestor window(s)", redacted_count)
+
             subprocess.run(
                 ["sips", "-Z", str(SCREENSHOT_MAX_DIM), raw_path, "--out", out_path],
                 check=True, capture_output=True, timeout=10,
@@ -261,10 +565,11 @@ class _Driver:
     def click(x: int, y: int, button: str = "left", clicks: int = 1) -> None:
         """Click at (x, y).
 
-        Left/double clicks go through System Events. Right/middle clicks
-        use cliclick because `click at {x, y}` in AppleScript is always
-        a primary click. We do NOT silently downgrade right→left when
-        cliclick is missing — that would feed the model misleading state.
+        Left/double clicks go through System Events.
+        Right/middle clicks prefer Quartz (no extra deps once pyobjc is
+        installed) and fall back to cliclick if Quartz isn't available.
+        We do NOT silently downgrade right→left when neither path works —
+        that would feed the model misleading state.
         """
         clicks = max(1, clicks)
         if button == "left":
@@ -275,11 +580,38 @@ class _Driver:
                     check=True, capture_output=True, timeout=5,
                 )
             return
-        # Right / middle: needs cliclick. Caller handles FileNotFoundError.
-        op = {"right": "rc", "middle": "mc"}[button]
+
+        # Right / middle. Try Quartz first (no brew dep). Fall back to
+        # cliclick when Quartz isn't available; the FileNotFoundError
+        # branch in execute_action surfaces a clear install hint.
+        if button == "right":
+            down, up, btn = (
+                Quartz.kCGEventRightMouseDown,
+                Quartz.kCGEventRightMouseUp,
+                Quartz.kCGMouseButtonRight,
+            ) if _quartz_available else (None, None, None)
+            cliclick_op = "rc"
+        else:  # middle
+            down, up, btn = (
+                Quartz.kCGEventOtherMouseDown,
+                Quartz.kCGEventOtherMouseUp,
+                Quartz.kCGMouseButtonCenter,
+            ) if _quartz_available else (None, None, None)
+            cliclick_op = "mc"
+
+        if _quartz_available:
+            for _ in range(clicks):
+                ok_down = _quartz_post_mouse(down, x, y, btn)
+                ok_up = _quartz_post_mouse(up, x, y, btn)
+                if not (ok_down and ok_up):
+                    break
+            else:
+                return  # success path
+            # Fell out of the loop on Quartz failure — try cliclick
+
         for _ in range(clicks):
             subprocess.run(
-                ["cliclick", f"{op}:{x},{y}"],
+                ["cliclick", f"{cliclick_op}:{x},{y}"],
                 check=True, capture_output=True, timeout=5,
             )
 
@@ -368,13 +700,20 @@ class _Driver:
     def scroll(x: int, y: int, dy: int) -> None:
         """Scroll at (x, y). `dy` > 0 = up, < 0 = down.
 
-        Requires `cliclick`; raises FileNotFoundError otherwise, which
-        execute_action surfaces as a clear install-cliclick error.
+        Prefers Quartz (no brew dep). Falls back to cliclick when Quartz
+        isn't available; the FileNotFoundError branch in execute_action
+        surfaces a clear install hint when neither works.
         """
-        subprocess.run(
-            ["cliclick", f"m:{x},{y}"],
-            check=True, capture_output=True, timeout=5,
-        )
+        # Move cursor to the target first so the scroll event lands on
+        # the correct view. osascript can do this without cliclick.
+        try:
+            _Driver.mouse_move(x, y)
+        except subprocess.CalledProcessError as exc:
+            logger.warning("pre-scroll mouse_move failed: %s", exc)
+
+        if _quartz_available and _quartz_scroll(dy):
+            return
+
         op = "su" if dy > 0 else "sd"
         subprocess.run(
             ["cliclick", f"{op}:{abs(dy)}"],
@@ -701,6 +1040,19 @@ def main() -> None:
 
     _audit("startup", pid=os.getpid())
 
+    # Acquire the machine-wide lock. If another live agent holds it, log a
+    # clean diagnostic and exit; the bridge surfaces the failed MCP server
+    # as a tool error to the model.
+    holder = _try_acquire_lock()
+    if holder is not None:
+        _audit("lock_conflict", holder=holder)
+        logger.error(
+            "computer-use lock held by another agent (agent_id=%s pid=%s); exiting",
+            holder.get("agent_id"), holder.get("pid"),
+        )
+        sys.exit(2)
+    _audit("lock_acquired", lock_file=str(LOCK_FILE))
+
     try:
         for line in sys.stdin:
             line = line.strip()
@@ -731,6 +1083,7 @@ def main() -> None:
                 sys.stdout.write(json.dumps(response) + "\n")
                 sys.stdout.flush()
     finally:
+        _release_lock()
         _audit("shutdown")
 
 

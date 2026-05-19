@@ -1,2 +1,14 @@
 websockets>=12.0
 httpx>=0.27.0
+
+# Optional, macOS only — used by computer_use_mcp_server.py for
+# CGPreflightScreenCaptureAccess (real Screen Recording perm probe),
+# Quartz mouse/scroll/key events (drops the cliclick brew dependency
+# for scroll + right/middle click), and CGWindowListCopyWindowInfo
+# (terminal-window exclusion from screenshots). The MCP server soft-
+# imports these and degrades cleanly when missing.
+pyobjc-core>=10.0; sys_platform == "darwin"
+pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"
+# Pillow is used to redact the bridge's terminal windows from screenshots
+# before they're sent to the model. Falls back to no-redaction when missing.
+Pillow>=10.0; sys_platform == "darwin"
