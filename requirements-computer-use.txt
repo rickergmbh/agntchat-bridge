@@ -1,0 +1,29 @@
+# Optional dependencies for computer_use_mcp_server.py safety features.
+#
+# These deliberately do NOT live in requirements.txt because installing
+# them synchronously on every agent start (which is what Tauri's
+# ensure_venv does for requirements.txt) blocked the UI with a multi-
+# minute "spinning wheel" — pyobjc + Pillow add up to ~50-80MB of wheels
+# and Pillow occasionally builds from source.
+#
+# The desktop app installs this list on demand via the
+# `install_computer_use_deps` Tauri command (kicked off in a background
+# thread from the AgentConfig toggle), so the agent-start path never
+# blocks on it. The MCP server soft-imports each one and degrades
+# cleanly when missing.
+#
+# What each one enables:
+#   pyobjc-core, pyobjc-framework-Quartz:
+#     - CGPreflightScreenCaptureAccess: real Screen Recording perm
+#       probe (catches "wallpaper-only" captures that pass the 8KB
+#       heuristic but show no app windows).
+#     - CGEventCreate* / CGEventPost: native mouse / scroll / right-
+#       click events without `brew install cliclick`.
+#     - CGWindowListCopyWindowInfo: enumerate the bridge's ancestor
+#       windows so they can be redacted from screenshots.
+#   Pillow:
+#     - Composite the black rectangles over those ancestor windows in
+#       the raw PNG before sips downscale.
+pyobjc-core>=10.0
+pyobjc-framework-Quartz>=10.0
+Pillow>=10.0
