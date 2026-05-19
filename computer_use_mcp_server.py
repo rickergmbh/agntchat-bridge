@@ -299,12 +299,24 @@ def _redact_terminal_windows(image_path: str) -> tuple[int, str | None]:
         return 0, f"PIL redaction draw failed: {exc}"
 
 
-def _quartz_post_mouse(event_type: int, x: int, y: int, button: int) -> bool:
-    """Synthesize a mouse event via Quartz. Returns True on success."""
+def _quartz_post_mouse(
+    event_type: int, x: int, y: int, button: int, click_state: int = 1
+) -> bool:
+    """Synthesize a mouse event via Quartz. Returns True on success.
+
+    `click_state` populates `kCGMouseEventClickState`, which apps consult
+    to distinguish single / double / triple clicks. Without it many
+    macOS apps silently ignore right-click events (they treat them as
+    click-state 0, which AppKit's responder chain often drops). Set to
+    1 for a normal single click.
+    """
     if not _quartz_available:
         return False
     try:
         event = Quartz.CGEventCreateMouseEvent(None, event_type, (x, y), button)
+        Quartz.CGEventSetIntegerValueField(
+            event, Quartz.kCGMouseEventClickState, click_state
+        )
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
         return True
     except Exception as exc:  # noqa: BLE001
@@ -313,18 +325,66 @@ def _quartz_post_mouse(event_type: int, x: int, y: int, button: int) -> bool:
 
 
 def _quartz_scroll(dy: int) -> bool:
-    """Synthesize a scroll-wheel event via Quartz."""
+    """Synthesize a scroll-wheel event via Quartz.
+
+    Uses pixel units rather than lines because modern macOS apps (Safari,
+    Chrome, Notes, native AppKit views) treat `kCGScrollEventUnitLine`
+    events as one "notch" and often render imperceptible movement.
+    `kCGScrollEventUnitPixel` with a meaningful pixel delta produces the
+    smooth-scroll behavior the agent expects to see in the next
+    screenshot.
+
+    The caller still passes "lines" — we scale up to ~20 pixels per line
+    so a scroll_amount of 3 moves ~60 pixels, which is visible at the
+    1400px downscale resolution.
+    """
     if not _quartz_available:
         return False
     try:
+        pixels = dy * 20  # one line ≈ 20px for visible scroll
         event = Quartz.CGEventCreateScrollWheelEvent(
-            None, Quartz.kCGScrollEventUnitLine, 1, dy,
+            None, Quartz.kCGScrollEventUnitPixel, 1, pixels,
         )
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
         return True
     except Exception as exc:  # noqa: BLE001
         logger.warning("Quartz scroll event failed: %s", exc)
         return False
+
+
+def _enumerate_displays() -> list[dict[str, Any]]:
+    """Return a list of {id, x, y, w, h, scale} for each active display.
+
+    Used for the screenshot audit row and (future) coordinate translation.
+    Empty list when Quartz isn't available.
+    """
+    if not _quartz_available:
+        return []
+    try:
+        err, ids, _count = Quartz.CGGetActiveDisplayList(8, None, None)
+        if err != 0 or ids is None:
+            return []
+        out: list[dict[str, Any]] = []
+        for did in ids:
+            b = Quartz.CGDisplayBounds(did)
+            pixels_wide = Quartz.CGDisplayPixelsWide(did)
+            scale = (
+                float(pixels_wide) / float(b.size.width)
+                if b.size.width > 0 else 1.0
+            )
+            out.append({
+                "id": int(did),
+                "x": int(b.origin.x),
+                "y": int(b.origin.y),
+                "w": int(b.size.width),
+                "h": int(b.size.height),
+                "scale": round(scale, 3),
+                "is_main": bool(Quartz.CGDisplayIsMain(did)),
+            })
+        return out
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("display enumeration failed: %s", exc)
+        return []
 
 
 # --- Audit (load-bearing: refusal-on-write-failure) ---
@@ -619,6 +679,7 @@ class _Driver:
                 "redaction_count": redacted_count,
                 "redaction_error": None,
                 "bytes": len(data),
+                "displays": _enumerate_displays(),
             }
             return base64.b64encode(data).decode("ascii"), audit_detail
         finally:
@@ -642,8 +703,9 @@ class _Driver:
         )
 
     @staticmethod
-    def click(x: int, y: int, button: str = "left", clicks: int = 1) -> None:
-        """Click at (x, y).
+    def click(x: int, y: int, button: str = "left", clicks: int = 1) -> str:
+        """Click at (x, y). Returns the driver name that actually fired
+        ("osascript", "quartz", or "cliclick") for audit visibility.
 
         Left/double clicks go through System Events.
         Right/middle clicks prefer Quartz (no extra deps once pyobjc is
@@ -653,47 +715,61 @@ class _Driver:
         """
         clicks = max(1, clicks)
         if button == "left":
-            for _ in range(clicks):
+            for i in range(clicks):
+                # ClickState = 1 for single, 2 for double (System Events
+                # `click at` already infers this from sequential calls in
+                # practice, but the higher 10s timeout gives slow apps
+                # time to fire menu animations / first-responder switches).
                 subprocess.run(
                     ["osascript", "-e",
                      f'tell application "System Events" to click at {{{x}, {y}}}'],
-                    check=True, capture_output=True, timeout=5,
+                    check=True, capture_output=True, timeout=10,
                 )
-            return
+            return "osascript"
 
         # Right / middle. Try Quartz first (no brew dep). Fall back to
         # cliclick when Quartz isn't available; the FileNotFoundError
         # branch in execute_action surfaces a clear install hint.
         if button == "right":
             down, up, btn = (
-                Quartz.kCGEventRightMouseDown,
-                Quartz.kCGEventRightMouseUp,
-                Quartz.kCGMouseButtonRight,
-            ) if _quartz_available else (None, None, None)
+                (Quartz.kCGEventRightMouseDown,
+                 Quartz.kCGEventRightMouseUp,
+                 Quartz.kCGMouseButtonRight)
+                if _quartz_available else (None, None, None)
+            )
             cliclick_op = "rc"
         else:  # middle
             down, up, btn = (
-                Quartz.kCGEventOtherMouseDown,
-                Quartz.kCGEventOtherMouseUp,
-                Quartz.kCGMouseButtonCenter,
-            ) if _quartz_available else (None, None, None)
+                (Quartz.kCGEventOtherMouseDown,
+                 Quartz.kCGEventOtherMouseUp,
+                 Quartz.kCGMouseButtonCenter)
+                if _quartz_available else (None, None, None)
+            )
             cliclick_op = "mc"
 
         if _quartz_available:
-            for _ in range(clicks):
-                ok_down = _quartz_post_mouse(down, x, y, btn)
-                ok_up = _quartz_post_mouse(up, x, y, btn)
+            all_ok = True
+            for i in range(clicks):
+                # Move the cursor first so the OS's tracked position
+                # matches our event location — some apps cross-check.
+                _quartz_post_mouse(
+                    Quartz.kCGEventMouseMoved, x, y, 0, click_state=0,
+                )
+                ok_down = _quartz_post_mouse(down, x, y, btn, click_state=i + 1)
+                ok_up = _quartz_post_mouse(up, x, y, btn, click_state=i + 1)
                 if not (ok_down and ok_up):
+                    all_ok = False
                     break
-            else:
-                return  # success path
-            # Fell out of the loop on Quartz failure — try cliclick
+            if all_ok:
+                return "quartz"
+            # Fell through on Quartz failure — try cliclick.
 
         for _ in range(clicks):
             subprocess.run(
                 ["cliclick", f"{cliclick_op}:{x},{y}"],
                 check=True, capture_output=True, timeout=5,
             )
+        return "cliclick"
 
     @staticmethod
     def type_text(text: str) -> None:
@@ -777,8 +853,12 @@ class _Driver:
         )
 
     @staticmethod
-    def scroll(x: int, y: int, dy: int) -> None:
+    def scroll(x: int, y: int, dy: int) -> str:
         """Scroll at (x, y). `dy` > 0 = up, < 0 = down.
+
+        Returns "quartz" or "cliclick" — which driver actually fired —
+        so the audit row can distinguish them when diagnosing
+        "scroll reported ok but I didn't see anything move".
 
         Prefers Quartz (no brew dep). Falls back to cliclick when Quartz
         isn't available; the FileNotFoundError branch in execute_action
@@ -792,13 +872,14 @@ class _Driver:
             logger.warning("pre-scroll mouse_move failed: %s", exc)
 
         if _quartz_available and _quartz_scroll(dy):
-            return
+            return "quartz"
 
         op = "su" if dy > 0 else "sd"
         subprocess.run(
             ["cliclick", f"{op}:{abs(dy)}"],
             check=True, capture_output=True, timeout=5,
         )
+        return "cliclick"
 
 
 # --- Tool surface (Anthropic-compatible) ---
@@ -971,8 +1052,8 @@ def execute_action(args: dict[str, Any]) -> dict[str, Any]:
                 "double_click": "left",
             }[action]
             clicks = 2 if action == "double_click" else 1
-            _Driver.click(x, y, button=button, clicks=clicks)
-            _audit("ok", action=action, x=x, y=y, clicks=clicks)
+            driver = _Driver.click(x, y, button=button, clicks=clicks)
+            _audit("ok", action=action, x=x, y=y, clicks=clicks, driver_used=driver)
             return _text_block({"ok": True}, is_error=False)
 
         if action == "type":
@@ -998,8 +1079,8 @@ def execute_action(args: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(f"scroll_direction must be 'up' or 'down'; got {direction!r}")
             amount = int(args.get("scroll_amount", 3))
             dy = amount if direction == "up" else -amount
-            _Driver.scroll(x, y, dy)
-            _audit("ok", action=action, x=x, y=y, dy=dy)
+            driver = _Driver.scroll(x, y, dy)
+            _audit("ok", action=action, x=x, y=y, dy=dy, driver_used=driver)
             return _text_block({"ok": True}, is_error=False)
 
         raise ValueError(f"Unknown action: {action!r}")
