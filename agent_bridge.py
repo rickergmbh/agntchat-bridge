@@ -2547,6 +2547,41 @@ def _resolved_tools_to_anthropic(tools: list[dict[str, Any]]) -> list[dict[str, 
     return result
 
 
+def _server_tools_to_anthropic(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Extract Anthropic-native server tool specs from backend-resolved
+    `server_tool` catalog entries.
+
+    Each entry carries its provider request spec under
+    ``executorConfig.anthropic`` (e.g. ``{"type": "web_search_20250305",
+    "name": "web_search", ...}``). The spec is emitted verbatim — Anthropic
+    defines and validates the schema for these tools. See GitHub issue #43.
+    """
+    result = []
+    for tool in tools:
+        cfg = tool.get("executorConfig") or tool.get("executor_config") or {}
+        spec = cfg.get("anthropic")
+        if isinstance(spec, dict) and spec.get("type") and spec.get("name"):
+            result.append(dict(spec))
+    return result
+
+
+def _server_tool_betas(tools: list[dict[str, Any]]) -> list[str]:
+    """Collect the `anthropic-beta` header flags declared by backend-resolved
+    `server_tool` entries.
+
+    The backend is the single source of truth for the beta version string
+    (`executorConfig.anthropic_beta`) — the bridge never hardcodes it, so the
+    two runtimes can't drift when Anthropic bumps a beta date. See issue #43.
+    """
+    betas: list[str] = []
+    for tool in tools:
+        cfg = tool.get("executorConfig") or tool.get("executor_config") or {}
+        beta = cfg.get("anthropic_beta")
+        if isinstance(beta, str) and beta and beta not in betas:
+            betas.append(beta)
+    return betas
+
+
 def _resolved_tools_to_openai(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Convert backend-resolved tool dicts to OpenAI function-calling format.
 
@@ -2824,17 +2859,31 @@ def run_single_agent(
     # Extract input_schema, resolved tools (from skills), and detail templates
     input_schema = None
     resolved_tools: list[dict[str, Any]] = []
+    server_tools: list[dict[str, Any]] = []
     detail_templates: dict[str, Any] = {}
     if profile:
         sc = profile.get("structuredCapabilities") or {}
         input_schema = sc.get("input_schema")
         detail_templates = sc.get("detail_templates") or {}
-        resolved_tools = profile.get("resolvedTools") or []
+        all_resolved = profile.get("resolvedTools") or []
+        # Split off Anthropic-native server tools (web_search, web_fetch,
+        # code_execution). They execute on Anthropic's infrastructure and
+        # are NEVER dispatched by us — keeping them out of `resolved_tools`
+        # ensures they never pollute the MCP tool list or platform tool
+        # defs. They are rendered verbatim into the provider request
+        # instead. See GitHub issue #43.
+        server_tools = [t for t in all_resolved if t.get("category") == "server_tool"]
+        resolved_tools = [t for t in all_resolved if t.get("category") != "server_tool"]
 
     if resolved_tools:
         tool_names = sorted(t["name"] for t in resolved_tools if t.get("name"))
         logger.info("[%s] Resolved %d tools from skills: %s",
                      executor_key, len(tool_names), ", ".join(tool_names))
+
+    if server_tools:
+        server_names = sorted(t["name"] for t in server_tools if t.get("name"))
+        logger.info("[%s] Native server tools available: %s",
+                     executor_key, ", ".join(server_names))
 
     agent_owner_id = profile.get("ownerId", "") if profile else ""
 
@@ -2983,6 +3032,24 @@ def run_single_agent(
         )
         execution_mode = "single_shot"
 
+    # Native server tools (web_search, web_fetch, code_execution) require the
+    # provider's native tools array — there is no <tool_call>-tag equivalent,
+    # so single_shot mode cannot carry them. If the agent resolved server
+    # tools but isn't in tool_use mode, promote it (the backend supports it)
+    # so the capability the native-server-tools skill advertises is actually
+    # wired in rather than silently dropped. See GitHub issue #43.
+    if (
+        server_tools
+        and sync_backend_name == "anthropic"
+        and _supports_native_tools
+        and execution_mode != "tool_use"
+    ):
+        logger.info(
+            "[%s] Promoting execution mode %s → tool_use: agent has %d native server tools",
+            executor_key, execution_mode, len(server_tools),
+        )
+        execution_mode = "tool_use"
+
     logger.info("[%s] Execution mode: %s", executor_key, execution_mode)
 
     # Agent identity — used only as minimal fallback when server directives unavailable
@@ -3073,6 +3140,27 @@ def run_single_agent(
             executor_key, len(_tool_defs),
             "anthropic" if sync_backend_name == "anthropic" else "openai",
         )
+
+    # Append Anthropic-native server tools (web_search, web_fetch,
+    # code_execution) verbatim. They run on Anthropic's infrastructure and
+    # are never dispatched locally, so they bypass the ToolExecutor — this
+    # gives bridge agents on the Anthropic backend the same native tools a
+    # hosted agent gets. See GitHub issue #43.
+    if execution_mode == "tool_use" and server_tools and sync_backend_name == "anthropic":
+        _server_defs = _server_tools_to_anthropic(server_tools)
+        if _server_defs:
+            _tool_defs = (_tool_defs or []) + _server_defs
+            # Hand the backend the beta-header flags the backend itself
+            # declared (executorConfig.anthropic_beta) — see issue #43.
+            _server_betas = _server_tool_betas(server_tools)
+            if hasattr(backend, "set_server_tool_betas"):
+                backend.set_server_tool_betas(_server_betas)
+            logger.info(
+                "[%s] Tool-use mode: %d native server tools enabled (%s)%s",
+                executor_key, len(_server_defs),
+                ", ".join(d.get("name", d.get("type", "?")) for d in _server_defs),
+                f" [beta: {', '.join(_server_betas)}]" if _server_betas else "",
+            )
     elif execution_mode == "single_shot" and resolved_tools:
         _tool_prompt_suffix = _build_tool_param_details_from_resolved(resolved_tools)
         if _tool_prompt_suffix:

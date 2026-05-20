@@ -79,9 +79,25 @@ class AnthropicBackend(ModelBackend):
         self._top_p = top_p
         self._top_k = top_k
 
+        # anthropic-beta header flags required by the agent's native server
+        # tools. Populated by the bridge from the resolved catalog
+        # (executorConfig.anthropic_beta) — see set_server_tool_betas.
+        self._server_tool_betas: list[str] = []
+
     @property
     def model_name(self) -> str:
         return self._model
+
+    def set_server_tool_betas(self, betas: list[str]) -> None:
+        """Record the `anthropic-beta` header flags required by the agent's
+        native server tools (e.g. ``code-execution-2025-08-25``).
+
+        The bridge supplies these from the backend-resolved catalog so the
+        beta version string lives in exactly one place (the backend), not
+        hardcoded here. Applied to every request that carries server tools.
+        See GitHub issue #43.
+        """
+        self._server_tool_betas = list(betas or [])
 
     def _sampling_kwargs(self) -> dict[str, Any]:
         """Build optional sampling kwargs for API calls."""
@@ -359,6 +375,17 @@ class AnthropicBackend(ModelBackend):
         text tokens are forwarded in real time.  Falls back to non-streaming
         ``messages.create()`` otherwise.
         """
+        # Native server tools (e.g. code_execution) require an
+        # anthropic-beta header. The flags are agent-level (set by the
+        # bridge from the resolved catalog), so they apply to every call —
+        # including the forced final-text call, whose history may still
+        # reference a server tool even though it passes tools=[].
+        extra_headers = (
+            {"anthropic-beta": ",".join(self._server_tool_betas)}
+            if self._server_tool_betas
+            else None
+        )
+
         if not on_progress or not hasattr(self._client.messages, "stream"):
             return await self._client.messages.create(
                 model=self._model,
@@ -366,6 +393,7 @@ class AnthropicBackend(ModelBackend):
                 system=self._cached_system(system_prompt),
                 messages=api_messages,
                 tools=tools,
+                extra_headers=extra_headers,
                 **self._sampling_kwargs(),
             )
 
@@ -381,6 +409,7 @@ class AnthropicBackend(ModelBackend):
             system=self._cached_system(system_prompt),
             messages=api_messages,
             tools=tools,
+            extra_headers=extra_headers,
             **self._sampling_kwargs(),
         ) as stream:
             async for event in stream:
@@ -475,6 +504,17 @@ class AnthropicBackend(ModelBackend):
 
             for k, v in self._usage_dict(response.usage).items():
                 total_usage[k] = total_usage.get(k, 0) + v
+
+            # Anthropic paused a long-running server-tool turn (web search
+            # or code execution still in flight). Re-feed the assistant
+            # content verbatim and continue so the turn can finish. The
+            # max_iterations cap bounds this. See GitHub issue #43.
+            if response.stop_reason == "pause_turn":
+                api_messages.append({
+                    "role": "assistant",
+                    "content": _serialize_content_blocks(response.content),
+                })
+                continue
 
             # If the model didn't request tool use, extract final text and return
             if response.stop_reason != "tool_use":
@@ -633,20 +673,56 @@ def _serialize_content_blocks(content_blocks: Any) -> list[dict[str, Any]]:
 
     The API requires sending the assistant's response (including tool_use blocks)
     back as dicts, not SDK objects.
+
+    Server-tool blocks (``server_tool_use``, ``web_search_tool_result``,
+    ``web_fetch_tool_result``, ``code_execution_tool_result``) are preserved
+    verbatim via the SDK's Pydantic dump so server-tool state — encrypted
+    citation content, sandbox container refs — survives the round-trip and
+    a ``pause_turn`` can be resumed cleanly. See GitHub issue #43.
     """
     result = []
     for block in content_blocks:
-        if hasattr(block, "type"):
-            if block.type == "text":
-                result.append({"type": "text", "text": block.text})
-            elif block.type == "tool_use":
-                result.append({
-                    "type": "tool_use",
-                    "id": block.id,
-                    "name": block.name,
-                    "input": dict(block.input) if block.input else {},
-                })
+        if not hasattr(block, "type"):
+            continue
+        if block.type == "text":
+            result.append({"type": "text", "text": block.text})
+        elif block.type == "tool_use":
+            result.append({
+                "type": "tool_use",
+                "id": block.id,
+                "name": block.name,
+                "input": dict(block.input) if block.input else {},
+            })
+        else:
+            dumped = _block_to_dict(block)
+            if dumped is not None:
+                result.append(dumped)
     return result
+
+
+def _block_to_dict(block: Any) -> dict[str, Any] | None:
+    """Best-effort JSON-safe dump of an Anthropic SDK content block.
+
+    Used for server-tool blocks we don't special-case. The anthropic SDK
+    ships Pydantic v2 models, so ``model_dump(mode="json")`` yields a dict
+    safe to send straight back to the API.
+    """
+    dump = getattr(block, "model_dump", None)
+    if callable(dump):
+        try:
+            return dump(mode="json")
+        except Exception:  # noqa: BLE001 — defensive; never break the loop
+            try:
+                return dump()
+            except Exception:  # noqa: BLE001
+                pass
+    # A block we couldn't serialize is dropped — log it, because dropping a
+    # server-tool block mid-turn can orphan its server_tool_use/result pair.
+    logger.warning(
+        "Dropping un-serializable content block of type %r",
+        getattr(block, "type", "<unknown>"),
+    )
+    return None
 
 
 def _translate_attachments(messages: list[ChatMessage]) -> list[ChatMessage]:
