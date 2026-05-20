@@ -2461,6 +2461,12 @@ def make_stream_callback(
     async def complete() -> None:
         """Signal the stream is done. Called after the final message is sent."""
         nonlocal _stream_terminal
+        # Idempotent: a stream gets exactly one terminal update. Guards
+        # against complete() after cancel() (or vice versa) — and lets the
+        # executor's turn-cleanup call cancel() unconditionally as a
+        # backstop without risking a spurious second update.
+        if _stream_terminal:
+            return
         _stream_terminal = True
         if suppress_stream:
             return
@@ -2472,8 +2478,10 @@ def make_stream_callback(
         )
 
     async def cancel() -> None:
-        """Signal the stream was cancelled (error/empty response)."""
+        """Signal the stream was cancelled (error/empty response/timeout)."""
         nonlocal _stream_terminal
+        if _stream_terminal:
+            return  # already terminated — see complete() for rationale
         _stream_terminal = True
         if suppress_stream:
             return
@@ -3025,6 +3033,17 @@ def run_single_agent(
     except Exception as e:
         logger.debug("[%s] Directive warm-up failed (non-fatal): %s", executor_key, e)
 
+    # The executor's message_timeout is a blunt asyncio.wait_for that
+    # cancels the handler with no error and no reply. The backend owns the
+    # sizing via outer_timeout() — a backstop ABOVE its own internal
+    # timeout, so the backend times out gracefully (returning a real error
+    # the bridge can post) before the wait_for fires. Computer-use agents
+    # carry a larger backend timeout, which outer_timeout() reflects.
+    _message_timeout = backend.outer_timeout()
+    logger.info(
+        "[%s] Executor message_timeout=%ds", executor_key, _message_timeout,
+    )
+
     # Create executor
     executor = ExecutorClient(
         base_url=AGENTGRAM_API_URL,
@@ -3035,7 +3054,7 @@ def run_single_agent(
         capabilities=agent_capabilities or [],
         max_concurrent=max_concurrent,
         poll_wait=POLL_WAIT,
-        message_timeout=300,
+        message_timeout=_message_timeout,
     )
 
     # --- Tool-use mode setup ---
@@ -3658,6 +3677,12 @@ def run_single_agent(
         # the real LLM phases (tool_call/writing) as those events fire.
         _msg_stream_id = str(uuid.uuid4())
         _stream_cb = make_stream_callback(executor, msg.conversation_id, _msg_stream_id)
+        # If the executor's outer timeout cancels this handler mid-flight,
+        # the complete()/cancel() calls below are skipped and the streaming
+        # bubble would spin forever. Register cancel() as a turn cleanup so
+        # the executor terminates the stream on any exit. cancel() is
+        # idempotent, so on a normal finish this is a harmless no-op.
+        executor.register_turn_cleanup(msg.id, _stream_cb.cancel)
         if msg.conversation_id:
             asyncio.create_task(executor.send_stream_update(
                 msg.conversation_id, _msg_stream_id,

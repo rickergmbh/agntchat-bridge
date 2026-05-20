@@ -240,6 +240,10 @@ class ExecutorClient:
         self._message_handler: MessageHandler | None = None
         self._scope_request_handler: ScopeRequestHandler | None = None
         self._task_completed_handlers: list[TaskCompletedHandler] = []
+        # Per-turn cleanups, keyed by gateway message id. Run in _handle_message's
+        # finally so handler-registered teardown (e.g. terminating a streaming
+        # bubble) still happens when a mid-flight cancel skips the handler's own.
+        self._turn_cleanups: dict[str, Callable[[], Awaitable[None]]] = {}
         self._running = False
         self._semaphore: asyncio.Semaphore | None = None
         self._message_dedup = MessageDedup(ttl=600.0)
@@ -288,6 +292,20 @@ class ExecutorClient:
         """
         self._message_handler = handler
         return handler
+
+    def register_turn_cleanup(
+        self, message_id: str, cleanup: Callable[[], Awaitable[None]]
+    ) -> None:
+        """Register an async cleanup to run when this message's turn ends.
+
+        `_handle_message` runs it in a ``finally`` — on normal completion,
+        on a handler exception, and (the case that matters) on a
+        timeout/cancellation that skips the handler's own teardown. Used so
+        a handler can guarantee teardown — e.g. terminating its streaming
+        bubble — even when a mid-flight cancel aborts it. The cleanup MUST
+        be idempotent: it also runs after a handler that already cleaned up.
+        """
+        self._turn_cleanups[message_id] = cleanup
 
     def on_scope_request(self, handler: ScopeRequestHandler) -> ScopeRequestHandler:
         """Register a scope request handler function.
@@ -2489,7 +2507,8 @@ class ExecutorClient:
 
         except BaseException as e:
             logger.exception("[MSG-HANDLE] Handler/ack failed for %s (%s): %s", msg.id, type(e).__name__, e)
-            # Still try to acknowledge so the message isn't retried
+            # Acknowledge FIRST so the message can't be redelivered — before
+            # the (slower, network-bound) notice POST below runs.
             try:
                 await self._post(
                     f"/api/gateway/messages/{msg.id}/ack",
@@ -2498,9 +2517,45 @@ class ExecutorClient:
                 logger.info("[MSG-HANDLE] Ack succeeded in except path for %s", msg.id)
             except Exception:
                 logger.exception("[MSG-HANDLE] Failed to ack message %s even in except path", msg.id)
+            # A timeout cancels the handler mid-task with no reply. Left
+            # silent, the agent just appears to stop dead — post a visible
+            # ErrorReport (also lands in error analytics / push) so the
+            # user knows what happened and can continue it.
+            if isinstance(e, asyncio.TimeoutError):
+                try:
+                    mins = max(1, self._message_timeout // 60)
+                    await self.send_message(
+                        msg.conversation_id,
+                        f"⏱️ I ran out of time on that — it passed the "
+                        f"{mins}-minute limit for a single turn and was cut off "
+                        f"mid-task. Longer jobs (computer use especially) can hit "
+                        f"this; ask me to keep going and I'll continue from the "
+                        f"current state, or split it into smaller steps.",
+                        message_type="ErrorReport",
+                        metadata={"error_code": "turn_timeout", "severity": "warning"},
+                    )
+                except Exception:
+                    logger.exception(
+                        "[MSG-HANDLE] Failed to post timeout notice for %s", msg.id
+                    )
             # Re-raise CancelledError so asyncio cancellation propagates correctly
             if isinstance(e, asyncio.CancelledError):
                 raise
+        finally:
+            # Run any cleanup the handler registered for this turn (e.g.
+            # terminating the streaming bubble). Guarantees teardown even
+            # when a mid-flight timeout/cancel skipped the handler's own
+            # complete()/cancel() calls. Runs after the except block, so a
+            # genuine CancelledError is re-raised first only once this has
+            # had its turn.
+            cleanup = self._turn_cleanups.pop(msg.id, None)
+            if cleanup is not None:
+                try:
+                    await cleanup()
+                except Exception:
+                    logger.exception(
+                        "[MSG-HANDLE] Turn cleanup failed for %s", msg.id
+                    )
 
     # ------------------------------------------------------------------
     # Batch Operations

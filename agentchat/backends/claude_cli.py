@@ -25,6 +25,7 @@ import asyncio
 import json
 import os
 import re
+import signal
 import sys
 import time
 from typing import Any
@@ -58,7 +59,35 @@ logger = logging.getLogger("agentchat.backends.claude_cli")
 
 _DEFAULT_CLI_PATH = "claude"
 _DEFAULT_TIMEOUT = 900  # 15 minutes — complex tasks need time
+_COMPUTER_USE_TIMEOUT = 1800  # 30 minutes — computer use chains many slow driver calls
 _STREAM_LIMIT = 10 * 1024 * 1024  # 10 MB — CLI can emit large JSON lines
+
+
+def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
+    """Best-effort SIGKILL of a subprocess and its entire process group.
+
+    The Claude CLI spawns its own children — MCP servers, including the
+    computer-use server that drives the desktop. A plain ``proc.kill()``
+    reaps only the direct child and orphans those grandchildren; an
+    orphaned computer-use server keeps clicking and typing on the user's
+    machine. Spawning with ``start_new_session=True`` makes the CLI a
+    process-group leader, so one ``killpg`` reaps the whole tree.
+
+    Call from a ``finally`` so it runs on graceful timeout, on a
+    CancelledError from the executor's outer wait_for, and on any crash.
+    """
+    if proc.returncode is not None:
+        return  # already exited — nothing to reap
+    if hasattr(os, "killpg") and hasattr(os, "getpgid"):
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass  # group already gone, or not permitted — fall through
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
 
 
 def _content_to_cli_text(content: str | list, cleanup_paths: list[str] | None = None) -> str:
@@ -274,6 +303,16 @@ class ClaudeCliBackend(ModelBackend):
                     "Ensure desktop/bridge/computer_use_mcp_server.py exists, "
                     "or place it under scripts/."
                 )
+
+        # Computer use chains many slow driver calls — each screenshot /
+        # click / scroll is a separate subprocess or Quartz event costing
+        # seconds, and real tasks chain dozens. The default 900s budget
+        # cuts them off mid-step, so give local computer-use agents a
+        # larger floor. This is a FLOOR: a longer explicit timeout still
+        # wins, but a shorter one is deliberately raised — a too-short
+        # computer-use timeout just reintroduces the silent-cutoff bug.
+        if self._computer_use_mode == "local":
+            self._timeout = max(self._timeout, _COMPUTER_USE_TIMEOUT)
 
         # MCP context (set per-invocation via set_mcp_context)
         self._mcp_resolved_tools: list[dict[str, Any]] | None = None
@@ -637,6 +676,13 @@ class ClaudeCliBackend(ModelBackend):
         env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
         return env
 
+    def outer_timeout(self) -> int:
+        # Backstop above self._timeout (the per-readline / batch cap). The
+        # MCP/streaming path enforces no global total budget, so this is a
+        # heuristic ceiling — generous enough that the CLI's own timeout
+        # fires first — not a guaranteed superset.
+        return int(self._timeout * 1.5) + 300
+
     async def _generate_batch(self, cmd: list[str], prompt: str = "") -> ModelResult:
         start = time.monotonic()
         proc = await asyncio.create_subprocess_exec(
@@ -646,6 +692,7 @@ class ClaudeCliBackend(ModelBackend):
             stderr=asyncio.subprocess.PIPE,
             limit=_STREAM_LIMIT,
             env=self._isolated_env(),
+            start_new_session=True,
         )
 
         try:
@@ -654,12 +701,15 @@ class ClaudeCliBackend(ModelBackend):
                 timeout=self._timeout,
             )
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
             elapsed = time.monotonic() - start
             raise TimeoutError(
                 f"Claude CLI timed out after {elapsed:.0f}s"
             )
+        finally:
+            # Reap on every exit — graceful timeout, a CancelledError from
+            # the executor's outer wait_for, or a crash — so the CLI and
+            # its MCP grandchildren never outlive this call.
+            _kill_process_group(proc)
 
         elapsed = time.monotonic() - start
 
@@ -710,6 +760,7 @@ class ClaudeCliBackend(ModelBackend):
             stderr=asyncio.subprocess.PIPE,
             limit=_STREAM_LIMIT,
             env=self._isolated_env(),
+            start_new_session=True,
         )
 
         # Write prompt to stdin and close — CLI reads it and begins processing
@@ -874,12 +925,15 @@ class ClaudeCliBackend(ModelBackend):
             await proc.wait()
 
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
             elapsed = time.monotonic() - start
             raise TimeoutError(
                 f"Claude CLI timed out after {elapsed:.0f}s"
             )
+        finally:
+            # Reap on every exit — graceful timeout, a CancelledError from
+            # the executor's outer wait_for, or a crash — so the CLI and
+            # its computer-use MCP grandchild never outlive this call.
+            _kill_process_group(proc)
 
         elapsed = time.monotonic() - start
 

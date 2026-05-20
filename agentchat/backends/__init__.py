@@ -130,6 +130,17 @@ class ModelBackend(ABC):
             timeout=timeout,
         )
 
+    def outer_timeout(self) -> int:
+        """Seconds an executor should wait before force-cancelling a turn.
+
+        A generous backstop ABOVE the backend's own internal timeout, so
+        the backend times out gracefully (returning a real error) before
+        the executor's blunt ``asyncio.wait_for`` cancels the handler with
+        no reply. Backends with no long-running subprocess keep this modest
+        default; CLI backends override it relative to their own timeout.
+        """
+        return 300
+
     async def chat(
         self,
         system_prompt: str,

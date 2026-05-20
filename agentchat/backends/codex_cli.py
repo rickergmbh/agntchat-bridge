@@ -268,6 +268,11 @@ class CodexCliBackend(ModelBackend):
             name += f" ({self._model})"
         return name
 
+    def outer_timeout(self) -> int:
+        # Backstop above self._timeout so the executor's wait_for never
+        # pre-empts the CLI's own (graceful) timeout. See ModelBackend.
+        return int(self._timeout * 1.5) + 300
+
     # ------------------------------------------------------------------
     # Quick generation — OpenAI SDK fast path (mirrors claude_cli's Haiku path)
     # ------------------------------------------------------------------
