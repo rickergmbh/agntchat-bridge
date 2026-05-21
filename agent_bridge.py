@@ -2840,23 +2840,57 @@ async def _handle_cta_action(
 # ---------------------------------------------------------------------------
 
 _child_processes: dict[str, subprocess.Popen] = {}
+# Ids we deliberately terminated — lets the monitor thread tell an intended
+# stop from a crash. Guarded by _child_processes_lock.
+_child_intentional_stops: set[str] = set()
 _child_processes_lock = threading.Lock()
 _child_cleanup_registered = False
 
 
-def _reap_dead_children_locked() -> None:
-    """Drop tracking entries for child processes that already exited.
-    Caller must hold _child_processes_lock."""
-    for cid in [c for c, p in _child_processes.items() if p.poll() is not None]:
-        _child_processes.pop(cid, None)
+def _child_launch_cmd() -> list[str]:
+    """Command to launch a child bridge process.
+
+    Frozen/bundled (PyInstaller, Tauri sidecar): sys.executable IS the bundled
+    binary — re-invoke it directly; with no --config it runs single-agent mode
+    off the AGENT_ID/AGENT_API_KEY env vars. Plain script: run this file."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    return [sys.executable, os.path.abspath(__file__)]
+
+
+def _monitor_child(child_agent_id: str, proc: subprocess.Popen, parent_key: str) -> None:
+    """Daemon thread: wait for one child to exit, log it, reap it, untrack it.
+
+    This makes a child crash *visible* (a child that dies on a bad key or an
+    import error is logged here, not silently shown as 'running') and prevents
+    zombies — wait() reaps the process."""
+    code = proc.wait()
+    with _child_processes_lock:
+        intentional = child_agent_id in _child_intentional_stops
+        _child_intentional_stops.discard(child_agent_id)
+        # Untrack only if this exact process is still the tracked one — a
+        # respawn may already have replaced it.
+        if _child_processes.get(child_agent_id) is proc:
+            del _child_processes[child_agent_id]
+
+    if intentional or code == 0:
+        logger.info("[%s] Sub-agent %s (pid %d) exited (code %s)",
+                    parent_key, child_agent_id, proc.pid, code)
+    else:
+        logger.error("[%s] Sub-agent %s (pid %d) exited unexpectedly (code %s) — "
+                     "likely failed on startup; check its own agent log",
+                     parent_key, child_agent_id, proc.pid, code)
 
 
 def _terminate_all_children() -> None:
-    """atexit hook — stop every spawned sub-agent process when the bridge exits."""
+    """atexit hook — stop every spawned sub-agent process on a graceful bridge
+    exit. (A hard SIGKILL cannot be caught; those orphans are reaped by the
+    backend's EphemeralAgentSweeper when the parent executor goes offline.)"""
     with _child_processes_lock:
-        procs = list(_child_processes.values())
-        _child_processes.clear()
-    for proc in procs:
+        procs = list(_child_processes.items())
+        for cid, _ in procs:
+            _child_intentional_stops.add(cid)
+    for _cid, proc in procs:
         if proc.poll() is None:
             try:
                 proc.terminate()
@@ -2867,11 +2901,11 @@ def _terminate_all_children() -> None:
 def _spawn_child_executor(
     child_agent_id: str, child_api_key: str, executor_key: str, parent_key: str
 ) -> None:
-    """Launch a spawned sub-agent as its own agent_bridge.py process."""
+    """Launch a spawned sub-agent as its own bridge process. Blocking — call
+    via run_in_executor, never directly on the event loop."""
     global _child_cleanup_registered
 
     with _child_processes_lock:
-        _reap_dead_children_locked()
         existing = _child_processes.get(child_agent_id)
         if existing is not None and existing.poll() is None:
             logger.info("[%s] Sub-agent %s already running (pid %d)",
@@ -2885,7 +2919,7 @@ def _spawn_child_executor(
         env.pop("INVITE_CODE", None)
 
         try:
-            proc = subprocess.Popen([sys.executable, os.path.abspath(__file__)], env=env)
+            proc = subprocess.Popen(_child_launch_cmd(), env=env)
         except Exception as e:
             logger.error("[%s] Failed to spawn sub-agent %s: %s",
                          parent_key, child_agent_id, e)
@@ -2896,27 +2930,44 @@ def _spawn_child_executor(
             atexit.register(_terminate_all_children)
             _child_cleanup_registered = True
 
+    threading.Thread(
+        target=_monitor_child, args=(child_agent_id, proc, parent_key), daemon=True
+    ).start()
     logger.info("[%s] Spawned sub-agent %s as pid %d",
                 parent_key, child_agent_id, proc.pid)
 
 
 def _despawn_child_executor(child_agent_id: str, parent_key: str) -> None:
-    """Stop a spawned sub-agent process the bridge launched."""
+    """Stop a spawned sub-agent process. Blocking — call via run_in_executor.
+    The monitor thread does the actual reaping and untracking."""
     with _child_processes_lock:
-        proc = _child_processes.pop(child_agent_id, None)
+        proc = _child_processes.get(child_agent_id)
+        if proc is not None:
+            _child_intentional_stops.add(child_agent_id)
 
     if proc is None:
+        # Not tracked — e.g. the parent bridge restarted since the spawn. The
+        # child's own executor is disabled backend-side on retire, so it stops
+        # itself; nothing to do here.
         logger.info("[%s] Despawn: no tracked sub-agent %s", parent_key, child_agent_id)
         return
 
-    if proc.poll() is None:
-        try:
-            proc.terminate()
-        except Exception as e:
-            logger.warning("[%s] Failed to terminate sub-agent %s: %s",
-                           parent_key, child_agent_id, e)
+    if proc.poll() is not None:
+        return  # already dead; the monitor thread untracks it
 
-    logger.info("[%s] Despawned sub-agent %s", parent_key, child_agent_id)
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            logger.warning("[%s] Sub-agent %s ignored SIGTERM — killing",
+                           parent_key, child_agent_id)
+            proc.kill()
+    except Exception as e:
+        logger.warning("[%s] Failed to stop sub-agent %s: %s",
+                       parent_key, child_agent_id, e)
+
+    logger.info("[%s] Despawn signalled for sub-agent %s", parent_key, child_agent_id)
 
 
 def run_single_agent(
@@ -4373,22 +4424,32 @@ def run_single_agent(
 
     @executor.on_command
     async def handle_command(command: dict[str, Any]) -> None:
-        """Backend control directives for sub-agent spawning."""
+        """Backend control directives for sub-agent spawning.
+
+        Spawn/despawn do blocking work (subprocess fork/exec, process wait) —
+        offloaded to a worker thread so the executor's event loop (heartbeats,
+        WS, message handling) is never stalled."""
         cmd_type = command.get("type")
+        loop = asyncio.get_running_loop()
 
         if cmd_type == "spawn_executor":
             child_id = command.get("child_agent_id")
             child_key = command.get("child_api_key")
             child_exec_key = command.get("executor_key") or f"spawn-{(child_id or '')[:8]}"
             if child_id and child_key:
-                _spawn_child_executor(child_id, child_key, child_exec_key, executor_key)
+                await loop.run_in_executor(
+                    None, _spawn_child_executor,
+                    child_id, child_key, child_exec_key, executor_key,
+                )
             else:
                 logger.warning("[%s] spawn_executor missing child_agent_id/api_key", executor_key)
 
         elif cmd_type == "despawn_executor":
             child_id = command.get("child_agent_id")
             if child_id:
-                _despawn_child_executor(child_id, executor_key)
+                await loop.run_in_executor(
+                    None, _despawn_child_executor, child_id, executor_key,
+                )
             else:
                 logger.warning("[%s] despawn_executor missing child_agent_id", executor_key)
 

@@ -716,10 +716,9 @@ class ExecutorClient:
                     )
                     logger.debug("Heartbeat sent for executor %s", self._executor_id)
 
-                    # Check for pending commands
+                    # Check for pending commands (drained as a list)
                     if resp_data and isinstance(resp_data, dict):
-                        command = resp_data.get("command")
-                        if command:
+                        for command in resp_data.get("commands") or []:
                             await self._handle_command(command)
             except Exception:
                 logger.debug("Heartbeat failed, will retry next cycle")
