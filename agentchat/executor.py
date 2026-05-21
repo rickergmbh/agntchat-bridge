@@ -873,10 +873,27 @@ class ExecutorClient:
 
         except Exception as e:
             logger.exception("Task %s failed: %s", task.task_id or task.id, e)
+            # asyncio.wait_for raises TimeoutError (asyncio.TimeoutError is an
+            # alias of the builtin since Python 3.11) with an empty message —
+            # f"{type(e).__name__}: {e}" would yield a useless "TimeoutError: "
+            # with zero diagnostic. Spell out what was hit so the failure card
+            # shows a real reason. This is a backstop: the backend's own
+            # timeout normally fires first with a descriptive message.
+            if isinstance(e, TimeoutError):
+                error_text = (
+                    f"Task exceeded the {self._task_timeout}s "
+                    f"({self._task_timeout // 60}m) execution timeout "
+                    "and was aborted."
+                )
+            else:
+                detail = str(e).strip()
+                error_text = (
+                    f"{type(e).__name__}: {detail}" if detail else type(e).__name__
+                )
             try:
                 await self._invoke_fail_task(
                     task.task_id or task.id,
-                    error_text=f"{type(e).__name__}: {e}",
+                    error_text=error_text,
                 )
             except Exception:
                 logger.exception(

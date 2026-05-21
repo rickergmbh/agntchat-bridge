@@ -3100,15 +3100,20 @@ def run_single_agent(
     except Exception as e:
         logger.debug("[%s] Directive warm-up failed (non-fatal): %s", executor_key, e)
 
-    # The executor's message_timeout is a blunt asyncio.wait_for that
-    # cancels the handler with no error and no reply. The backend owns the
-    # sizing via outer_timeout() — a backstop ABOVE its own internal
-    # timeout, so the backend times out gracefully (returning a real error
-    # the bridge can post) before the wait_for fires. Computer-use agents
-    # carry a larger backend timeout, which outer_timeout() reflects.
-    _message_timeout = backend.outer_timeout()
+    # The executor wraps BOTH message handlers and task handlers in a blunt
+    # asyncio.wait_for that cancels the handler with no error and no reply.
+    # The backend owns the sizing via outer_timeout() — a backstop ABOVE its
+    # own internal timeout, so the backend times out gracefully (returning a
+    # real error the bridge can post) before the wait_for fires. Computer-use
+    # agents carry a larger backend timeout, which outer_timeout() reflects.
+    #
+    # task_timeout must use the SAME sizing: left at the bare 1800s default
+    # it exactly tied the computer-use backend's internal 1800s timeout and
+    # won the race, so the blunt wait_for fired first and surfaced an empty
+    # "TimeoutError:" instead of the backend's descriptive message.
+    _executor_timeout = backend.outer_timeout()
     logger.info(
-        "[%s] Executor message_timeout=%ds", executor_key, _message_timeout,
+        "[%s] Executor handler timeout=%ds", executor_key, _executor_timeout,
     )
 
     # Create executor
@@ -3121,7 +3126,8 @@ def run_single_agent(
         capabilities=agent_capabilities or [],
         max_concurrent=max_concurrent,
         poll_wait=POLL_WAIT,
-        message_timeout=_message_timeout,
+        message_timeout=_executor_timeout,
+        task_timeout=_executor_timeout,
     )
 
     # --- Tool-use mode setup ---
