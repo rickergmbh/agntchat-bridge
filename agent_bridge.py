@@ -2840,9 +2840,11 @@ async def _handle_cta_action(
 # ---------------------------------------------------------------------------
 
 _child_processes: dict[str, subprocess.Popen] = {}
-# Ids we deliberately terminated — lets the monitor thread tell an intended
-# stop from a crash. Guarded by _child_processes_lock.
-_child_intentional_stops: set[str] = set()
+# Processes we deliberately terminated — lets the monitor thread tell an
+# intended stop from a crash. Keyed on the Popen object (not the agent id) so
+# a crash that races a despawn, or a respawn reusing the same agent id, can
+# never mislabel the wrong process. Guarded by _child_processes_lock.
+_child_intentional_stops: set[subprocess.Popen] = set()
 _child_processes_lock = threading.Lock()
 _child_cleanup_registered = False
 
@@ -2866,8 +2868,8 @@ def _monitor_child(child_agent_id: str, proc: subprocess.Popen, parent_key: str)
     zombies — wait() reaps the process."""
     code = proc.wait()
     with _child_processes_lock:
-        intentional = child_agent_id in _child_intentional_stops
-        _child_intentional_stops.discard(child_agent_id)
+        intentional = proc in _child_intentional_stops
+        _child_intentional_stops.discard(proc)
         # Untrack only if this exact process is still the tracked one — a
         # respawn may already have replaced it.
         if _child_processes.get(child_agent_id) is proc:
@@ -2887,10 +2889,10 @@ def _terminate_all_children() -> None:
     exit. (A hard SIGKILL cannot be caught; those orphans are reaped by the
     backend's EphemeralAgentSweeper when the parent executor goes offline.)"""
     with _child_processes_lock:
-        procs = list(_child_processes.items())
-        for cid, _ in procs:
-            _child_intentional_stops.add(cid)
-    for _cid, proc in procs:
+        procs = list(_child_processes.values())
+        for proc in procs:
+            _child_intentional_stops.add(proc)
+    for proc in procs:
         if proc.poll() is None:
             try:
                 proc.terminate()
@@ -2943,7 +2945,7 @@ def _despawn_child_executor(child_agent_id: str, parent_key: str) -> None:
     with _child_processes_lock:
         proc = _child_processes.get(child_agent_id)
         if proc is not None:
-            _child_intentional_stops.add(child_agent_id)
+            _child_intentional_stops.add(proc)
 
     if proc is None:
         # Not tracked — e.g. the parent bridge restarted since the spawn. The
