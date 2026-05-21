@@ -38,11 +38,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import json
 import logging
 import os
 import re
+import subprocess
 import sys
+import threading
 import uuid
 from typing import Any
 
@@ -2828,6 +2831,94 @@ async def _handle_cta_action(
     return None
 
 
+# ---------------------------------------------------------------------------
+# Sub-agent runtime — spawn / despawn child executor processes on backend
+# directive. The backend's spawn_sub_agent tool decides whether and where a
+# sub-agent runs; the bridge is a dumb pipe that just launches/stops the
+# process. A spawned child is a normal single-agent agent_bridge.py process
+# that bootstraps itself from its own backend record.
+# ---------------------------------------------------------------------------
+
+_child_processes: dict[str, subprocess.Popen] = {}
+_child_processes_lock = threading.Lock()
+_child_cleanup_registered = False
+
+
+def _reap_dead_children_locked() -> None:
+    """Drop tracking entries for child processes that already exited.
+    Caller must hold _child_processes_lock."""
+    for cid in [c for c, p in _child_processes.items() if p.poll() is not None]:
+        _child_processes.pop(cid, None)
+
+
+def _terminate_all_children() -> None:
+    """atexit hook — stop every spawned sub-agent process when the bridge exits."""
+    with _child_processes_lock:
+        procs = list(_child_processes.values())
+        _child_processes.clear()
+    for proc in procs:
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+
+def _spawn_child_executor(
+    child_agent_id: str, child_api_key: str, executor_key: str, parent_key: str
+) -> None:
+    """Launch a spawned sub-agent as its own agent_bridge.py process."""
+    global _child_cleanup_registered
+
+    with _child_processes_lock:
+        _reap_dead_children_locked()
+        existing = _child_processes.get(child_agent_id)
+        if existing is not None and existing.poll() is None:
+            logger.info("[%s] Sub-agent %s already running (pid %d)",
+                        parent_key, child_agent_id, existing.pid)
+            return
+
+        env = dict(os.environ)
+        env["AGENT_ID"] = child_agent_id
+        env["AGENT_API_KEY"] = child_api_key
+        env["EXECUTOR_KEY"] = executor_key
+        env.pop("INVITE_CODE", None)
+
+        try:
+            proc = subprocess.Popen([sys.executable, os.path.abspath(__file__)], env=env)
+        except Exception as e:
+            logger.error("[%s] Failed to spawn sub-agent %s: %s",
+                         parent_key, child_agent_id, e)
+            return
+
+        _child_processes[child_agent_id] = proc
+        if not _child_cleanup_registered:
+            atexit.register(_terminate_all_children)
+            _child_cleanup_registered = True
+
+    logger.info("[%s] Spawned sub-agent %s as pid %d",
+                parent_key, child_agent_id, proc.pid)
+
+
+def _despawn_child_executor(child_agent_id: str, parent_key: str) -> None:
+    """Stop a spawned sub-agent process the bridge launched."""
+    with _child_processes_lock:
+        proc = _child_processes.pop(child_agent_id, None)
+
+    if proc is None:
+        logger.info("[%s] Despawn: no tracked sub-agent %s", parent_key, child_agent_id)
+        return
+
+    if proc.poll() is None:
+        try:
+            proc.terminate()
+        except Exception as e:
+            logger.warning("[%s] Failed to terminate sub-agent %s: %s",
+                           parent_key, child_agent_id, e)
+
+    logger.info("[%s] Despawned sub-agent %s", parent_key, child_agent_id)
+
+
 def run_single_agent(
     agent_id: str,
     api_key: str,
@@ -4279,6 +4370,30 @@ def run_single_agent(
         result: dict[str, Any] = {"title": title, "description": sr.content}
         logger.info("[%s] Scope response: title=%s", executor_key, title)
         return result
+
+    @executor.on_command
+    async def handle_command(command: dict[str, Any]) -> None:
+        """Backend control directives for sub-agent spawning."""
+        cmd_type = command.get("type")
+
+        if cmd_type == "spawn_executor":
+            child_id = command.get("child_agent_id")
+            child_key = command.get("child_api_key")
+            child_exec_key = command.get("executor_key") or f"spawn-{(child_id or '')[:8]}"
+            if child_id and child_key:
+                _spawn_child_executor(child_id, child_key, child_exec_key, executor_key)
+            else:
+                logger.warning("[%s] spawn_executor missing child_agent_id/api_key", executor_key)
+
+        elif cmd_type == "despawn_executor":
+            child_id = command.get("child_agent_id")
+            if child_id:
+                _despawn_child_executor(child_id, executor_key)
+            else:
+                logger.warning("[%s] despawn_executor missing child_agent_id", executor_key)
+
+        else:
+            logger.info("[%s] Unhandled command type: %s", executor_key, cmd_type)
 
     logger.info("[%s] Starting agent bridge for %s", executor_key, agent_id)
     logger.info("[%s] API: %s | Model: %s", executor_key, AGENTGRAM_API_URL, backend.model_name)

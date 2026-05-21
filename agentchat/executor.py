@@ -193,6 +193,7 @@ TaskHandler = Callable[[GatewayTask], Awaitable[Union[Dict[str, Any], str, None]
 MessageHandler = Callable[[GatewayMessage], Awaitable[Union[str, None]]]
 TaskCompletedHandler = Callable[[Dict[str, Any]], Awaitable[None]]
 ScopeRequestHandler = Callable[["ScopeRequest"], Awaitable[Optional[Dict[str, Any]]]]
+CommandHandler = Callable[[Dict[str, Any]], Awaitable[None]]
 
 
 class ExecutorClient:
@@ -240,6 +241,9 @@ class ExecutorClient:
         self._message_handler: MessageHandler | None = None
         self._scope_request_handler: ScopeRequestHandler | None = None
         self._task_completed_handlers: list[TaskCompletedHandler] = []
+        # Handles backend control directives other than `shutdown` (which the
+        # client handles itself) — e.g. sub-agent spawn/despawn.
+        self._command_handler: CommandHandler | None = None
         # Per-turn cleanups, keyed by gateway message id. Run in _handle_message's
         # finally so handler-registered teardown (e.g. terminating a streaming
         # bubble) still happens when a mid-flight cancel skips the handler's own.
@@ -314,6 +318,16 @@ class ExecutorClient:
         title, description, and optionally scope_message, or None to skip.
         """
         self._scope_request_handler = handler
+        return handler
+
+    def on_command(self, handler: CommandHandler) -> CommandHandler:
+        """Register a handler for backend control directives.
+
+        The handler receives the raw command dict for every command type
+        except `shutdown` (which the client always handles itself). Used for
+        sub-agent spawn/despawn directives.
+        """
+        self._command_handler = handler
         return handler
 
     def on_task_completed(self, handler: TaskCompletedHandler) -> TaskCompletedHandler:
@@ -718,6 +732,11 @@ class ExecutorClient:
         if cmd_type == "shutdown":
             logger.warning("Shutdown command received (reason: %s). Stopping executor.", reason)
             await self.stop()
+        elif self._command_handler is not None:
+            try:
+                await self._command_handler(command)
+            except Exception:
+                logger.exception("Command handler failed for type %s", cmd_type)
         else:
             logger.info("Unknown command type: %s", cmd_type)
 
