@@ -2901,10 +2901,15 @@ def _terminate_all_children() -> None:
 
 
 def _spawn_child_executor(
-    child_agent_id: str, child_api_key: str, executor_key: str, parent_key: str
+    child_agent_id: str, child_api_key: str, executor_key: str, parent_key: str,
+    skip_permissions: bool = False,
 ) -> None:
     """Launch a spawned sub-agent as its own bridge process. Blocking — call
-    via run_in_executor, never directly on the event loop."""
+    via run_in_executor, never directly on the event loop.
+
+    skip_permissions inherits the parent's --dangerously-skip-permissions so a
+    helper doesn't stall on an interactive sandbox-approval prompt it can't
+    answer (skip-permissions is a CLI flag, not part of the backend record)."""
     global _child_cleanup_registered
 
     with _child_processes_lock:
@@ -2920,8 +2925,12 @@ def _spawn_child_executor(
         env["EXECUTOR_KEY"] = executor_key
         env.pop("INVITE_CODE", None)
 
+        cmd = _child_launch_cmd()
+        if skip_permissions:
+            cmd = cmd + ["--dangerously-skip-permissions"]
+
         try:
-            proc = subprocess.Popen(_child_launch_cmd(), env=env)
+            proc = subprocess.Popen(cmd, env=env)
         except Exception as e:
             logger.error("[%s] Failed to spawn sub-agent %s: %s",
                          parent_key, child_agent_id, e)
@@ -4439,9 +4448,15 @@ def run_single_agent(
             child_key = command.get("child_api_key")
             child_exec_key = command.get("executor_key") or f"spawn-{(child_id or '')[:8]}"
             if child_id and child_key:
+                # A spawned helper inherits the parent's skip-permissions so
+                # its code sandbox doesn't stall on an interactive approval.
+                skip_perms = bool(
+                    args.dangerously_skip_permissions
+                    or agent_config.get("dangerously_skip_permissions")
+                )
                 await loop.run_in_executor(
                     None, _spawn_child_executor,
-                    child_id, child_key, child_exec_key, executor_key,
+                    child_id, child_key, child_exec_key, executor_key, skip_perms,
                 )
             else:
                 logger.warning("[%s] spawn_executor missing child_agent_id/api_key", executor_key)
