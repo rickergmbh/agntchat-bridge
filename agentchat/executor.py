@@ -117,6 +117,11 @@ class GatewayMessage:
     # and creates a self-task directly so the work runs in a focused
     # sub-conversation instead of inline.
     message_triage: dict[str, Any] | None = None
+    # The active Task this message is being processed under, when it arrives
+    # inside a task work conversation. The backend serializes `activeTaskId`
+    # on queued messages so the bridge can thread it into tool context — this
+    # is what lets a spawned sub-agent's complete-task resolve the right task.
+    active_task_id: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -144,6 +149,7 @@ class GatewayMessage:
             recent_messages=d.get("recentMessages") or [],
             latest_seen_message_id=d.get("latestSeenMessageId"),
             message_triage=d.get("messageTriage"),
+            active_task_id=d.get("activeTaskId"),
             raw=d,
         )
 

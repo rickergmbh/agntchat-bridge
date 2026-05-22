@@ -4006,6 +4006,7 @@ def run_single_agent(
         freshness_anchor = msg.latest_seen_message_id or msg.message_id or ""
         _update_mcp_context(
             msg.conversation_id or "",
+            task_id=msg.active_task_id or "",
             source_message_id=msg.message_id or "",
             last_seen_message_id=freshness_anchor,
         )
@@ -4013,10 +4014,15 @@ def run_single_agent(
         presentations: list[dict[str, Any]] = []
 
         if execution_mode == "tool_use" and _tool_defs:
+            # When the message arrives inside a task work conversation the
+            # backend stamps `activeTaskId`; thread it into tool context so
+            # placeholder task_id auto-injection (and source classification)
+            # resolve the right task — the fix for issue #44.
             tool_context = {
                 "conversation_id": msg.conversation_id,
+                "task_id": msg.active_task_id,
                 "owner_id": agent_owner_id,
-                "source_type": "message",
+                "source_type": "task" if msg.active_task_id else "message",
                 "source_message_id": msg.message_id or "",
                 "last_seen_message_id": freshness_anchor,
             }

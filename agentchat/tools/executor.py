@@ -78,6 +78,41 @@ def _is_placeholder_conv_id(value: Any) -> bool:
     return normalized in _CONV_ID_PLACEHOLDERS
 
 
+# Strings the LLM hands back when it means "the task I'm working on" without
+# substituting the real Task UUID. Anything in this set (case-insensitive,
+# stripped of surrounding angle brackets) triggers task_id injection from the
+# bridge's ambient context. This is the task-id analogue of
+# `_CONV_ID_PLACEHOLDERS` — without it, a model that passes "CURRENT_TASK"
+# instead of the real UUID gets rejected by the backend as a non-UUID, which
+# is exactly the failure mode behind issue #44 for spawned sub-agents.
+_TASK_ID_PLACEHOLDERS = frozenset({
+    "",
+    "current",
+    "current_task",
+    "task",
+    "task_id",
+    "this",
+    "this_task",
+})
+
+
+def _is_placeholder_task_id(value: Any) -> bool:
+    """True when `value` looks like a placeholder rather than a real Task UUID.
+
+    Recognizes the empty/missing case, `{{task_id}}`-style template tokens,
+    and bare sentinels like "current" / "current_task" / "<task_id>".
+    Mirrors `_is_placeholder_conv_id` for the task-id auto-injection path.
+    """
+    if value is None:
+        return True
+    if not isinstance(value, str):
+        return False
+    if value.startswith("{{"):
+        return True
+    normalized = value.strip().strip("<>").lower()
+    return normalized in _TASK_ID_PLACEHOLDERS
+
+
 def _sanitize_tool_output(text: str) -> str:
     """Remove canvas-card injection vectors from tool output.
 
@@ -207,10 +242,17 @@ class ToolExecutor:
             if not arguments.get("user_id"):
                 arguments["user_id"] = self._context.get("owner_id")
 
-        # Auto-inject task_id from context (for report_progress during task execution)
+        # Auto-inject task_id from context (for report_progress / complete_task
+        # during task execution). Replace the arg whenever the LLM left it
+        # empty OR handed back a placeholder like "CURRENT_TASK" / "{{task_id}}"
+        # — the backend rejects non-UUID task ids, so an uncorrected
+        # placeholder breaks complete-task for spawned sub-agents (issue #44).
+        # A real, non-placeholder task_id the LLM supplied is left untouched so
+        # cross-task delegation still works.
         if "task_id" in param_names:
-            if not arguments.get("task_id"):
-                arguments["task_id"] = self._context.get("task_id")
+            ctx_task_id = self._context.get("task_id")
+            if ctx_task_id and _is_placeholder_task_id(arguments.get("task_id")):
+                arguments["task_id"] = ctx_task_id
 
         # Auto-inject source_conversation_id for DM creation so the relay directive fires.
         if executor_method == "find_or_create_dm":
