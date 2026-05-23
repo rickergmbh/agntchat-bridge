@@ -777,6 +777,7 @@ class ClaudeCliBackend(ModelBackend):
 
         _result_error_subtype = ""  # populated from result event if is_error=True
         _result_subtype = ""  # result event's subtype, captured for every result
+        _result_is_error = False  # result event's is_error flag
         # Inner-loop visibility: the CLI subprocess runs its own agentic loop
         # when MCP tools are in play. Capture each tool_use block it emits and
         # the final num_turns so the outer bridge can log real counts instead
@@ -794,7 +795,7 @@ class ClaudeCliBackend(ModelBackend):
 
         try:
             async def read_stream():
-                nonlocal result_text, _last_delta_time, _accumulated_text, _result_error_subtype, _result_subtype, _num_turns
+                nonlocal result_text, _last_delta_time, _accumulated_text, _result_error_subtype, _result_subtype, _result_is_error, _num_turns
                 nonlocal _active_tool_use
                 assert proc.stdout is not None
                 while True:
@@ -821,6 +822,7 @@ class ClaudeCliBackend(ModelBackend):
                         result_text = event.get("result", "")
                         _num_turns = int(event.get("num_turns") or 0)
                         _result_subtype = event.get("subtype", "")
+                        _result_is_error = bool(event.get("is_error"))
                         # Detect error results (max_turns, permission denied, etc.)
                         if event.get("is_error"):
                             _result_error_subtype = event.get("subtype", "unknown_error")
@@ -946,19 +948,38 @@ class ClaudeCliBackend(ModelBackend):
             # The CLI process can exit nonzero *after* emitting a successful
             # result event — teardown noise (a post-run hook, an MCP server
             # shutdown). The result event is the authoritative completion
-            # signal: if the agentic run reported subtype=success, honor it
-            # instead of throwing away a task whose work actually finished.
-            if _result_subtype == "success":
+            # signal: if the agentic run reported subtype=success AND the CLI
+            # itself didn't flag is_error, honor it instead of throwing away a
+            # task whose work actually finished.
+            #
+            # `is_error=True` with `subtype=success` is anomalous but real —
+            # we have seen it from `awsAuthRefresh` failures where the CLI
+            # emits the error message as `result.result` and marks the event
+            # as errored. Treating that as success masks a real auth failure
+            # behind a bogus "complete" with the error string as the
+            # deliverable. Trust `is_error` and fail loudly instead.
+            if _result_subtype == "success" and not _result_is_error:
                 logger.warning(
-                    "Claude CLI exit code %d but result subtype=success — "
-                    "honoring the result event, treating the run as successful. stderr=%s",
+                    "Claude CLI exit code %d but result subtype=success "
+                    "(is_error=False) — honoring the result event, treating "
+                    "the run as successful. stderr=%s",
                     proc.returncode,
                     err_msg[:200] if err_msg else "(empty)",
                 )
             else:
-                # Use the result event's error subtype if available (more specific
-                # than stderr, which is often empty for max_turns/permission errors)
-                detail = _result_error_subtype or err_msg or "unknown error"
+                # When the CLI flagged is_error but subtype is success, the
+                # subtype is misleading — `result_text` carries the actual
+                # error (e.g. "API Error: Could not load credentials..."), so
+                # prefer that as the detail. Otherwise fall back to the
+                # error subtype, then stderr.
+                anomalous_success = _result_subtype == "success" and _result_is_error
+                if anomalous_success and result_text:
+                    detail = result_text
+                else:
+                    # Use the result event's error subtype if available (more
+                    # specific than stderr, which is often empty for
+                    # max_turns/permission errors)
+                    detail = _result_error_subtype or err_msg or "unknown error"
                 # In streaming mode, result_text is empty until the final "result"
                 # event. If the CLI crashes before that, _accumulated_text has the
                 # partial output.

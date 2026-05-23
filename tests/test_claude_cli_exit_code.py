@@ -37,14 +37,20 @@ async def _noop_progress(_event):
 
 
 @pytest.mark.asyncio
-async def test_exit_nonzero_with_success_subtype_is_honored():
-    """returncode=1 but result subtype=success → treated as a successful run."""
+async def test_exit_nonzero_with_clean_success_is_honored():
+    """returncode=1, subtype=success, is_error=False → treated as success.
+
+    This is the teardown-noise case the original commit aimed at: the
+    agentic run finished cleanly, the result event carries the full output,
+    and only the process exit code is wrong (a post-run hook or MCP server
+    cleanup failed). The bridge honors the result event.
+    """
     backend = _backend()
     cmd = _fake_cli(
         {
             "type": "result",
             "subtype": "success",
-            "is_error": True,
+            "is_error": False,
             "result": "work finished",
             "num_turns": 1,
         },
@@ -54,6 +60,32 @@ async def test_exit_nonzero_with_success_subtype_is_honored():
     result = await backend._generate_streaming(cmd, _noop_progress, prompt="")
 
     assert result.text == "work finished"
+
+
+@pytest.mark.asyncio
+async def test_exit_nonzero_with_subtype_success_but_is_error_still_raises():
+    """returncode=1, subtype=success, is_error=True → raise, with result_text as detail.
+
+    Anomalous but real: the awsAuthRefresh failure path emits the error
+    message as `result.result` and marks the event `is_error=True` while
+    leaving `subtype="success"`. Honoring success here would mask the auth
+    failure behind a fake "complete." Trust is_error; raise with the actual
+    error text as the message detail.
+    """
+    backend = _backend()
+    cmd = _fake_cli(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "result": "API Error: Could not load credentials from any providers",
+            "num_turns": 1,
+        },
+        exit_code=1,
+    )
+
+    with pytest.raises(RuntimeError, match="Could not load credentials"):
+        await backend._generate_streaming(cmd, _noop_progress, prompt="")
 
 
 @pytest.mark.asyncio
