@@ -8,7 +8,7 @@ import logging
 from typing import Any, Callable, Awaitable
 
 from .auth import TokenManager
-from .errors import ConnectionError
+from .errors import AuthError, ConnectionError
 from .models import Conversation, Message
 from .rest import RestClient
 from .transport import PhoenixTransport
@@ -589,6 +589,14 @@ class AgentChatClient:
 
     async def _reconnect_loop(self) -> None:
         """Monitor connection via disconnect events and reconnect with exponential backoff."""
+        # Treat persistent auth failures (e.g., the bridge's API key /
+        # delegation token expired) as terminal — exit the process so
+        # the supervising parent (Tauri's process_manager OR the org
+        # host's BridgeSupervisor) restarts us with fresh credentials.
+        # Without this, an expired delegation token loops forever with
+        # logs but no recovery.
+        _AUTH_GIVEUP_AFTER = 3
+
         try:
             while self._connected:
                 # Wait for disconnect signal instead of polling
@@ -601,6 +609,7 @@ class AgentChatClient:
 
                 logger.warning("Disconnect detected — starting reconnect")
                 backoff = _RECONNECT_BASE
+                consecutive_auth_failures = 0
                 while self._connected:
                     logger.info(f"Reconnecting in {backoff}s...")
                     await asyncio.sleep(backoff)
@@ -621,7 +630,27 @@ class AgentChatClient:
 
                         await self.refresh_trust()
                         logger.info("Reconnected successfully")
+                        consecutive_auth_failures = 0
                         break
+                    except AuthError as exc:
+                        consecutive_auth_failures += 1
+                        logger.warning(
+                            "Reconnect auth error (%d/%d): %s",
+                            consecutive_auth_failures,
+                            _AUTH_GIVEUP_AFTER,
+                            exc,
+                        )
+                        if consecutive_auth_failures >= _AUTH_GIVEUP_AFTER:
+                            logger.error(
+                                "Auth keeps failing — exiting so the supervisor "
+                                "respawns us with a fresh delegation token"
+                            )
+                            # Exit hard from the reconnect task. The main
+                            # event loop will surface the unhandled task
+                            # exception; supervisor sees rc != 0.
+                            import os
+                            os._exit(2)
+                        backoff = min(backoff * 2, _RECONNECT_MAX)
                     except Exception:
                         logger.exception("Reconnect attempt failed")
                         backoff = min(backoff * 2, _RECONNECT_MAX)
