@@ -588,6 +588,22 @@ class CodexCliBackend(ModelBackend):
 
                 etype = event.get("type", "")
 
+                # Codex's --json stream surfaces fatal config / model errors
+                # as `{"type":"error",...}` events, then exits non-zero with
+                # empty stderr. Without explicit logging, the post-exit
+                # "exit code 1: unknown error" wrapper had nothing to attach
+                # — an invalid model id or rejected -c override looked
+                # identical to a real crash.
+                if etype == "error":
+                    err_msg = (
+                        event.get("message")
+                        or event.get("error")
+                        or json.dumps(event)
+                    )
+                    logger.error("Codex CLI emitted error event: %s", err_msg)
+                    agent_messages.append(f"[codex error] {err_msg}")
+                    continue
+
                 if etype == "thread.started":
                     thread_id = event.get("thread_id")
                 elif etype == "turn.started":
