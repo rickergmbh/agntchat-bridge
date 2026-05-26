@@ -63,6 +63,108 @@ _COMPUTER_USE_TIMEOUT = 1800  # 30 minutes — computer use chains many slow dri
 _STREAM_LIMIT = 10 * 1024 * 1024  # 10 MB — CLI can emit large JSON lines
 
 
+def _detect_cli_runtime() -> str:
+    """Returns "bedrock" | "vertex" | "anthropic".
+
+    Mirrors agent_bridge._detect_cli_connection but lives here so the
+    backend can translate model IDs without taking a dependency on the
+    bridge entrypoint module. Reads process env first, then OS-managed
+    settings, then user settings — same order/priority as the CLI itself.
+    """
+    import json
+    import sys
+    from pathlib import Path
+
+    def _truthy(v: Any) -> bool:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return bool(v)
+        if isinstance(v, str):
+            return v.strip().lower() in ("1", "true", "yes", "on")
+        return False
+
+    def _check_env(env: dict[str, Any]) -> str | None:
+        if _truthy(env.get("CLAUDE_CODE_USE_BEDROCK")):
+            return "bedrock"
+        if _truthy(env.get("CLAUDE_CODE_USE_VERTEX")):
+            return "vertex"
+        return None
+
+    def _read_json(path: Path) -> dict[str, Any] | None:
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, PermissionError, json.JSONDecodeError, OSError):
+            return None
+
+    found = _check_env(dict(os.environ))
+    if found:
+        return found
+
+    managed_paths: list[Path] = []
+    if sys.platform == "darwin":
+        managed_paths.append(Path("/Library/Application Support/ClaudeCode/managed-settings.json"))
+    elif sys.platform.startswith("linux"):
+        managed_paths.append(Path("/etc/claude-code/managed-settings.json"))
+    elif sys.platform == "win32":
+        managed_paths.append(Path(r"C:\ProgramData\ClaudeCode\managed-settings.json"))
+
+    for path in managed_paths:
+        cfg = _read_json(path)
+        if cfg:
+            found = _check_env(cfg.get("env", {}) or {})
+            if found:
+                return found
+
+    user_settings = _read_json(Path.home() / ".claude" / "settings.json")
+    if user_settings:
+        found = _check_env(user_settings.get("env", {}) or {})
+        if found:
+            return found
+
+    return "anthropic"
+
+
+# Detected once at module load. Used to translate the bare model ID the
+# backend stores (e.g. "claude-opus-4-1-20250805") into the cross-region
+# inference profile ID the runtime expects ("us.anthropic.claude-opus-4-1-
+# 20250805-v1:0" on Bedrock).
+_CLI_RUNTIME: str = _detect_cli_runtime()
+
+
+def _translate_model_for_cli_runtime(model: str) -> str:
+    """Rewrite a bare catalog model ID into the format the local CLI runtime
+    expects.
+
+    Bedrock requires cross-region inference profile IDs prefixed with the
+    region group (`us.`, `eu.`, etc.) and suffixed `-v1:0`. The CLI does
+    NOT auto-translate when given a bare Anthropic ID — it forwards the
+    string as-is and Bedrock 400s.
+
+    Pass-through cases:
+      - already-translated IDs (start with `us.`/`eu.`/`apac.`/`anthropic.`
+        or contain `:`)
+      - the user's own settings format (e.g. `[1m]` 1M-context variants)
+      - non-Bedrock runtimes
+    """
+    if _CLI_RUNTIME != "bedrock":
+        return model
+    # Already a Bedrock ID — don't double-prefix.
+    if (
+        model.startswith(("us.", "eu.", "apac.", "anthropic."))
+        or ":" in model
+        or model.endswith("-v1:0")
+    ):
+        return model
+    # Bare bracket variants like `claude-opus-4-7[1m]` are user-facing
+    # Anthropic-only syntax — leave them alone; the CLI will reject them
+    # on Bedrock and the runtime_warning will steer the user away.
+    if "[" in model:
+        return model
+    return f"us.anthropic.{model}-v1:0"
+
+
 def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
     """Best-effort SIGKILL of a subprocess and its entire process group.
 
@@ -570,7 +672,7 @@ class ClaudeCliBackend(ModelBackend):
         if self._max_tokens:
             cmd.extend(["--settings", json.dumps({"maxOutputTokens": self._max_tokens})])
         if self._model:
-            cmd.extend(["--model", self._model])
+            cmd.extend(["--model", _translate_model_for_cli_runtime(self._model)])
         if self._skip_permissions:
             cmd.append("--dangerously-skip-permissions")
         if self._effort:
