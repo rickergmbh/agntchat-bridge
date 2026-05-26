@@ -367,10 +367,25 @@ async def _warm_up_directives(
 
 
 async def _sync_model_config(
-    base_url: str, agent_id: str, api_key: str, model_config: dict[str, Any]
+    base_url: str,
+    agent_id: str,
+    api_key: str,
+    model_config: dict[str, Any],
+    cli_connection: str | None = None,
 ) -> None:
-    """PATCH the agent's model_config so the mobile app can display the model label."""
+    """PATCH the agent's model_config so the mobile app can display the model label.
+
+    `cli_connection` is the runtime the local Claude CLI is talking to
+    ("anthropic" / "bedrock" / "vertex"), detected at bridge boot. The
+    backend uses it to compute a runtime_warning if the agent's saved
+    model isn't supported there, and to filter the model dropdown in
+    clients. Pass None for non-CLI backends.
+    """
     import httpx
+
+    payload: dict[str, Any] = {"model_config": model_config}
+    if cli_connection:
+        payload["cli_connection"] = cli_connection
 
     tm = TokenManager(base_url, agent_id, api_key)
     token = await tm.get_token()
@@ -378,9 +393,91 @@ async def _sync_model_config(
         resp = await client.patch(
             f"{base_url.rstrip('/')}/api/agents/me/model-config",
             headers={"Authorization": f"Bearer {token}"},
-            json={"model_config": model_config},
+            json=payload,
         )
         resp.raise_for_status()
+
+
+def _detect_cli_connection() -> str | None:
+    """Detect which Claude/Codex CLI runtime is configured on this host.
+
+    Returns "anthropic" | "bedrock" | "vertex" | None.
+
+    Checks (in priority order):
+      1. Process env (highest priority — explicit user override)
+      2. OS-managed settings (`/Library/Application Support/ClaudeCode/managed-settings.json`
+         on macOS, `/etc/claude-code/managed-settings.json` on Linux,
+         `C:\\ProgramData\\ClaudeCode\\managed-settings.json` on Windows).
+         The Claude CLI loads this file itself on each spawn, so its `env`
+         block reaches the CLI even when the bridge subprocess env doesn't
+         contain those vars — that's how EA's enforced Bedrock config slips
+         past `ps -E` on Mac. Read it directly here so we report the same
+         runtime the CLI will actually use.
+      3. User settings (`~/.claude/settings.json`).
+
+    Returns None when no CLI runtime indicator is found — callers should
+    treat that as "anthropic" (the default) but skip reporting it so the
+    backend keeps whatever it had on record.
+    """
+    import json
+    import sys
+    from pathlib import Path
+
+    def _truthy(v: Any) -> bool:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return bool(v)
+        if isinstance(v, str):
+            return v.strip().lower() in ("1", "true", "yes", "on")
+        return False
+
+    def _check_env(env: dict[str, Any]) -> str | None:
+        if _truthy(env.get("CLAUDE_CODE_USE_BEDROCK")):
+            return "bedrock"
+        if _truthy(env.get("CLAUDE_CODE_USE_VERTEX")):
+            return "vertex"
+        return None
+
+    def _read_json(path: Path) -> dict[str, Any] | None:
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, PermissionError, json.JSONDecodeError, OSError):
+            return None
+
+    # 1. Process env
+    found = _check_env(dict(os.environ))
+    if found:
+        return found
+
+    # 2. Managed-settings (per-platform)
+    managed_paths: list[Path] = []
+    if sys.platform == "darwin":
+        managed_paths.append(Path("/Library/Application Support/ClaudeCode/managed-settings.json"))
+    elif sys.platform.startswith("linux"):
+        managed_paths.append(Path("/etc/claude-code/managed-settings.json"))
+    elif sys.platform == "win32":
+        managed_paths.append(Path(r"C:\ProgramData\ClaudeCode\managed-settings.json"))
+
+    for path in managed_paths:
+        cfg = _read_json(path)
+        if cfg:
+            found = _check_env(cfg.get("env", {}) or {})
+            if found:
+                return found
+
+    # 3. User settings
+    user_settings = _read_json(Path.home() / ".claude" / "settings.json")
+    if user_settings:
+        found = _check_env(user_settings.get("env", {}) or {})
+        if found:
+            return found
+
+    # Fallback: if no Bedrock/Vertex marker anywhere, assume direct
+    # Anthropic. Returning "anthropic" (rather than None) lets the backend
+    # clear any stale value left over from a previous host.
+    return "anthropic"
 
 
 def extract_agent_config(profile: dict[str, Any] | None) -> dict[str, Any]:
@@ -3117,6 +3214,12 @@ def run_single_agent(
 
     # Model config sync
     sync_backend_name = effective_backend or os.getenv("MODEL_BACKEND", "anthropic")
+    # Only matters for CLI backends — we detect once at boot and report on
+    # every sync so the backend can recompute runtime_warning whenever the
+    # model changes. Stale value self-heals on next bridge boot.
+    cli_connection = _detect_cli_connection() if sync_backend_name in ("claude_cli", "codex_cli") else None
+    if cli_connection:
+        logger.info("[%s] Detected CLI runtime: %s", executor_key, cli_connection)
     _last_synced_model: str | None = None
 
     def _do_sync(model: str | None) -> None:
@@ -3129,7 +3232,11 @@ def run_single_agent(
         if not config:
             return
         try:
-            asyncio.run(_sync_model_config(AGENTGRAM_API_URL, agent_id, api_key, config))
+            asyncio.run(
+                _sync_model_config(
+                    AGENTGRAM_API_URL, agent_id, api_key, config, cli_connection
+                )
+            )
             _last_synced_model = model
             logger.info("[%s] Synced model config: %s", executor_key, config)
         except Exception as e:
@@ -3142,7 +3249,9 @@ def run_single_agent(
                 config: dict[str, Any] = {"model": result_model}
                 if sync_backend_name:
                     config["backend"] = sync_backend_name
-                await _sync_model_config(AGENTGRAM_API_URL, agent_id, api_key, config)
+                await _sync_model_config(
+                    AGENTGRAM_API_URL, agent_id, api_key, config, cli_connection
+                )
                 _last_synced_model = result_model
                 logger.info("[%s] Model changed → synced: %s", executor_key, result_model)
             except Exception as e:
