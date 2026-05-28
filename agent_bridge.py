@@ -2011,6 +2011,7 @@ _MCP_PREFIXES = ("mcp__agentgram__", "mcp__")
 # Human-readable labels for platform tools (keyed on clean name after prefix strip)
 _PLATFORM_TOOL_LABELS: dict[str, str] = {
     "send_message": "Sending message",
+    "end_turn": "Ending turn",
     "get_messages": "Reading messages",
     "create_task": "Creating task",
     "update_task_status": "Updating task",
