@@ -348,6 +348,21 @@ class CodexCliBackend(ModelBackend):
         and `env`. We set each field as a separate -c override so the CLI
         parses each value as a small TOML expression and merges them into
         the in-memory config — no global config.toml mutation.
+
+        SECURITY NOTE (shared org-host): the `env.AGENTGRAM_API_KEY` value
+        below lands in this process's argv, which is world-readable via
+        /proc/<pid>/cmdline. On a multi-agent org-host VM a co-tenant agent
+        could read it. Unlike claude_cli (which now writes --system-prompt /
+        --mcp-config to 0600 temp files), Codex has no verified file-based
+        equivalent that survives `--ignore-user-config`, so the argv form
+        stays. This residual is closed at the HOST layer, not here:
+          * `ProtectProc=invisible` in agentgram-host.service hides sibling
+            /proc/<pid>/cmdline from same-uid peers, and
+          * `AGENTGRAM_HOST_ISOLATION=per_user` gives each bridge a distinct
+            uid so the read is denied outright.
+        See host/README.md § Security / Isolation. The Codex system prompt is
+        already passed via a temp file (model_instructions_file), so soul.md
+        does not leak through argv.
         """
         if not self._mcp_server_script:
             return []

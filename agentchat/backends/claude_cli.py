@@ -559,14 +559,18 @@ class ClaudeCliBackend(ModelBackend):
         cmd.append("--strict-mcp-config")
 
         if system_prompt:
-            if sys.platform == "win32":
-                # Windows routes `.cmd` shims through `cmd.exe /c`, which
-                # re-interprets `%VAR%`, `&`, `|`, `^`, `<`, `>` in argv.
-                # Soul.md commonly contains those characters, so write the
-                # prompt to a temp file and pass --system-prompt-file.
-                cmd.extend(["--system-prompt-file", write_temp(system_prompt, ".txt", "agentchat_sp_", cleanup_paths)])
-            else:
-                cmd.extend(["--system-prompt", system_prompt])
+            # Always pass the system prompt via a temp FILE, never inline in
+            # argv, on every platform. Two reasons:
+            #   1. Security: argv is world-readable via /proc/<pid>/cmdline.
+            #      On a shared org-host VM a co-tenant agent could read another
+            #      agent's full soul.md persona straight out of /proc. A
+            #      0600 temp file (write_temp) keeps it off the process table.
+            #   2. Windows: `.cmd` shims route through `cmd.exe /c`, which
+            #      re-interprets `%VAR%`, `&`, `|`, `^`, `<`, `>` in argv —
+            #      soul.md commonly contains those.
+            # The file inherits the per-agent $TMPDIR the org host sets and is
+            # unlinked by the caller's cleanup_temp_files(cleanup_paths).
+            cmd.extend(["--system-prompt-file", write_temp(system_prompt, ".txt", "agentchat_sp_", cleanup_paths)])
         if self._max_tokens:
             cmd.extend(["--settings", json.dumps({"maxOutputTokens": self._max_tokens})])
         if self._model:
@@ -607,13 +611,13 @@ class ClaudeCliBackend(ModelBackend):
                 source_message_id, last_seen_message_id,
             )
             if mcp_config:
-                if sys.platform == "win32":
-                    # Same rationale as --system-prompt-file: API URLs with
-                    # `?a=1&b=2` or env values with `%` would be re-parsed
-                    # by cmd.exe. The CLI accepts a JSON file path here.
-                    cmd.extend(["--mcp-config", write_temp(mcp_config, ".json", "agentchat_mcp_", cleanup_paths)])
-                else:
-                    cmd.extend(["--mcp-config", mcp_config])
+                # Always via a temp FILE, never inline in argv. The MCP config
+                # JSON embeds the agent's AGENTGRAM_API_KEY and owner_id (see
+                # _mcp_agentgram_entry); inline, those leak via
+                # /proc/<pid>/cmdline to any co-tenant agent on a shared
+                # org-host. (Also dodges the Windows cmd.exe re-parse of
+                # `?a=1&b=2` / `%` in the JSON.) Unlinked via cleanup_paths.
+                cmd.extend(["--mcp-config", write_temp(mcp_config, ".json", "agentchat_mcp_", cleanup_paths)])
 
         return cmd, user_prompt, cleanup_paths
 
