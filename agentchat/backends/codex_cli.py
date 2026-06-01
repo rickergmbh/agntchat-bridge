@@ -58,6 +58,12 @@ _DEFAULT_TIMEOUT = 900  # 15 minutes — complex tasks need time
 _STREAM_LIMIT = 10 * 1024 * 1024  # 10 MB
 _PROC_SHUTDOWN_GRACE = 5.0  # seconds we'll wait for a doomed proc to die
 
+# Env-var name the MCP `env_vars` override forwards the agent API key under.
+# Held in Codex's process env (out of argv) and passed through to the MCP
+# server, which reads AGENTGRAM_API_KEY — so the forwarded name must match
+# what agentgram_mcp_server.py expects. See _mcp_overrides.
+_MCP_API_KEY_ENV = "AGENTGRAM_API_KEY"
+
 
 def _toml_quote(s: str) -> str:
     """Escape a Python string as a TOML basic-string literal.
@@ -345,32 +351,37 @@ class CodexCliBackend(ModelBackend):
         """Build -c flags that register the AgentGram MCP server inline.
 
         Codex's [mcp_servers.<name>] config block supports `command`, `args`,
-        and `env`. We set each field as a separate -c override so the CLI
-        parses each value as a small TOML expression and merges them into
-        the in-memory config — no global config.toml mutation.
+        `env` (literal name=value pairs), and `env_vars` (names to FORWARD
+        from Codex's own process environment into the server). We set each
+        field as a separate -c override so the CLI parses each value as a
+        small TOML expression and merges them into the in-memory config — no
+        global config.toml mutation.
 
-        SECURITY NOTE (shared org-host): the `env.AGENTGRAM_API_KEY` value
-        below lands in this process's argv, which is world-readable via
-        /proc/<pid>/cmdline. On a multi-agent org-host VM a co-tenant agent
-        could read it. Unlike claude_cli (which now writes --system-prompt /
-        --mcp-config to 0600 temp files), Codex has no verified file-based
-        equivalent that survives `--ignore-user-config`, so the argv form
-        stays. This residual is closed at the HOST layer, not here:
-          * `ProtectProc=invisible` in agentgram-host.service hides sibling
-            /proc/<pid>/cmdline from same-uid peers, and
-          * `AGENTGRAM_HOST_ISOLATION=per_user` gives each bridge a distinct
-            uid so the read is denied outright.
-        See host/README.md § Security / Isolation. The Codex system prompt is
-        already passed via a temp file (model_instructions_file), so soul.md
-        does not leak through argv.
+        SECURITY (shared org-host): the agent's API key MUST NOT land in argv
+        (world-readable via /proc/<pid>/cmdline to a co-tenant agent). So the
+        key is NOT written as a literal `env.AGENTGRAM_API_KEY=<value>`
+        override; instead it is injected into Codex's PROCESS environment by
+        `_run` and forwarded by NAME via `env_vars=["AGENTGRAM_API_KEY"]`.
+        Codex then passes it through to the MCP server (which reads it from
+        its env). The key thus lives only in /proc/<pid>/environ
+        (owner-readable, and closed by per_user uid isolation +
+        ProtectProc=invisible), never in /proc/<pid>/cmdline — parity with
+        the claude_cli 0600-temp-file fix. The remaining literal `env` values
+        are non-secret (IDs, the public API URL, tool defs), so they stay as
+        -c overrides. `env_vars` is a recognized Codex config field (verified
+        against the CLI); a Codex too old to know it ignores it rather than
+        erroring, in which case the key simply isn't forwarded (the agent
+        loses MCP auth — fail-safe, not a leak). The system prompt already
+        goes through a temp file (model_instructions_file), so soul.md does
+        not leak through argv either.
         """
         if not self._mcp_server_script:
             return []
 
+        # Non-secret values: safe to pass as literal `env` -c overrides.
         env = {
             "AGENTGRAM_API_URL": self._api_url,
             "AGENTGRAM_AGENT_ID": self._agent_id,
-            "AGENTGRAM_API_KEY": self._api_key,
             "AGENTGRAM_CONVERSATION_ID": conversation_id,
             "AGENTGRAM_TASK_ID": task_id,
             "AGENTGRAM_OWNER_ID": owner_id,
@@ -384,10 +395,28 @@ class CodexCliBackend(ModelBackend):
         overrides: list[str] = [
             "-c", f"mcp_servers.agentgram.command={_toml_quote(sys.executable)}",
             "-c", f"mcp_servers.agentgram.args={args_toml}",
+            # Forward the secret API key from Codex's env by NAME — never its
+            # value — so it stays out of argv. _run injects it into the env.
+            "-c", f"mcp_servers.agentgram.env_vars=[{_toml_quote(_MCP_API_KEY_ENV)}]",
         ]
         for k, v in env.items():
             overrides.extend(["-c", f"mcp_servers.agentgram.env.{k}={_toml_quote(v)}"])
         return overrides
+
+    def _mcp_subprocess_env(self) -> dict[str, str]:
+        """Env to inject into the Codex child so `env_vars` can forward the key.
+
+        Codex forwards AGENTGRAM_API_KEY to the MCP server by reading it from
+        its OWN environment (see _mcp_overrides). We start from the bridge's
+        env (Codex needs OPENAI_API_KEY / CODEX_HOME / PATH from it) and add
+        the key under the agreed name. Returns None-equivalent (the inherited
+        env unchanged) when there's no key or no MCP server, so the no-MCP
+        path keeps inheriting the parent env exactly as before.
+        """
+        env = os.environ.copy()
+        if self._api_key and self._mcp_server_script:
+            env[_MCP_API_KEY_ENV] = self._api_key
+        return env
 
     def _base_cmd(
         self,
@@ -546,6 +575,11 @@ class CodexCliBackend(ModelBackend):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=_STREAM_LIMIT,
+            # Inject the agent API key into Codex's env (NOT argv) so the
+            # mcp_servers `env_vars` override can forward it to the MCP server
+            # by name. Inherits the rest of the bridge env (OPENAI_API_KEY,
+            # CODEX_HOME, PATH, the per-agent TMPDIR the org host sets).
+            env=self._mcp_subprocess_env(),
         )
 
         # Concurrent stderr drain — if Codex emits warnings during a
