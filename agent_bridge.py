@@ -3058,7 +3058,21 @@ def run_single_agent(
     backend_kwargs: dict[str, Any] = {}
     if agent_config.get("options"):
         backend_kwargs["options"] = agent_config["options"]
-    if args.model:
+    # Model precedence is normally CLI arg > profile, BUT a CLI backend on a
+    # cloud connection (Bedrock/Vertex) needs the platform-specific id the
+    # server resolved into `runtime_api_id` (e.g.
+    # "us.anthropic.claude-opus-4-7-v1:0"), which extract_agent_config folds
+    # into agent_config["model"]. The desktop shell passes the *canonical*
+    # id (e.g. "claude-opus-4-7") as --model, which would shadow that and
+    # break the Bedrock/Vertex call. So when the server injected a
+    # runtime_api_id, it WINS over the --model arg. Subscription/Anthropic
+    # connections carry no runtime_api_id, so --model keeps priority there.
+    profile_resolved_model = (
+        (profile.get("modelConfig") or {}).get("runtime_api_id") if profile else None
+    )
+    if profile_resolved_model:
+        backend_kwargs["model"] = profile_resolved_model
+    elif args.model:
         backend_kwargs["model"] = args.model
     elif agent_config.get("model"):
         backend_kwargs["model"] = agent_config["model"]
