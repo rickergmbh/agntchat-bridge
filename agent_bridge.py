@@ -770,11 +770,23 @@ async def execute_tool_calls(
     calls: list[dict[str, Any]],
     executor_key: str = "",
     resolved_tools: list[dict[str, Any]] | None = None,
+    context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Execute parsed tool_call operations via ExecutorClient methods.
+    """Execute parsed <tool_call> operations (single_shot / tag-based mode).
 
     Returns list of {name, arguments, result} dicts.
     Tool-to-executor mapping is built from resolved_tools (backend skills).
+
+    A tool whose `executorMethod` has no matching ExecutorClient method is a
+    SERVER-ONLY tool (e.g. `pulse_report`, `end_turn`) — it has no local SDK
+    implementation and must execute on the backend. We delegate those to a
+    `ToolExecutor`, whose `_invoke_via_passthrough` POSTs to `/api/mcp/call`
+    so the backend dispatches through its ToolRegistry. This mirrors the
+    tool_use path and is what lets server-registered tools work in
+    single_shot mode without shipping a bridge SDK method. `context`
+    (task_id, conversation_id, …) is forwarded so the backend can resolve
+    the right task/conversation — without it `pulse_report` couldn't find
+    the pulse task it belongs to.
     """
     results: list[dict[str, Any]] = []
 
@@ -786,6 +798,10 @@ async def execute_tool_calls(
         method = tool.get("executorMethod", tool.get("executor_method", name))
         if name:
             method_map[name] = method
+
+    # Lazily built only if we hit a server-only tool — most tag calls map to
+    # a local SDK method and never need the passthrough executor.
+    passthrough_exec: ToolExecutor | None = None
 
     for call in calls:
         name = call["name"]
@@ -799,8 +815,20 @@ async def execute_tool_calls(
 
         method = getattr(executor, method_name, None)
         if not method:
-            logger.warning("[%s] Executor missing method: %s", executor_key, method_name)
-            results.append({"name": name, "error": f"Method not available: {method_name}"})
+            # Server-only tool: dispatch via the backend passthrough instead
+            # of erroring. The ToolExecutor handles the /api/mcp/call POST and
+            # context forwarding (incl. task_id) the same way tool_use does.
+            if passthrough_exec is None:
+                passthrough_exec = ToolExecutor(
+                    executor, context=context or {}, resolved_tools=resolved_tools
+                )
+            try:
+                result = await passthrough_exec.execute(name, args)
+                results.append({"name": name, "arguments": args, "result": result})
+                logger.info("[%s] Tool call %s succeeded (backend passthrough)", executor_key, name)
+            except Exception as e:
+                logger.warning("[%s] Tool call %s failed (passthrough): %s", executor_key, name, e)
+                results.append({"name": name, "arguments": args, "error": str(e)})
             continue
 
         try:
@@ -3742,7 +3770,17 @@ def run_single_agent(
             # Execute tool calls from tags (works with any backend including claude_cli)
             remaining_text, task_tool_calls = parse_tool_calls(remaining_text)
             if task_tool_calls:
-                task_tool_results = await execute_tool_calls(executor, task_tool_calls, executor_key, resolved_tools=resolved_tools)
+                task_tool_results = await execute_tool_calls(
+                    executor, task_tool_calls, executor_key,
+                    resolved_tools=resolved_tools,
+                    context={
+                        "conversation_id": task.work_conversation_id or task.conversation_id or "",
+                        "task_id": task.task_id or "",
+                        "owner_id": agent_owner_id or "",
+                        "source_type": "task",
+                        "source_message_id": task_source_message_id,
+                    },
+                )
                 logger.info("[%s] Executed %d tool call(s) from task tags", executor_key, len(task_tool_results))
 
                 # If the LLM only produced tool calls (no surrounding text), feed
@@ -4298,7 +4336,18 @@ def run_single_agent(
         # Detect and execute tool calls (<tool_call> tags — works with any backend)
         reply, tool_calls = parse_tool_calls(reply or "")
         if tool_calls:
-            tool_results = await execute_tool_calls(executor, tool_calls, executor_key, resolved_tools=resolved_tools)
+            tool_results = await execute_tool_calls(
+                executor, tool_calls, executor_key,
+                resolved_tools=resolved_tools,
+                context={
+                    "conversation_id": msg.conversation_id or "",
+                    "task_id": msg.active_task_id or "",
+                    "owner_id": agent_owner_id or "",
+                    "source_type": "task" if msg.active_task_id else "message",
+                    "source_message_id": msg.message_id or "",
+                    "last_seen_message_id": freshness_anchor,
+                },
+            )
             logger.info("[%s] Executed %d tool call(s) from tags", executor_key, len(tool_results))
 
             # If the LLM only produced tool calls (no surrounding text), feed
