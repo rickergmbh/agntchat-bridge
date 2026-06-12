@@ -254,6 +254,12 @@ class ExecutorClient:
         # finally so handler-registered teardown (e.g. terminating a streaming
         # bubble) still happens when a mid-flight cancel skips the handler's own.
         self._turn_cleanups: dict[str, Callable[[], Awaitable[None]]] = {}
+        # In-flight handler runs, so `stop_generation` / `stop_task` control
+        # directives can cancel them mid-LLM-call. Message runs are keyed by
+        # conversation_id, task runs by the underlying Task id; each maps to
+        # the asyncio.Tasks currently executing handlers for that key.
+        self._active_message_runs: dict[str, set[asyncio.Task]] = {}
+        self._active_task_runs: dict[str, set[asyncio.Task]] = {}
         self._running = False
         self._semaphore: asyncio.Semaphore | None = None
         self._message_dedup = MessageDedup(ttl=600.0)
@@ -737,6 +743,24 @@ class ExecutorClient:
         if cmd_type == "shutdown":
             logger.warning("Shutdown command received (reason: %s). Stopping executor.", reason)
             await self.stop()
+        elif cmd_type == "stop_generation":
+            conversation_id = command.get("conversation_id")
+            cancelled = self._cancel_runs(
+                self._active_message_runs.get(conversation_id) if conversation_id else None
+            )
+            logger.warning(
+                "stop_generation for conversation %s (reason: %s) — cancelled %d run(s)",
+                conversation_id, reason, cancelled,
+            )
+        elif cmd_type == "stop_task":
+            task_id = command.get("task_id")
+            cancelled = self._cancel_runs(
+                self._active_task_runs.get(task_id) if task_id else None
+            )
+            logger.warning(
+                "stop_task for task %s (reason: %s) — cancelled %d run(s)",
+                task_id, reason, cancelled,
+            )
         elif self._command_handler is not None:
             try:
                 await self._command_handler(command)
@@ -744,6 +768,22 @@ class ExecutorClient:
                 logger.exception("Command handler failed for type %s", cmd_type)
         else:
             logger.info("Unknown command type: %s", cmd_type)
+
+    @staticmethod
+    def _cancel_runs(runs: set[asyncio.Task] | None) -> int:
+        """Cancel every asyncio task in `runs`. Returns the number cancelled.
+
+        Snapshot before iterating — each cancellation mutates the registry
+        set from the cancelled task's own finally block.
+        """
+        if not runs:
+            return 0
+        cancelled = 0
+        for t in list(runs):
+            if not t.done():
+                t.cancel()
+                cancelled += 1
+        return cancelled
 
     async def stop(self) -> None:
         """Signal the gateway loop to stop and deregister executor."""
@@ -794,11 +834,25 @@ class ExecutorClient:
 
     async def _handle_task_wrapper(self, task: GatewayTask) -> None:
         """Wrapper that ensures semaphore release and error reporting."""
+        current = asyncio.current_task()
+        run_key = task.task_id or task.id
+        runs = self._active_task_runs.setdefault(run_key, set())
+        if current is not None:
+            runs.add(current)
         try:
             await self._handle_task(task)
+        except asyncio.CancelledError:
+            # A stop_task directive cancelled the run. The backend already
+            # marked the Task cancelled and cleaned the gateway queue —
+            # nothing to report; just release the slot.
+            logger.info("Task run %s cancelled by stop_task directive", run_key)
         except Exception:
             logger.exception("Unhandled error in task handler for %s", task.id)
         finally:
+            if current is not None:
+                runs.discard(current)
+            if not runs:
+                self._active_task_runs.pop(run_key, None)
             self._current_activity = "idle"
             self._semaphore.release()
 
@@ -2460,12 +2514,20 @@ class ExecutorClient:
     async def _handle_message_wrapper(self, msg: GatewayMessage) -> None:
         """Wrapper that ensures semaphore release and error reporting."""
         logger.info("[MSG-DISPATCH] Starting handler for %s", msg.id)
+        current = asyncio.current_task()
+        runs = self._active_message_runs.setdefault(msg.conversation_id, set())
+        if current is not None:
+            runs.add(current)
         try:
             await self._handle_message(msg)
             logger.info("[MSG-DISPATCH] Handler completed normally for %s", msg.id)
         except BaseException as e:
             logger.exception("[MSG-DISPATCH] Handler raised %s for %s: %s", type(e).__name__, msg.id, e)
         finally:
+            if current is not None:
+                runs.discard(current)
+            if not runs:
+                self._active_message_runs.pop(msg.conversation_id, None)
             self._current_activity = "idle"
             self._semaphore.release()
             logger.info("[MSG-DISPATCH] Semaphore released for %s", msg.id)
