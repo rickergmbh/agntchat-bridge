@@ -1829,6 +1829,13 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def main() -> None:
+    # MCP stdio is UTF-8 by spec, but Python's stdin/stdout default to the
+    # ANSI code page (cp1252) on Windows, double-decoding the CLI's UTF-8
+    # tool args into mojibake ("Köln" → "KÃ¶ln") — corrupting both reported
+    # text and text typed into apps. Force UTF-8 on both ends of the pipe.
+    sys.stdin.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8")
+
     logger.info(
         "computer-use MCP starting (agent=%s, platform=%s, pause=%s, audit=%s)",
         AGENT_ID, sys.platform, PAUSE_FILE, AUDIT_LOG,
