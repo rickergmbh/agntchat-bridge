@@ -1203,6 +1203,98 @@ class ExecutorClient:
             json=body,
         )
 
+    async def share_file(
+        self,
+        path: str,
+        conversation_id: str | None = None,
+        caption: str | None = None,
+        filename: str | None = None,
+    ) -> dict[str, Any]:
+        """Upload a local file into a conversation as a file attachment.
+
+        Bridge-local by necessity: the file's bytes live on this machine,
+        which neither the backend nor anyone else can reach. Flow mirrors
+        the desktop/mobile clients: presigned upload-url → PUT bytes →
+        confirm (which creates the attachment row + file message and
+        broadcasts it to the conversation).
+        """
+        import mimetypes
+        import os
+
+        if not conversation_id:
+            raise AgentChatError("share_file requires a conversation_id")
+        if not path or not os.path.isfile(path):
+            raise AgentChatError(f"share_file: no such file: {path!r}")
+
+        size_bytes = os.path.getsize(path)
+        max_bytes = 25 * 1024 * 1024
+        if size_bytes == 0:
+            raise AgentChatError(f"share_file: file is empty: {path!r}")
+        if size_bytes > max_bytes:
+            raise AgentChatError(
+                f"share_file: file is {size_bytes} bytes — exceeds the 25MB limit"
+            )
+
+        display_name = filename or os.path.basename(path)
+        content_type = (
+            mimetypes.guess_type(display_name)[0] or "application/octet-stream"
+        )
+
+        signed = await self._post(
+            f"/api/conversations/{conversation_id}/upload-url",
+            json={
+                "filename": display_name,
+                "contentType": content_type,
+                "sizeBytes": size_bytes,
+            },
+        )
+        upload_url = signed.get("uploadUrl")
+        storage_key = signed.get("storageKey")
+        if not upload_url or not storage_key:
+            raise AgentChatError(f"share_file: bad upload-url response: {signed}")
+
+        with open(path, "rb") as f:
+            file_bytes = f.read()
+
+        client = self._api_client or httpx.AsyncClient(timeout=60)
+        put_resp = await client.put(
+            upload_url,
+            content=file_bytes,
+            headers={"content-type": content_type},
+        )
+        if put_resp.status_code not in (200, 201):
+            raise AgentChatError(
+                f"share_file: storage PUT failed with {put_resp.status_code}: "
+                f"{put_resp.text[:300]}"
+            )
+
+        confirm_body: dict[str, Any] = {
+            "storageKey": storage_key,
+            "filename": display_name,
+            "contentType": content_type,
+            "sizeBytes": size_bytes,
+        }
+        if caption:
+            confirm_body["caption"] = caption
+
+        message = await self._post(
+            f"/api/conversations/{conversation_id}/files/confirm",
+            json=confirm_body,
+        )
+
+        attachments = message.get("fileAttachments") or []
+        attachment_id = attachments[0].get("id") if attachments else None
+        return {
+            "attachment_id": attachment_id,
+            "message_id": message.get("id"),
+            "filename": display_name,
+            "size_bytes": size_bytes,
+            "note": (
+                "File is now visible in the conversation as a downloadable "
+                "message. Other agents can read it via read_attachment."
+            ),
+        }
+
     async def send_typing(self, conversation_id: str) -> None:
         """Send a typing indicator to a conversation."""
         try:

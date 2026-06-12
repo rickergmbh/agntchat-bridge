@@ -197,6 +197,55 @@ async def _verify_create_calendar_event(
         )
 
 
+async def _verify_share_file(
+    client: Any, result: dict[str, Any]
+) -> VerificationResult:
+    """Verify a shared file attachment exists by requesting its download URL."""
+    attachment_id = None
+    if isinstance(result, dict):
+        attachment_id = result.get("attachment_id") or result.get("attachmentId")
+
+    if not attachment_id:
+        return VerificationResult(
+            verified=False,
+            action="share_file",
+            detail="No attachment_id returned from share_file call",
+        )
+
+    try:
+        check = await client._get(f"/api/files/{attachment_id}/download-url")
+        if isinstance(check, dict) and check.get("url"):
+            logger.info(
+                "[verify] share_file verified: attachment %s downloadable",
+                attachment_id,
+            )
+            return VerificationResult(
+                verified=True,
+                action="share_file",
+                detail=f"Attachment {attachment_id} confirmed downloadable",
+                resource_id=attachment_id,
+            )
+        else:
+            logger.warning(
+                "[verify] share_file FAILED: attachment %s has no download URL",
+                attachment_id,
+            )
+            return VerificationResult(
+                verified=False,
+                action="share_file",
+                detail=f"Attachment {attachment_id} not downloadable after upload",
+                resource_id=attachment_id,
+            )
+    except Exception as e:
+        logger.warning("[verify] share_file verification error: %s", e)
+        return VerificationResult(
+            verified=False,
+            action="share_file",
+            detail=f"Verification check failed: {e}",
+            resource_id=attachment_id,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -207,6 +256,7 @@ VERIFICATION_REGISTRY: dict[str, Any] = {
     "save_draft": _verify_save_draft,
     "send_email": _verify_send_email,
     "create_calendar_event": _verify_create_calendar_event,
+    "share_file": _verify_share_file,
 }
 
 
