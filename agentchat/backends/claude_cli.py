@@ -442,6 +442,20 @@ class ClaudeCliBackend(ModelBackend):
         if lock_file:
             env["AGENTGRAM_COMPUTER_USE_LOCK"] = lock_file
 
+        # Windows OS plumbing: the CLI's minimal MCP env is a POSIX set
+        # (HOME/PATH/USER). Python won't even start without SYSTEMROOT,
+        # ctypes/tempfile need the rest, and Path.home() (the default
+        # ~/.agentgram state dir) reads USERPROFILE.
+        if sys.platform == "win32":
+            for name in (
+                "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "USERPROFILE",
+                "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+                "HOMEDRIVE", "HOMEPATH",
+            ):
+                val = os.environ.get(name)
+                if val:
+                    env[name] = val
+
         return {
             "type": "stdio",
             "command": sys.executable,

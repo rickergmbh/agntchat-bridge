@@ -42,6 +42,7 @@ from ._cli_utils import (
     ANSI_ESCAPE_RE,
     cleanup_temp_files,
     download_image_to_temp,
+    find_sibling_script,
     parse_add_dirs_env,
     resolve_cli_path,
     save_base64_image_to_temp,
@@ -249,6 +250,35 @@ class CodexCliBackend(ModelBackend):
         self._mcp_source_message_id: str = ""
         self._mcp_last_seen_message_id: str = ""
 
+        # Computer-use MCP server (desktop control). Same env contract as
+        # claude_cli: Tauri sets AGENTGRAM_COMPUTER_USE=local when the
+        # agent's toggle is on — for ANY backend — so this wiring is what
+        # makes the toggle real on Codex. "builtin" is a claude_cli-only
+        # concept (Anthropic's own server); Codex has no equivalent.
+        self._computer_use_mode = (
+            os.getenv("AGENTGRAM_COMPUTER_USE", "off").strip().lower()
+        )
+        if self._computer_use_mode not in ("off", "local"):
+            logger.warning(
+                "AGENTGRAM_COMPUTER_USE=%r is not supported on codex_cli — "
+                "treating as 'off' (only 'local' is wired here)",
+                self._computer_use_mode,
+            )
+            self._computer_use_mode = "off"
+        self._computer_use_script: str | None = None
+        if self._computer_use_mode == "local":
+            self._computer_use_script = find_sibling_script(
+                "computer_use_mcp_server.py"
+            )
+            if not self._computer_use_script:
+                logger.error(
+                    "AGENTGRAM_COMPUTER_USE=local set but "
+                    "computer_use_mcp_server.py was not found — computer use "
+                    "DISABLED for this agent. Ensure "
+                    "desktop/bridge/computer_use_mcp_server.py exists."
+                )
+                self._computer_use_mode = "off"
+
     @staticmethod
     def _find_mcp_server() -> str | None:
         """Locate the agentgram_mcp_server.py script (same lookup as claude_cli)."""
@@ -403,6 +433,60 @@ class CodexCliBackend(ModelBackend):
             overrides.extend(["-c", f"mcp_servers.agentgram.env.{k}={_toml_quote(v)}"])
         return overrides
 
+    def _computer_use_overrides(self) -> list[str]:
+        """-c flags registering the local computer-use MCP server.
+
+        Mirrors claude_cli's `_mcp_computer_use_entry`. Codex spawns MCP
+        servers with a MINIMAL environment, so everything the server
+        needs is either a literal `env.<K>=<V>` override (the AgentGram
+        paths/IDs — all non-secret) or an `env_vars` forward from Codex's
+        own process env (the OS plumbing below).
+
+        Windows: Python itself won't start without SYSTEMROOT, ctypes/
+        tempfile need the rest, and Path.home() (the default
+        ~/.agentgram state dir) reads USERPROFILE. POSIX: Path.home()
+        reads HOME.
+        """
+        if self._computer_use_mode != "local" or not self._computer_use_script:
+            return []
+
+        env: dict[str, str] = {
+            "AGENTGRAM_AGENT_ID": self._agent_id,
+            "AGENTGRAM_COMPUTER_USE_PAUSE": os.getenv(
+                "AGENTGRAM_COMPUTER_USE_PAUSE",
+                os.path.expanduser("~/.agentgram/computer_use.paused"),
+            ),
+            "AGENTGRAM_COMPUTER_USE_AUDIT": os.getenv(
+                "AGENTGRAM_COMPUTER_USE_AUDIT",
+                os.path.expanduser("~/.agentgram/computer_use_audit.log"),
+            ),
+        }
+        allowed_apps = os.getenv("AGENTGRAM_COMPUTER_USE_ALLOWED_APPS")
+        if allowed_apps:
+            env["AGENTGRAM_COMPUTER_USE_ALLOWED_APPS"] = allowed_apps
+        lock_file = os.getenv("AGENTGRAM_COMPUTER_USE_LOCK")
+        if lock_file:
+            env["AGENTGRAM_COMPUTER_USE_LOCK"] = lock_file
+
+        if sys.platform == "win32":
+            os_env_names = [
+                "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "USERPROFILE",
+                "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+                "HOMEDRIVE", "HOMEPATH",
+            ]
+        else:
+            os_env_names = ["HOME", "TMPDIR"]
+        env_vars_toml = "[" + ", ".join(_toml_quote(n) for n in os_env_names) + "]"
+
+        overrides: list[str] = [
+            "-c", f"mcp_servers.computer_use.command={_toml_quote(sys.executable)}",
+            "-c", f"mcp_servers.computer_use.args=[{_toml_quote(self._computer_use_script)}]",
+            "-c", f"mcp_servers.computer_use.env_vars={env_vars_toml}",
+        ]
+        for k, v in env.items():
+            overrides.extend(["-c", f"mcp_servers.computer_use.env.{k}={_toml_quote(v)}"])
+        return overrides
+
     def _mcp_subprocess_env(self) -> dict[str, str]:
         """Env to inject into the Codex child so `env_vars` can forward the key.
 
@@ -475,6 +559,11 @@ class CodexCliBackend(ModelBackend):
                 conversation_id, task_id, owner_id, source_message_id,
                 last_seen_message_id, resolved_tools,
             ))
+
+        # Computer-use MCP server — independent of resolved_tools: the
+        # `computer` tool is defined by the server itself, not by the
+        # backend tool catalog.
+        cmd.extend(self._computer_use_overrides())
 
         # Prompt is read from stdin
         cmd.append("-")

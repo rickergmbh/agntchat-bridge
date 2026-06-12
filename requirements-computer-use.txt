@@ -1,4 +1,9 @@
-# Optional dependencies for computer_use_mcp_server.py safety features.
+# Optional macOS dependencies for computer_use_mcp_server.py safety
+# features. Platform markers make this file a no-op on Windows: the
+# Windows driver needs no optional deps at all (SendInput is stdlib
+# ctypes, Pillow ships via requirements.txt's win32 marker, and the
+# perm-probe / native-input / redaction features below are built into
+# the Windows driver from the start).
 #
 # These deliberately do NOT live in requirements.txt because installing
 # them synchronously on every agent start (which is what Tauri's
@@ -12,7 +17,7 @@
 # blocks on it. The MCP server soft-imports each one and degrades
 # cleanly when missing.
 #
-# What each one enables:
+# What each one enables (macOS):
 #   pyobjc-core, pyobjc-framework-Quartz:
 #     - CGPreflightScreenCaptureAccess: real Screen Recording perm
 #       probe (catches "wallpaper-only" captures that pass the 8KB
@@ -24,6 +29,6 @@
 #   Pillow:
 #     - Composite the black rectangles over those ancestor windows in
 #       the raw PNG before sips downscale.
-pyobjc-core>=10.0
-pyobjc-framework-Quartz>=10.0
-Pillow>=10.0
+pyobjc-core>=10.0; sys_platform == "darwin"
+pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"
+Pillow>=10.0; sys_platform == "darwin"

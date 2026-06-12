@@ -1,21 +1,25 @@
 websockets>=12.0
 httpx>=0.27.0
 
-# NOTE: pyobjc-core, pyobjc-framework-Quartz, and Pillow are intentionally
-# NOT in this file even though they enable safety features in the optional
-# computer_use_mcp_server.py (real Screen Recording perm probe via Quartz,
-# native scroll/right-click without cliclick, terminal-window redaction via
-# PIL). They're ~50-80MB of wheels and would otherwise be installed
-# synchronously by Tauri's ensure_venv on every user's first agent launch,
-# which was producing a "spinning wheel of death" while pip ran.
+# Windows computer-use driver: PIL.ImageGrab IS the screenshot path
+# (there's no screencapture equivalent to shell out to), so Pillow is a
+# hard dependency there. At ~3MB it doesn't reintroduce the pyobjc
+# spinning-wheel problem described below.
+Pillow>=10.0; sys_platform == "win32"
+
+# NOTE (macOS): pyobjc-core, pyobjc-framework-Quartz, and Pillow are
+# intentionally NOT installed here even though they enable safety
+# features in the optional computer_use_mcp_server.py (real Screen
+# Recording perm probe via Quartz, native scroll/right-click without
+# cliclick, terminal-window redaction via PIL). They're ~50-80MB of
+# wheels and would otherwise be installed synchronously by Tauri's
+# ensure_venv on every user's first agent launch, which was producing a
+# "spinning wheel of death" while pip ran.
 #
-# The MCP server soft-imports and degrades cleanly when these are missing
-# (perm probe falls back to an 8KB heuristic; redaction is skipped with
-# an audit-logged warning; scroll + right-click fall back to cliclick).
-#
-# Users who want the full safety set should install them manually into
-# the bridge venv:
-#   desktop/bridge/venv/bin/python -m pip install \
-#       pyobjc-core pyobjc-framework-Quartz Pillow
+# The MCP server soft-imports and degrades cleanly when these are
+# missing on macOS (perm probe falls back to an 8KB heuristic; redaction
+# is skipped with an audit-logged warning; scroll + right-click fall
+# back to cliclick). The desktop app installs them on demand via the
+# `install_computer_use_deps` Tauri command (requirements-computer-use.txt).
 #
 # See docs/reference/computer-use-guide.md § 9 (Optional dependencies).
