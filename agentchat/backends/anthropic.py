@@ -771,6 +771,13 @@ def _attachment_to_anthropic_blocks(block: dict[str, Any]) -> list[dict[str, Any
             {"type": "text", "text": label},
         ]
 
+    # Large non-image files (e.g. a big PDF) skip the native document block:
+    # rendering the whole file costs a lot of input tokens. Point the model
+    # at the capped read_attachment path + brief instead. Smaller PDFs keep
+    # native rendering for fidelity.
+    if att.should_use_capped_path(block):
+        return [{"type": "text", "text": att.capped_pointer_text(block)}]
+
     if url and att.is_pdf_attachment(block):
         return [
             {"type": "document", "source": {"type": "url", "url": url}},

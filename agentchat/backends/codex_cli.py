@@ -148,6 +148,10 @@ def _content_to_cli(content: str | list) -> tuple[str, list[str]]:
                     text_parts.append(att.attachment_label(block))
                 else:
                     text_parts.append(f"{att.attachment_label(block)} [image unavailable]")
+            elif att.should_use_capped_path(block):
+                # Large file — include the server brief alongside the
+                # read_attachment hint so the model gets the gist up front.
+                text_parts.append(att.capped_pointer_text(block))
             else:
                 text_parts.append(att.fallback_text(block))
     text = " ".join(text_parts) if text_parts else (str(content) if content else "")

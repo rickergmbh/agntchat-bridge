@@ -161,8 +161,15 @@ def _attachment_to_cli_pointer(block: dict, cleanup_paths: list[str] | None = No
     Read tool can open it; the path is appended to `cleanup_paths` so
     the caller can unlink after the turn. Falls back to a text label
     + read_attachment hint when no URL is available or download fails.
+
+    Large non-image files skip the download entirely: the CLI's Read would
+    echo the whole file back as one (multi-MB) tool_result, blowing context.
+    Instead we point the model at the capped `read_attachment` path + brief.
     """
     from . import _attachment as att
+
+    if att.should_use_capped_path(block):
+        return att.capped_pointer_text(block)
 
     filename = block.get("filename") or "file"
     url = block.get("url")

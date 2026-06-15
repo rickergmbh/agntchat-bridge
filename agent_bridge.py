@@ -1759,14 +1759,16 @@ async def _cached_get_messages(
     return msgs
 
 
-async def _get_attachment_download_url(
+async def _get_attachment_info(
     attachment_id: str, base_url: str, token: str
-) -> str | None:
-    """Get a signed download URL for any file attachment.
+) -> dict[str, Any] | None:
+    """Fetch a file attachment's signed download URL + server metadata.
 
-    Returns the presigned Supabase Storage URL, or None on failure. The URL
-    is passed directly to the model — as an image `url` source for images,
-    or as a document `url` source for PDFs.
+    Returns the `/download-url` response dict — `url` plus `sizeBytes`,
+    `extractionStatus`, `summaryStatus`, and `summary` — or None on failure.
+    Backend adapters use the metadata to decide how to render the file to a
+    model: large files route to the capped `read_attachment` path (with the
+    brief) instead of being downloaded and read (and echoed) whole.
     """
     try:
         import httpx
@@ -1777,15 +1779,15 @@ async def _get_attachment_download_url(
                 headers={"Authorization": f"Bearer {token}"},
             )
             if resp.status_code != 200:
-                log.warning("[Attachment] Failed to get download URL for %s: %s", attachment_id, resp.status_code)
+                log.warning("[Attachment] Failed to get info for %s: %s", attachment_id, resp.status_code)
                 return None
-            download_url = resp.json().get("url")
-            if not download_url:
+            info = resp.json()
+            if not info.get("url"):
                 return None
-            return download_url
+            return info
 
     except Exception as exc:
-        log.warning("[Attachment] Download URL fetch failed for %s: %s", attachment_id, exc)
+        log.warning("[Attachment] Info fetch failed for %s: %s", attachment_id, exc)
         return None
 
 
@@ -1986,14 +1988,23 @@ async def messages_to_chat_history(
             # `read_attachment(attachment_id)` is the universal fallback
             # any agent on any backend can call.
             signed_url = None
+            info: dict[str, Any] | None = None
             if attachment_id and base_url and token:
-                signed_url = await _get_attachment_download_url(attachment_id, base_url, token)
+                info = await _get_attachment_info(attachment_id, base_url, token)
+                if info:
+                    signed_url = info.get("url")
 
             label = (
                 f"{ts_prefix}{sender_label} shared a file: {filename}"
                 if role == "user"
                 else f"{ts_prefix}I shared a file: {filename}"
             )
+
+            # Prefer the server's authoritative size/summary metadata; fall
+            # back to the size embedded in the file message content.
+            size_bytes = (info or {}).get("sizeBytes")
+            if size_bytes is None:
+                size_bytes = file_info.get("sizeBytes")
 
             attachment_block = {
                 "type": "attachment",
@@ -2002,6 +2013,10 @@ async def messages_to_chat_history(
                 "attachment_id": attachment_id,
                 "url": signed_url,
                 "label": label,
+                "size_bytes": size_bytes,
+                "summary": (info or {}).get("summary"),
+                "summary_status": (info or {}).get("summaryStatus"),
+                "extraction_status": (info or {}).get("extractionStatus"),
             }
             history.append(ChatMessage(role=role, content=[attachment_block]))
             continue

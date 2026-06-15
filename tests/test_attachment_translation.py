@@ -8,6 +8,7 @@ import pytest
 from agentchat.backends import ChatMessage
 from agentchat.backends import _attachment as att
 from agentchat.backends.anthropic import _translate_attachments
+from agentchat.backends.claude_cli import _attachment_to_cli_pointer
 from agentchat.backends.openai import _translate_content
 from agentchat.backends.openclaw import _flatten_to_text
 
@@ -23,6 +24,17 @@ def _block(**overrides):
     }
     base.update(overrides)
     return base
+
+
+def _big_block(**overrides):
+    """A large (>512 KB) attachment with a ready server brief."""
+    base = {
+        "size_bytes": 2 * 1024 * 1024,
+        "summary": "It's a Q3 deck: revenue up 12%, churn down, asks for 2 hires.",
+        "summary_status": "completed",
+    }
+    base.update(overrides)
+    return _block(**base)
 
 
 # --- shared helper ----------------------------------------------------------
@@ -52,6 +64,51 @@ class TestSharedAttachmentHelper:
         text = att.fallback_text(_block())
         assert "read_attachment" in text
         assert "abc-123" in text
+
+
+# --- large-file gating ------------------------------------------------------
+
+
+class TestLargeAttachmentGating:
+    def test_large_non_image_routes_to_capped_path(self):
+        assert att.should_use_capped_path(_big_block())
+
+    def test_large_image_stays_native(self):
+        # Vision needs the bytes — never route images to the text path.
+        assert not att.should_use_capped_path(_big_block(content_type="image/png"))
+
+    def test_small_file_stays_native(self):
+        assert not att.should_use_capped_path(_block(size_bytes=1024))
+
+    def test_missing_size_stays_native(self):
+        assert not att.should_use_capped_path(_block())
+
+    def test_capped_pointer_has_brief_size_and_read_hint(self):
+        text = att.capped_pointer_text(_big_block())
+        assert "read_attachment" in text
+        assert "abc-123" in text
+        assert "Summary:" in text
+        assert "revenue up 12%" in text
+        assert "2097152 bytes" in text
+
+    def test_capped_pointer_omits_unready_brief(self):
+        text = att.capped_pointer_text(_big_block(summary=None, summary_status="pending"))
+        assert "Summary:" not in text
+        assert "read_attachment" in text
+
+
+# --- Claude CLI -------------------------------------------------------------
+
+
+class TestClaudeCliPointer:
+    def test_large_file_skips_download_for_capped_pointer(self):
+        # No cleanup_paths mutation and no network: a large file returns the
+        # capped pointer before any temp-file download is attempted.
+        cleanup: list[str] = []
+        text = _attachment_to_cli_pointer(_big_block(), cleanup)
+        assert "read_attachment" in text
+        assert "Summary:" in text
+        assert cleanup == []
 
 
 # --- Anthropic --------------------------------------------------------------
@@ -107,6 +164,22 @@ class TestAnthropicTranslation:
         assert msgs[0].content == "plain string"
         assert msgs[1].content == [{"type": "text", "text": "hi"}]
 
+    def test_large_pdf_skips_native_document_block_for_capped_pointer(self):
+        msgs = _translate_attachments([
+            ChatMessage(role="user", content=[_big_block()])
+        ])
+        blocks = msgs[0].content
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "text"
+        assert "read_attachment" in blocks[0]["text"]
+        assert "Summary:" in blocks[0]["text"]
+
+    def test_large_image_still_renders_natively(self):
+        msgs = _translate_attachments([
+            ChatMessage(role="user", content=[_big_block(content_type="image/png")])
+        ])
+        assert msgs[0].content[0]["type"] == "image"
+
 
 # --- OpenAI -----------------------------------------------------------------
 
@@ -124,6 +197,12 @@ class TestOpenAITranslation:
         assert "read_attachment" in out
         assert "abc-123" in out
 
+    def test_large_attachment_includes_brief(self):
+        out = _translate_content([_big_block()])
+        assert isinstance(out, str)
+        assert "Summary:" in out
+        assert "read_attachment" in out
+
 
 # --- OpenClaw ---------------------------------------------------------------
 
@@ -136,3 +215,8 @@ class TestOpenClawFlatten:
 
     def test_plain_string_passes_through(self):
         assert _flatten_to_text("hi") == "hi"
+
+    def test_large_attachment_includes_brief(self):
+        out = _flatten_to_text([_big_block()])
+        assert "Summary:" in out
+        assert "read_attachment" in out

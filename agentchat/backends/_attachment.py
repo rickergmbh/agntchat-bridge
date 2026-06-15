@@ -29,8 +29,57 @@ from __future__ import annotations
 from typing import Any
 
 
+# Non-image files at or above this size skip the raw download + native Read
+# path: the model is pointed at `read_attachment` (server-extracted text,
+# capped at 512 KB) plus the brief, so a multi-MB Read doesn't echo the whole
+# file back into context. Matches the backend's read_attachment inline cap —
+# below it, native Read is at most as large; above it, the capped path wins.
+# Images always render natively (vision needs the bytes).
+LARGE_ATTACHMENT_BYTES = 512 * 1024
+
+
 def is_image_attachment(block: dict[str, Any]) -> bool:
     return (block.get("content_type") or "").startswith("image/")
+
+
+def is_large_attachment(block: dict[str, Any]) -> bool:
+    """True when the file is big enough to prefer the capped read path."""
+    size = block.get("size_bytes")
+    return isinstance(size, int) and size >= LARGE_ATTACHMENT_BYTES
+
+
+def should_use_capped_path(block: dict[str, Any]) -> bool:
+    """Route large non-image files through read_attachment, not raw Read.
+
+    Images are excluded — a model needs the actual bytes to see them, and
+    they don't produce the giant text echo a document Read does.
+    """
+    return is_large_attachment(block) and not is_image_attachment(block)
+
+
+def capped_pointer_text(block: dict[str, Any]) -> str:
+    """Pointer for a large file: brief + read_attachment hint + size.
+
+    Deliberately inlines NO raw bytes. The model gets the server brief (if
+    ready) and is told to call `read_attachment` for the full (capped)
+    extracted text, or use the download URL for raw bytes.
+    """
+    parts = [attachment_label(block)]
+
+    summary = block.get("summary")
+    if summary and block.get("summary_status") == "completed":
+        parts.append(f"Summary: {summary}")
+
+    size = block.get("size_bytes")
+    if isinstance(size, int) and size > 0:
+        parts.append(f"({size} bytes — large file)")
+
+    if block.get("attachment_id"):
+        parts.append(
+            "Use read_attachment for the full server-extracted text (capped); "
+            "the download URL has the raw bytes if you truly need them."
+        )
+    return " ".join(parts)
 
 
 def is_pdf_attachment(block: dict[str, Any]) -> bool:

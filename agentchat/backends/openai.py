@@ -421,6 +421,8 @@ def _translate_content(content: Any) -> Any:
             if url and att.is_image_attachment(block):
                 out.append({"type": "image_url", "image_url": {"url": url}})
                 out.append({"type": "text", "text": att.attachment_label(block)})
+            elif att.should_use_capped_path(block):
+                out.append({"type": "text", "text": att.capped_pointer_text(block)})
             else:
                 out.append({"type": "text", "text": att.fallback_text(block)})
 

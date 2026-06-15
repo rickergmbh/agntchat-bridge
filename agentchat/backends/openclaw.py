@@ -202,7 +202,10 @@ def _flatten_to_text(content: Any) -> str:
         if btype == "text":
             parts.append(block.get("text", ""))
         elif btype == "attachment":
-            parts.append(att.fallback_text(block))
+            if att.should_use_capped_path(block):
+                parts.append(att.capped_pointer_text(block))
+            else:
+                parts.append(att.fallback_text(block))
     return "\n".join(parts) if parts else ""
 
 
