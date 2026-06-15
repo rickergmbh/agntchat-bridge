@@ -39,6 +39,7 @@ from ._cli_utils import (
     download_image_to_temp,
     download_to_temp,
     find_sibling_script,
+    iter_event_lines,
     parse_add_dirs_env,
     resolve_cli_path,
     save_base64_image_to_temp,
@@ -819,14 +820,9 @@ class ClaudeCliBackend(ModelBackend):
                 nonlocal result_text, _last_delta_time, _accumulated_text, _result_error_subtype, _result_subtype, _result_is_error, _num_turns
                 nonlocal _active_tool_use
                 assert proc.stdout is not None
-                while True:
-                    line = await asyncio.wait_for(
-                        proc.stdout.readline(),
-                        timeout=self._timeout,
-                    )
-                    if not line:
-                        break
-
+                async for line in iter_event_lines(
+                    proc.stdout, timeout=self._timeout, max_line=_STREAM_LIMIT
+                ):
                     line_str = line.decode().strip()
                     if not line_str:
                         continue

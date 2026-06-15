@@ -8,6 +8,7 @@ Windows users see divergent failures. Put the shared logic here.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import os
@@ -16,10 +17,16 @@ import shutil
 import sys
 import tempfile
 import urllib.request
-from typing import Iterable
+from typing import AsyncIterator, Iterable
 
 
 logger = logging.getLogger("agentchat.backends._cli_utils")
+
+# How much we pull from the subprocess pipe per read. The CLI stream is
+# newline-delimited JSON; we reassemble lines ourselves (see
+# ``iter_event_lines``) so this is just a syscall/granularity knob, not a
+# line-size cap.
+_READ_CHUNK = 256 * 1024
 
 # Matches ANSI escape sequences (colors, bold, cursor movement, etc.)
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -56,6 +63,65 @@ def parse_add_dirs_env() -> list[str]:
                 ADD_DIRS_ENV, d,
             )
     return valid
+
+
+async def iter_event_lines(
+    stream: asyncio.StreamReader,
+    *,
+    timeout: float,
+    max_line: int,
+) -> AsyncIterator[bytes]:
+    """Yield newline-delimited lines from a CLI's stdout, skipping over-long ones.
+
+    The Claude/Codex CLIs stream newline-delimited JSON. ``StreamReader.readline``
+    buffers a whole line and **raises** ``asyncio.LimitOverrunError`` ("Separator
+    is not found, and chunk exceed the limit") when a single line exceeds the
+    stream's buffer limit — killing the entire turn. That happens when the CLI's
+    ``Read`` tool echoes a large uploaded document back as a single ``tool_result``
+    line, which can be many MB.
+
+    The bridge never consumes those echo lines — it parses only token deltas and
+    the final ``result`` event, both bounded well under ``max_line`` by
+    ``maxOutputTokens``. So an over-long line is, by construction, always one we
+    were going to ignore. Rather than buffering it (and crashing), we drain and
+    drop it: read in fixed ``_READ_CHUNK`` blocks, reassemble lines ourselves,
+    and discard any line that grows past ``max_line`` without holding it in
+    memory. Lines at or under ``max_line`` are yielded intact.
+
+    ``timeout`` bounds each underlying read (a stalled-CLI backstop), not the
+    whole line — a large response that keeps flowing won't trip it. Stops at EOF,
+    flushing any trailing newline-less line.
+    """
+    buf = bytearray()
+    over = False  # current line already exceeded max_line → drop the rest of it
+    while True:
+        chunk = await asyncio.wait_for(stream.read(_READ_CHUNK), timeout=timeout)
+        if not chunk:
+            if buf and not over:
+                yield bytes(buf)
+            return
+        start = 0
+        while start < len(chunk):
+            nl = chunk.find(b"\n", start)
+            end = len(chunk) if nl == -1 else nl
+            if not over:
+                buf += chunk[start:end]
+                if len(buf) > max_line:
+                    logger.warning(
+                        "Skipping oversized CLI stream line (>%d bytes) — likely a "
+                        "tool_result echo of a large file; not consumed by the bridge.",
+                        max_line,
+                    )
+                    buf.clear()
+                    over = True
+            if nl == -1:
+                break
+            # Completed a line at the newline.
+            if not over:
+                yield bytes(buf)
+                buf.clear()
+            over = False
+            start = nl + 1
 
 
 def resolve_cli_path(path: str) -> str:

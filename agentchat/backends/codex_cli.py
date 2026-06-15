@@ -43,6 +43,7 @@ from ._cli_utils import (
     cleanup_temp_files,
     download_image_to_temp,
     find_sibling_script,
+    iter_event_lines,
     parse_add_dirs_env,
     resolve_cli_path,
     save_base64_image_to_temp,
@@ -703,14 +704,9 @@ class CodexCliBackend(ModelBackend):
                         pass
 
             assert proc.stdout is not None
-            while True:
-                line = await asyncio.wait_for(
-                    proc.stdout.readline(),
-                    timeout=self._timeout,
-                )
-                if not line:
-                    break
-
+            async for line in iter_event_lines(
+                proc.stdout, timeout=self._timeout, max_line=_STREAM_LIMIT
+            ):
                 line_str = line.decode().strip()
                 if not line_str:
                     continue
