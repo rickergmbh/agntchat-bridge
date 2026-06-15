@@ -493,6 +493,39 @@ async def _record_cli_tool_uses(
         logger.debug("[%s] CLI tool-use telemetry POST failed: %s", executor_key, e)
 
 
+async def _report_usage(
+    executor: Any,
+    usage: dict[str, int],
+    model: str | None,
+    executor_key: str,
+) -> None:
+    """POST one LLM turn's token usage to the backend.
+
+    Best-effort telemetry: the backend buckets it (ETS + batched flush) for the
+    operator console's per-agent/month token totals. Attributed server-side to
+    the authenticated agent. Failures log but never propagate to the turn.
+    """
+    if not usage:
+        return
+    try:
+        await executor._post(  # type: ignore[attr-defined]
+            "/api/usage",
+            {"usage": usage, "model": model},
+        )
+    except Exception as e:
+        logger.debug("[%s] Usage telemetry POST failed: %s", executor_key, e)
+
+
+def _maybe_report_usage(executor: Any, result: Any, executor_key: str) -> None:
+    """Fire-and-forget a usage report for a completed LLM turn, if it carried any."""
+    usage = getattr(result, "usage", None)
+    if not usage:
+        return
+    asyncio.create_task(
+        _report_usage(executor, dict(usage), getattr(result, "model", None), executor_key)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Location request helpers
 # ---------------------------------------------------------------------------
@@ -3332,6 +3365,34 @@ def run_single_agent(
         message_timeout=_executor_timeout,
         task_timeout=_executor_timeout,
     )
+
+    # Report LLM token usage after every turn. All LLM calls funnel through
+    # backend.chat / backend.chat_with_tools, so wrap both once here rather than
+    # threading a report call through ~11 scattered completion sites. The
+    # wrappers are transparent — they pass args through and return the result
+    # unchanged, scheduling a best-effort usage POST as a side effect.
+    try:
+        _orig_chat = backend.chat
+        _orig_chat_with_tools = getattr(backend, "chat_with_tools", None)
+
+        async def _chat_reporting(*a, **kw):
+            result = await _orig_chat(*a, **kw)
+            _maybe_report_usage(executor, result, executor_key)
+            return result
+
+        backend.chat = _chat_reporting  # type: ignore[assignment]
+
+        if _orig_chat_with_tools is not None:
+
+            async def _chat_with_tools_reporting(*a, **kw):
+                result = await _orig_chat_with_tools(*a, **kw)
+                _maybe_report_usage(executor, result, executor_key)
+                return result
+
+            backend.chat_with_tools = _chat_with_tools_reporting  # type: ignore[assignment]
+    except Exception as e:
+        # Telemetry is non-critical — never let wrapping break the executor.
+        logger.debug("[%s] Could not wrap backend for usage reporting: %s", executor_key, e)
 
     # --- Tool-use mode setup ---
     # Tool definitions come from the backend via skills (resolvedTools).
