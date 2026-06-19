@@ -701,34 +701,99 @@ def _is_result_presentation(data: dict[str, Any]) -> bool:
     return isinstance(items, list) and len(items) > 0 and isinstance(result_type, str)
 
 
-def parse_result_presentations(text: str) -> tuple[str, list[dict[str, Any]]]:
-    """Extract <result_presentation> JSON blocks from LLM output."""
-    presentations: list[dict[str, Any]] = []
-    matched_any = False
+# Strips XML-ish child tags (e.g. <title>, <subtitle>) but keeps their text,
+# used when salvaging a block the model wrote as markup instead of JSON.
+_INNER_TAG_RE = re.compile(r"</?[a-zA-Z_][\w-]*\s*>")
 
-    for match in _RESULT_TAG_RE.finditer(text):
-        matched_any = True
+
+def _salvage_block_text(raw_inner: str) -> str:
+    """Best-effort plain-text rendering of a result_presentation block that
+    failed to validate as JSON.
+
+    When the model emits a malformed or XML-shaped block, deleting it leaves a
+    visible hole in the reply (the café-list bug). Instead we salvage whatever
+    readable content we can so the user still sees the information, just without
+    the rich card styling:
+
+    - Valid JSON dict → render each item's title/subtitle/text-ish fields as
+      markdown bullets.
+    - Otherwise (XML children / prose) → drop the inner tags, keep their text.
+    """
+    raw_inner = (raw_inner or "").strip()
+    if not raw_inner:
+        return ""
+
+    data: Any = None
+    try:
+        data = json.loads(raw_inner)
+    except json.JSONDecodeError:
+        repaired = _try_repair_json(raw_inner)
+        data = repaired if repaired is not None else None
+
+    if isinstance(data, dict):
+        items = data.get("items")
+        lines: list[str] = []
+        title = data.get("title")
+        if isinstance(title, str) and title.strip():
+            lines.append(f"**{title.strip()}**")
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("title") or item.get("name")
+                subtitle = item.get("subtitle") or item.get("description")
+                if isinstance(name, str) and name.strip():
+                    bullet = f"- **{name.strip()}**"
+                    if isinstance(subtitle, str) and subtitle.strip():
+                        bullet += f" — {subtitle.strip()}"
+                    lines.append(bullet)
+                elif isinstance(subtitle, str) and subtitle.strip():
+                    lines.append(f"- {subtitle.strip()}")
+        if lines:
+            return "\n".join(lines)
+
+    # Not usable JSON — strip XML-ish child tags and keep the text content.
+    stripped = _INNER_TAG_RE.sub(" ", raw_inner)
+    # Collapse the whitespace the tag removal leaves behind.
+    return re.sub(r"[ \t]+", " ", stripped).strip()
+
+
+def parse_result_presentations(text: str) -> tuple[str, list[dict[str, Any]]]:
+    """Extract <result_presentation> JSON blocks from LLM output.
+
+    Valid blocks become structured presentations and are stripped from the
+    visible text (they render as cards). Blocks that match the tag but fail to
+    validate are NOT silently deleted — their content is salvaged back into the
+    text as markdown so the user never sees an empty gap where results should
+    be (see _salvage_block_text)."""
+    presentations: list[dict[str, Any]] = []
+
+    def _replace(match: "re.Match[str]") -> str:
         json_str = match.group(1)
         try:
             data = json.loads(json_str)
-            if _is_result_presentation(data):
-                presentations.append(data)
-            else:
-                logger.warning("result_presentation block missing items/result_type")
         except json.JSONDecodeError:
-            repaired = _try_repair_json(json_str)
-            if repaired and _is_result_presentation(repaired):
-                presentations.append(repaired)
+            data = _try_repair_json(json_str)
+            if data is not None:
                 logger.info("Repaired malformed result_presentation JSON")
-            else:
-                logger.warning("Failed to parse or repair result_presentation JSON")
 
-    # Always strip well-formed <result_presentation>...</result_presentation>
-    # blocks from the user-visible text, even when none parsed as JSON. The
-    # tag is an internal protocol — when the model emits XML-shaped children
-    # instead of JSON (a known failure mode), raw template markup bleeding
-    # into the conversation is worse than dropping the structured payload.
-    remaining = _RESULT_TAG_RE.sub("", text).strip() if matched_any else text
+        if isinstance(data, dict) and _is_result_presentation(data):
+            presentations.append(data)
+            return ""  # rendered as a card — remove from visible text
+
+        # Failed to parse or wrong shape — salvage the content as text instead
+        # of dropping it, so the reply doesn't end up with a hole in it.
+        salvaged = _salvage_block_text(json_str)
+        if salvaged:
+            logger.warning(
+                "result_presentation block invalid — salvaged %d chars as text",
+                len(salvaged),
+            )
+            return salvaged
+        logger.warning("result_presentation block invalid and empty — dropped")
+        return ""
+
+    remaining = _RESULT_TAG_RE.sub(_replace, text).strip()
 
     # Truncated blocks (opening tag but no closing tag)
     _OPEN_TAG = "<result_presentation>"
@@ -742,6 +807,12 @@ def parse_result_presentations(text: str) -> tuple[str, list[dict[str, Any]]]:
                 presentations.append(repaired)
                 remaining = remaining[:idx].strip()
                 logger.info("Recovered truncated result_presentation block (%d items)", len(repaired["items"]))
+            else:
+                # Couldn't recover structured data — salvage the partial block
+                # as text rather than leaving a dangling open tag in the reply.
+                salvaged = _salvage_block_text(json_part)
+                remaining = (remaining[:idx] + ("\n\n" + salvaged if salvaged else "")).strip()
+                logger.warning("Truncated result_presentation block salvaged as text (%d chars)", len(salvaged))
 
     return remaining, presentations
 
