@@ -963,6 +963,48 @@ async def execute_tool_calls(
     return results
 
 
+# Side-effecting tools whose execution must ALWAYS be surfaced to the user,
+# even when the agent also wrote surrounding prose. Without this, an agent that
+# drafts an email as prose AND fires <tool_call>{send_email} silently performs
+# the action — the tool block (carrying the body) is stripped at finalization
+# and nothing confirms it happened. Read-only tools (list_*, get_*) are absent
+# on purpose: their data already feeds the reply prose.
+_ACTION_TOOL_CONFIRMATIONS = {
+    "send_email": "Email sent",
+    "save_draft": "Draft saved to Gmail drafts",
+    "create_calendar_event": "Calendar event created",
+    "delete_calendar_event": "Calendar event deleted",
+}
+
+
+def _summarize_action_tool_calls(results: list[dict[str, Any]]) -> list[str]:
+    """Build short user-facing confirmation lines for side-effecting tools.
+
+    Mirrors the CTA confirmation strings (see `_handle_cta_action`) so a
+    tag-based <tool_call> for send_email/save_draft reads the same as the
+    button-driven path. Returns one line per action tool; read-only tools and
+    tools that errored-out-loud are skipped (errors flow through normal
+    follow-up). Empty list when nothing actionable ran.
+    """
+    lines: list[str] = []
+    for tr in results:
+        label = _ACTION_TOOL_CONFIRMATIONS.get(_normalized_tool_name(tr.get("name", "")))
+        if not label:
+            continue
+        args = tr.get("arguments", {}) or {}
+        to = args.get("to", "")
+        subject = args.get("subject") or args.get("title") or ""
+        if "error" in tr:
+            lines.append(f"⚠️ {label} failed: {tr['error']}")
+            continue
+        detail = subject and f': "{subject}"' or ""
+        if to:
+            lines.append(f"✓ {label} to {to}{detail}")
+        else:
+            lines.append(f"✓ {label}{detail}")
+    return lines
+
+
 def _format_tool_results_for_followup(results: list[dict[str, Any]]) -> str:
     """Format tool execution results for LLM follow-up summarization."""
     parts = []
@@ -4567,6 +4609,18 @@ def run_single_agent(
                 except Exception as e:
                     logger.warning("[%s] Tool follow-up failed, using raw results: %s", executor_key, e)
                     reply = tool_result_text[:MAX_REPLY_CHARS]
+            elif reply.strip() and tool_results:
+                # Prose AND side-effecting tools: the tool block (carrying the
+                # email/draft body) was just stripped, so the reply alone never
+                # tells the user the action happened. Append a confirmation line
+                # per action tool so the final message reflects what was done.
+                confirmations = _summarize_action_tool_calls(tool_results)
+                if confirmations:
+                    reply = reply.rstrip() + "\n\n" + "\n".join(confirmations)
+                    logger.info(
+                        "[%s] Appended %d action-tool confirmation(s) to reply",
+                        executor_key, len(confirmations),
+                    )
 
         # Detect task requests (parse now to strip tags, but defer creation until after reply is sent)
         _deferred_task_requests: list[dict[str, Any]] = []
