@@ -210,6 +210,14 @@ class ClaudeCliBackend(ModelBackend):
         api_url: str | None = None,
         agent_id: str | None = None,
         api_key: str | None = None,
+        # CLI connection (auth/runtime) — server is the source of truth. The
+        # bridge forwards the profile's cli_connection so we set the matching
+        # CLAUDE_CODE_USE_* env on the spawned CLI ourselves, keeping the env
+        # flag and the resolved --model id (also server-derived) in lockstep.
+        cli_connection: str | None = None,
+        aws_region: str | None = None,
+        vertex_region: str | None = None,
+        vertex_project: str | None = None,
         **_kwargs: Any,
     ) -> None:
         self._cli_path = resolve_cli_path(
@@ -321,6 +329,14 @@ class ClaudeCliBackend(ModelBackend):
         # computer-use timeout just reintroduces the silent-cutoff bug.
         if self._computer_use_mode == "local":
             self._timeout = max(self._timeout, _COMPUTER_USE_TIMEOUT)
+
+        # CLI connection (auth/runtime). The server profile is authoritative;
+        # `_isolated_env` translates this into the mutually-exclusive
+        # CLAUDE_CODE_USE_BEDROCK / _VERTEX switches the `claude` CLI reads.
+        self._cli_connection = cli_connection
+        self._aws_region = aws_region or os.getenv("AWS_REGION") or "us-east-1"
+        self._vertex_region = vertex_region
+        self._vertex_project = vertex_project
 
         # MCP context (set per-invocation via set_mcp_context)
         self._mcp_resolved_tools: list[dict[str, Any]] | None = None
@@ -692,17 +708,47 @@ class ClaudeCliBackend(ModelBackend):
     # Batch mode (original behavior, no progress)
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _isolated_env() -> dict[str, str]:
+    def _isolated_env(self) -> dict[str, str]:
         """Return env vars that prevent Claude CLI from loading project CLAUDE.md.
 
         Agents get their identity from soul.md stored in the AgentGram database,
         passed via --append-system-prompt.  Without isolation the CLI picks up
         whatever CLAUDE.md exists in the working directory, overriding the agent's
         real personality.
+
+        Also applies the CLI connection (auth/runtime) the server selected. The
+        Claude CLI routes through AWS Bedrock / GCP Vertex purely off the
+        mutually-exclusive CLAUDE_CODE_USE_BEDROCK / _VERTEX switches. We ALWAYS
+        clear both first, then set the one this connection needs — otherwise an
+        ambient/inherited switch (the bridge process may itself run on a managed
+        machine, or the desktop's Tauri layer may have set one) could hijack the
+        agent's choice. This is the bridge half of the single-source-of-truth
+        fix: the same server `cli_connection` that resolved `--model` also picks
+        the runtime here, so the two can never disagree.
         """
         env = os.environ.copy()
         env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
+
+        # Clear both switches unconditionally — see docstring.
+        env.pop("CLAUDE_CODE_USE_BEDROCK", None)
+        env.pop("CLAUDE_CODE_USE_VERTEX", None)
+
+        connection = self._cli_connection or "subscription"
+        if connection == "bedrock":
+            env["CLAUDE_CODE_USE_BEDROCK"] = "1"
+            # Claude Code needs AWS_REGION explicitly (it does not read ~/.aws
+            # for the region). Credentials themselves come from the machine's
+            # default chain (~/.aws, SSO, env), unchanged.
+            env["AWS_REGION"] = self._aws_region
+        elif connection == "vertex":
+            env["CLAUDE_CODE_USE_VERTEX"] = "1"
+            if self._vertex_region:
+                env["CLOUD_ML_REGION"] = self._vertex_region
+            if self._vertex_project:
+                env["ANTHROPIC_VERTEX_PROJECT_ID"] = self._vertex_project
+        # "subscription"/"anthropic" leave both switches cleared above — the CLI
+        # uses the machine's `claude login` (or an ambient API key) as-is.
+
         return env
 
     def outer_timeout(self) -> int:

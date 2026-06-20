@@ -407,6 +407,23 @@ def extract_agent_config(profile: dict[str, Any] | None) -> dict[str, Any]:
         config["model"] = model_config["model"]
     elif metadata.get("model"):
         config["model"] = metadata["model"]
+    # CLI connection (auth/runtime) + its cloud region/project. The backend is
+    # the single source of truth: the serializer stamps `cli_connection` (and
+    # resolves `runtime_api_id` from it) onto every CLI agent's modelConfig. The
+    # bridge reads it here and the claude_cli backend uses it to set the right
+    # CLAUDE_CODE_USE_* env on the spawned CLI — so the env flag and the model
+    # id always agree, on desktop AND org-host alike. `runtime_api_id` is the
+    # same value, surfaced separately so the model-resolution guard below can
+    # detect a Bedrock/Vertex connection that resolved no platform model id.
+    if model_config.get("cli_connection"):
+        config["cli_connection"] = model_config["cli_connection"]
+    config["has_runtime_api_id"] = bool(model_config.get("runtime_api_id"))
+    if model_config.get("aws_region"):
+        config["aws_region"] = model_config["aws_region"]
+    if model_config.get("vertex_region"):
+        config["vertex_region"] = model_config["vertex_region"]
+    if model_config.get("vertex_project"):
+        config["vertex_project"] = model_config["vertex_project"]
     if model_config.get("max_tokens"):
         config["max_tokens"] = int(model_config["max_tokens"])
     elif metadata.get("max_tokens"):
@@ -3263,6 +3280,43 @@ def run_single_agent(
         backend_kwargs["api_url"] = AGENTGRAM_API_URL
         backend_kwargs["agent_id"] = agent_id
         backend_kwargs["api_key"] = api_key
+
+        # CLI connection (auth/runtime) from the server profile. The backend
+        # is the single source of truth: this is the SAME value the serializer
+        # used to resolve `runtime_api_id`, so the CLAUDE_CODE_USE_* env the
+        # claude_cli backend sets from it can never disagree with the resolved
+        # model id. Desktop's Tauri shell ALSO sets these env vars from its
+        # local copy — when the two agree it's a harmless no-op; when they'd
+        # drift (e.g. the desktop never persisted the pick to the backend),
+        # this server-driven value is the authoritative one. Org-host bridges
+        # have no Tauri layer at all, so this is their only source.
+        if agent_config.get("cli_connection"):
+            backend_kwargs["cli_connection"] = agent_config["cli_connection"]
+        if agent_config.get("aws_region"):
+            backend_kwargs["aws_region"] = agent_config["aws_region"]
+        if agent_config.get("vertex_region"):
+            backend_kwargs["vertex_region"] = agent_config["vertex_region"]
+        if agent_config.get("vertex_project"):
+            backend_kwargs["vertex_project"] = agent_config["vertex_project"]
+
+        # Fail loud on the split-brain that caused the original bug: a cloud
+        # connection (Bedrock/Vertex) needs the platform-specific model id the
+        # server resolves into `runtime_api_id`. If the connection says cloud
+        # but no runtime_api_id came back, the canonical id (e.g.
+        # "claude-opus-4-8") would be handed to a CLI pointed at Bedrock and
+        # rejected with an opaque 400. Refuse to start with a clear message
+        # instead — almost always means the desktop's connection pick never
+        # persisted to the backend (re-pick it in Agent Config to fix).
+        _conn = agent_config.get("cli_connection")
+        if _conn in ("bedrock", "vertex") and not agent_config.get("has_runtime_api_id"):
+            raise SystemExit(
+                f"[{executor_key}] cli_connection={_conn!r} but the server "
+                f"resolved no runtime_api_id for model "
+                f"{backend_kwargs.get('model')!r}. The canonical model id would "
+                f"be rejected by {_conn}. This usually means the connection "
+                f"choice wasn't saved to the backend — re-pick the Connection "
+                f"in Agent Config (which persists it) and restart."
+            )
 
     # LLM API key precedence: explicit kwarg (CLI / agent_config) → server
     # credential → env var (handled inside the backend constructor).
