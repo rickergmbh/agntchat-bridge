@@ -3650,9 +3650,97 @@ def run_single_agent(
                 last_seen_message_id=last_seen_message_id,
             )
 
+    # --- Toolkit refresh ---
+    # The startup profile fetch (above) froze `resolved_tools` and everything
+    # derived from it (`_tool_defs`, `_tool_prompt_suffix`, `_has_mcp`). Without
+    # a refresh, any global tool seeded AFTER this bridge booted — e.g. an
+    # `update_pulse` added by a later migration — is silently uninvokable until
+    # the process is manually restarted: `execute_tool_calls` rejects any name
+    # not in `resolved_tools` as "Unknown tool" before it can reach the backend
+    # passthrough. Re-fetch the profile on task/message pickup, TTL-guarded so we
+    # don't hit /api/me on every single turn.
+    _tools_refreshed_at = _time.monotonic()
+    _TOOLS_REFRESH_TTL = 60.0
+
+    async def _maybe_refresh_resolved_tools() -> None:
+        nonlocal resolved_tools, server_tools, _tool_defs, _tool_prompt_suffix
+        nonlocal _has_mcp, _tools_refreshed_at
+
+        if _time.monotonic() - _tools_refreshed_at < _TOOLS_REFRESH_TTL:
+            return
+        # Stamp before the fetch so a slow/failed call doesn't let concurrent
+        # turns pile up duplicate refreshes.
+        _tools_refreshed_at = _time.monotonic()
+
+        try:
+            fresh = await _fetch_profile(AGENTGRAM_API_URL, agent_id, api_key)
+        except AuthError:
+            raise  # bad agent key — surface it, don't swallow
+        except Exception as e:
+            logger.debug("[%s] Toolkit refresh fetch failed: %s", executor_key, e)
+            return
+
+        all_resolved = (fresh or {}).get("resolvedTools") or []
+        if not all_resolved:
+            # An empty resolve is treated as a transient blip, not a real
+            # "all tools removed" event — clobbering to empty would break tool
+            # access for the rest of the session. Keep the current toolkit.
+            return
+
+        new_server = [t for t in all_resolved if t.get("category") == "server_tool"]
+        new_resolved = [t for t in all_resolved if t.get("category") != "server_tool"]
+
+        old_names = {t.get("name") for t in resolved_tools}
+        new_names = {t.get("name") for t in new_resolved}
+        if new_names == old_names and len(new_server) == len(server_tools):
+            return  # toolkit unchanged — nothing to rebuild
+
+        added = sorted(n for n in new_names - old_names if n)
+        removed = sorted(n for n in old_names - new_names if n)
+        resolved_tools = new_resolved
+        server_tools = new_server
+
+        # Rebuild everything the startup block derived from the toolkit. Mirror
+        # the setup at "--- Tool-use mode setup ---" exactly so a refreshed tool
+        # is wired identically to one present at boot.
+        _tool_defs = None
+        _tool_prompt_suffix = ""
+        if execution_mode == "tool_use" and resolved_tools:
+            if sync_backend_name in ("anthropic",):
+                _tool_defs = _resolved_tools_to_anthropic(resolved_tools)
+            else:
+                _tool_defs = _resolved_tools_to_openai(resolved_tools)
+
+        if execution_mode == "tool_use" and server_tools and sync_backend_name == "anthropic":
+            _server_defs = _server_tools_to_anthropic(server_tools)
+            if _server_defs:
+                _tool_defs = (_tool_defs or []) + _server_defs
+                if hasattr(backend, "set_server_tool_betas"):
+                    backend.set_server_tool_betas(_server_tool_betas(server_tools))
+        elif execution_mode == "single_shot" and resolved_tools:
+            _tool_prompt_suffix = _build_tool_param_details_from_resolved(resolved_tools)
+
+        _has_mcp = (
+            hasattr(backend, "set_mcp_context")
+            and resolved_tools
+            and hasattr(backend, "_mcp_server_script")
+            and backend._mcp_server_script
+        )
+        if _has_mcp:
+            _tool_prompt_suffix = ""
+
+        logger.info(
+            "[%s] Toolkit refreshed (added=%s removed=%s, now %d tools)",
+            executor_key, added or "none", removed or "none", len(resolved_tools),
+        )
+
     @executor.on_task
     async def handle_task(task: GatewayTask) -> dict[str, Any]:
         nonlocal _cached_directives_by_conv, _cached_directives_fallback
+
+        # Pick up any tools seeded since boot (e.g. update_pulse) before we
+        # build this turn's tool defs. TTL-guarded — usually a no-op.
+        await _maybe_refresh_resolved_tools()
 
         # Read behavioral config from server directives (with per-conversation cache fallback)
         task_directives = task.raw.get("directives") or {}
@@ -4096,6 +4184,10 @@ def run_single_agent(
             "human" if msg.is_human else "agent",
             msg.content[:100],
         )
+
+        # Pick up any tools seeded since boot before building this turn's tool
+        # defs. TTL-guarded — usually a no-op.
+        await _maybe_refresh_resolved_tools()
 
         async def _cancel_signal_bubble() -> None:
             """Clear the backend's InstantAgentSignal "thinking" bubble.
