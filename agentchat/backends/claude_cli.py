@@ -1094,15 +1094,22 @@ class ClaudeCliBackend(ModelBackend):
         max_iterations: int = 10,
         max_tool_calls: int = 25,
         on_progress: ProgressCallback | None = None,
+        guardrail_config: dict[str, Any] | None = None,
     ) -> ModelResult:
         """Agentic tool-use loop.
 
         When MCP context is set (resolved_tools via set_mcp_context), Claude CLI
         handles tool calls natively via the MCP server — single invocation, no
-        iterative XML parsing loop.
+        iterative XML parsing loop. In that mode the CLI owns the loop, so intra-
+        turn guardrails cannot be enforced here; the server instead injects a
+        "don't repeat failing/no-progress calls" directive into the system prompt.
 
-        Falls back to the legacy <tool_call> XML loop when MCP is not available.
+        Falls back to the legacy <tool_call> XML loop when MCP is not available;
+        guardrails ARE enforced on that path.
         """
+        from ..tools.guardrails import ToolCallGuardrail
+
+        guardrail = ToolCallGuardrail(guardrail_config)
         # --- MCP path: single invocation, CLI handles tool loop ---
         mcp_tools = self._mcp_resolved_tools
         if mcp_tools and self._mcp_server_script:
@@ -1280,33 +1287,55 @@ class ClaudeCliBackend(ModelBackend):
                     )
                     continue
 
+                call_args = call.get("arguments", {})
+
+                # Guardrail pre-check: block degenerate repeat/no-progress calls
+                pre = guardrail.before_call(call["name"], call_args)
+                if pre.blocked:
+                    logger.warning(
+                        "Tool %s blocked by guardrail (%s)", call["name"], pre.code,
+                    )
+                    all_tool_calls.append(ToolCall(
+                        id=f"cli_{iteration}_{len(all_tool_calls)}",
+                        name=call["name"],
+                        arguments=call_args,
+                        result=pre.message,
+                        elapsed_seconds=0.0,
+                    ))
+                    tool_result_parts.append(
+                        f"Tool `{call['name']}`: BLOCKED — {pre.message}"
+                    )
+                    continue
+
                 if on_progress:
                     await on_progress({
                         "type": "tool_call",
                         "tool": call["name"],
-                        "arguments": call.get("arguments", {}),
+                        "arguments": call_args,
                         "iteration": iteration,
                         "total_tool_calls": len(all_tool_calls) + 1,
                     })
 
                 tc_start = time.monotonic()
-                result_str = await tool_executor.execute(
-                    call["name"], call.get("arguments", {})
-                )
+                result_str = await tool_executor.execute(call["name"], call_args)
                 tc_elapsed = time.monotonic() - tc_start
 
                 all_tool_calls.append(ToolCall(
                     id=f"cli_{iteration}_{len(all_tool_calls)}",
                     name=call["name"],
-                    arguments=call.get("arguments", {}),
+                    arguments=call_args,
                     result=result_str,
                     elapsed_seconds=round(tc_elapsed, 2),
                 ))
+
+                post = guardrail.after_call(call["name"], call_args, result_str)
 
                 # Truncate large results for prompt context
                 display_result = result_str[:3000]
                 if len(result_str) > 3000:
                     display_result += "\n... (truncated)"
+                if post.has_message:
+                    display_result += f"\n\n[guardrail] {post.message}"
                 tool_result_parts.append(
                     f"Tool `{call['name']}` result:\n```json\n{display_result}\n```"
                 )

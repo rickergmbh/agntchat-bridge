@@ -3751,6 +3751,7 @@ def run_single_agent(
         elif not task_directives:
             task_directives = (conv_id and _cached_directives_by_conv.get(conv_id)) or _cached_directives_fallback or {}
         behavioral_config = task_directives.get("behavioralConfig")
+        _guardrail_config = (behavioral_config or {}).get("toolLoopGuardrails")
 
         task_meta = task.raw.get("task", {}).get("metadata", {})
 
@@ -3894,6 +3895,7 @@ def run_single_agent(
             result = await backend.chat_with_tools(
                 task_prompt, chat_messages, _tool_defs, tool_exec,
                 on_progress=_task_stream_cb,
+                guardrail_config=_guardrail_config,
             )
             if hasattr(progress_cb, "flush"):
                 await progress_cb.flush()
@@ -4220,6 +4222,7 @@ def run_single_agent(
             _cached_directives_fallback = msg.directives
         directives = msg.directives or (conv_id and _cached_directives_by_conv.get(conv_id)) or _cached_directives_fallback or {}
         behavioral_config = directives.get("behavioralConfig", {})
+        _guardrail_config = (behavioral_config or {}).get("toolLoopGuardrails")
         is_orchestrator = directives.get("isOrchestrator", False)
         skip_message = directives.get("skipMessage", False)
         skip_reason = directives.get("skipReason")
@@ -4427,6 +4430,7 @@ def run_single_agent(
                 result = await backend.chat_with_tools(
                     msg_prompt, chat_messages, _tool_defs, tool_exec,
                     on_progress=_stream_cb,
+                    guardrail_config=_guardrail_config,
                 )
             except Exception:
                 logger.exception("[%s] Model call failed (tool_use)", executor_key)

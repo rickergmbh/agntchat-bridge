@@ -201,11 +201,15 @@ class OpenAIBackend(ModelBackend):
         max_iterations: int = 10,
         max_tool_calls: int = 25,
         on_progress: Any = None,
+        guardrail_config: dict[str, Any] | None = None,
     ) -> ModelResult:
         """Agentic tool-use loop using OpenAI's function calling format.
 
         Works with OpenAI and any compatible provider that supports tool_calls.
         """
+        from ..tools.guardrails import ToolCallGuardrail
+
+        guardrail = ToolCallGuardrail(guardrail_config)
         api_messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt}
         ]
@@ -281,6 +285,26 @@ class OpenAIBackend(ModelBackend):
                 except (json.JSONDecodeError, TypeError):
                     args = {}
 
+                # Guardrail pre-check: block degenerate repeat/no-progress calls
+                pre = guardrail.before_call(tc.function.name, args)
+                if pre.blocked:
+                    logger.warning(
+                        "Tool %s blocked by guardrail (%s)", tc.function.name, pre.code,
+                    )
+                    all_tool_calls.append(ToolCall(
+                        id=tc.id,
+                        name=tc.function.name,
+                        arguments=args,
+                        result=pre.message,
+                        elapsed_seconds=0.0,
+                    ))
+                    api_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": json.dumps({"error": pre.message, "guardrail": pre.code}),
+                    })
+                    continue
+
                 if on_progress:
                     await on_progress({
                         "type": "tool_call",
@@ -302,10 +326,15 @@ class OpenAIBackend(ModelBackend):
                     elapsed_seconds=round(tc_elapsed, 2),
                 ))
 
+                post = guardrail.after_call(tc.function.name, args, result_str)
+                tool_content = result_str
+                if post.has_message:
+                    tool_content = f"{result_str}\n\n[guardrail] {post.message}"
+
                 api_messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
-                    "content": result_str,
+                    "content": tool_content,
                 })
 
                 logger.info(

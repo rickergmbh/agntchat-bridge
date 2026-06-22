@@ -9,6 +9,7 @@ activity feed.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -463,6 +464,7 @@ class AnthropicBackend(ModelBackend):
         max_iterations: int = 10,
         max_tool_calls: int = 25,
         on_progress: Any = None,
+        guardrail_config: dict[str, Any] | None = None,
     ) -> ModelResult:
         """Agentic tool-use loop using Anthropic's native tool_use blocks.
 
@@ -471,7 +473,13 @@ class AnthropicBackend(ModelBackend):
         2. If stop_reason == "tool_use": execute tool calls, feed results back
         3. If stop_reason != "tool_use": return final text response
         4. Repeat until max_iterations or max_tool_calls hit
+
+        Intra-turn tool-loop guardrails (server-configured) detect and break
+        degenerate retry / no-progress loops within this single turn.
         """
+        from ..tools.guardrails import ToolCallGuardrail
+
+        guardrail = ToolCallGuardrail(guardrail_config)
         api_messages = _coalesce_messages(_translate_attachments(messages))
         all_tool_calls: list[ToolCall] = []
         total_usage = {
@@ -551,34 +559,66 @@ class AnthropicBackend(ModelBackend):
                     })
                     continue
 
+                block_args = dict(block.input) if block.input else {}
+
+                # Guardrail pre-check: block degenerate repeat/no-progress calls
+                # before spending the round-trip, feeding the reason back so the
+                # model changes strategy instead of re-issuing the same call.
+                pre = guardrail.before_call(block.name, block_args)
+                if pre.blocked:
+                    logger.warning(
+                        "Tool %s blocked by guardrail (%s)", block.name, pre.code,
+                    )
+                    all_tool_calls.append(ToolCall(
+                        id=block.id,
+                        name=block.name,
+                        arguments=block_args,
+                        result=pre.message,
+                        elapsed_seconds=0.0,
+                    ))
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": json.dumps({"error": pre.message, "guardrail": pre.code}),
+                        "is_error": True,
+                    })
+                    continue
+
                 # Report progress
                 if on_progress:
                     await on_progress({
                         "type": "tool_call",
                         "tool": block.name,
-                        "arguments": dict(block.input) if block.input else {},
+                        "arguments": block_args,
                         "iteration": iteration,
                         "total_tool_calls": len(all_tool_calls) + 1,
                     })
 
                 tc_start = time.monotonic()
-                result_str = await tool_executor.execute(
-                    block.name, dict(block.input) if block.input else {}
-                )
+                result_str = await tool_executor.execute(block.name, block_args)
                 tc_elapsed = time.monotonic() - tc_start
 
                 all_tool_calls.append(ToolCall(
                     id=block.id,
                     name=block.name,
-                    arguments=dict(block.input) if block.input else {},
+                    arguments=block_args,
                     result=result_str,
                     elapsed_seconds=round(tc_elapsed, 2),
                 ))
 
+                # Guardrail post-check: record outcome; append any warning as a
+                # nudge the model sees alongside the result.
+                post = guardrail.after_call(block.name, block_args, result_str)
+                result_payload = result_str
+                if post.has_message:
+                    result_payload = (
+                        f"{result_str}\n\n[guardrail] {post.message}"
+                    )
+
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": result_str,
+                    "content": result_payload,
                 })
 
                 logger.info(

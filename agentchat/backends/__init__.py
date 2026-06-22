@@ -169,6 +169,7 @@ class ModelBackend(ABC):
         max_iterations: int = 10,
         max_tool_calls: int = 25,
         on_progress: ProgressCallback | None = None,
+        guardrail_config: dict[str, Any] | None = None,
     ) -> ModelResult:
         """Agentic tool-use loop: LLM calls tools iteratively until done.
 
@@ -182,6 +183,9 @@ class ModelBackend(ABC):
             max_tool_calls: Max individual tool invocations before forcing
                 a final text-only response.
             on_progress: Called after each tool call with event details.
+            guardrail_config: Server-provided intra-turn tool-loop guardrail
+                thresholds (``behavioralConfig.toolLoopGuardrails``). When None,
+                backends fall back to built-in defaults.
 
         Raises:
             NotImplementedError: If the backend doesn't support tool use.
