@@ -170,6 +170,7 @@ class ModelBackend(ABC):
         max_tool_calls: int = 25,
         on_progress: ProgressCallback | None = None,
         guardrail_config: dict[str, Any] | None = None,
+        compaction_config: dict[str, Any] | None = None,
     ) -> ModelResult:
         """Agentic tool-use loop: LLM calls tools iteratively until done.
 
@@ -186,6 +187,10 @@ class ModelBackend(ABC):
             guardrail_config: Server-provided intra-turn tool-loop guardrail
                 thresholds (``behavioralConfig.toolLoopGuardrails``). When None,
                 backends fall back to built-in defaults.
+            compaction_config: Server-provided in-turn context compaction config
+                (``behavioralConfig.compaction``) — trigger ratio, tail budget,
+                and the summary template/prefix. When None, backends fall back
+                to built-in defaults (or skip compaction if unsupported).
 
         Raises:
             NotImplementedError: If the backend doesn't support tool use.

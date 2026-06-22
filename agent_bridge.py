@@ -3752,6 +3752,7 @@ def run_single_agent(
             task_directives = (conv_id and _cached_directives_by_conv.get(conv_id)) or _cached_directives_fallback or {}
         behavioral_config = task_directives.get("behavioralConfig")
         _guardrail_config = (behavioral_config or {}).get("toolLoopGuardrails")
+        _compaction_config = (behavioral_config or {}).get("compaction")
 
         task_meta = task.raw.get("task", {}).get("metadata", {})
 
@@ -3896,6 +3897,7 @@ def run_single_agent(
                 task_prompt, chat_messages, _tool_defs, tool_exec,
                 on_progress=_task_stream_cb,
                 guardrail_config=_guardrail_config,
+                compaction_config=_compaction_config,
             )
             if hasattr(progress_cb, "flush"):
                 await progress_cb.flush()
@@ -4223,6 +4225,7 @@ def run_single_agent(
         directives = msg.directives or (conv_id and _cached_directives_by_conv.get(conv_id)) or _cached_directives_fallback or {}
         behavioral_config = directives.get("behavioralConfig", {})
         _guardrail_config = (behavioral_config or {}).get("toolLoopGuardrails")
+        _compaction_config = (behavioral_config or {}).get("compaction")
         is_orchestrator = directives.get("isOrchestrator", False)
         skip_message = directives.get("skipMessage", False)
         skip_reason = directives.get("skipReason")
@@ -4431,6 +4434,7 @@ def run_single_agent(
                     msg_prompt, chat_messages, _tool_defs, tool_exec,
                     on_progress=_stream_cb,
                     guardrail_config=_guardrail_config,
+                    compaction_config=_compaction_config,
                 )
             except Exception:
                 logger.exception("[%s] Model call failed (tool_use)", executor_key)

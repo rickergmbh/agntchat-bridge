@@ -85,6 +85,12 @@ class AnthropicBackend(ModelBackend):
         # (executorConfig.anthropic_beta) — see set_server_tool_betas.
         self._server_tool_betas: list[str] = []
 
+        # Context window for in-turn compaction sizing. Modern Claude models are
+        # 200k; overridable via env for non-default deployments.
+        self._context_window = (
+            _try_int(os.getenv("ANTHROPIC_CONTEXT_WINDOW")) or 200_000
+        )
+
     @property
     def model_name(self) -> str:
         return self._model
@@ -363,6 +369,29 @@ class AnthropicBackend(ModelBackend):
     # Tool-use loop
     # ------------------------------------------------------------------
 
+    async def _summarize(self, system_prompt: str, user_content: str, compactor: Any) -> str | None:
+        """One-shot, tool-less summary call used by the context compactor.
+
+        Returns the summary text or None on any failure (the compactor then
+        falls back to a structural prune so the turn still proceeds).
+        """
+        try:
+            max_tokens = int(getattr(compactor, "_cfg", {}).get("maxSummaryTokens", 2_000))
+        except (TypeError, ValueError):
+            max_tokens = 2_000
+
+        try:
+            response = await self._client.messages.create(
+                model=self._model,
+                max_tokens=max_tokens,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_content}],
+            )
+            return _extract_text(response.content) or None
+        except Exception as e:  # noqa: BLE001 — summary failure is non-fatal
+            logger.warning("Summary call failed: %s", e)
+            return None
+
     async def _tool_iteration(
         self,
         system_prompt: str,
@@ -465,21 +494,27 @@ class AnthropicBackend(ModelBackend):
         max_tool_calls: int = 25,
         on_progress: Any = None,
         guardrail_config: dict[str, Any] | None = None,
+        compaction_config: dict[str, Any] | None = None,
     ) -> ModelResult:
         """Agentic tool-use loop using Anthropic's native tool_use blocks.
 
         The LLM calls tools iteratively. Each iteration:
-        1. Call messages.create with tools
-        2. If stop_reason == "tool_use": execute tool calls, feed results back
-        3. If stop_reason != "tool_use": return final text response
-        4. Repeat until max_iterations or max_tool_calls hit
+        1. Compact context if it's approaching the window (server-configured)
+        2. Call messages.create with tools
+        3. If stop_reason == "tool_use": execute tool calls, feed results back
+        4. If stop_reason != "tool_use": return final text response
+        5. Repeat until max_iterations or max_tool_calls hit
 
         Intra-turn tool-loop guardrails (server-configured) detect and break
         degenerate retry / no-progress loops within this single turn.
         """
         from ..tools.guardrails import ToolCallGuardrail
+        from ..context.compactor import ContextCompactor
 
         guardrail = ToolCallGuardrail(guardrail_config)
+        compactor = ContextCompactor(
+            compaction_config, self._context_window, self._max_tokens,
+        )
         api_messages = _coalesce_messages(_translate_attachments(messages))
         all_tool_calls: list[ToolCall] = []
         total_usage = {
@@ -491,6 +526,14 @@ class AnthropicBackend(ModelBackend):
 
         while iteration < max_iterations:
             iteration += 1
+
+            # Preflight: compact context if it's approaching the window. Done
+            # before the API call so the request itself stays under budget.
+            if compactor.should_compact(api_messages):
+                api_messages = await compactor.compact(
+                    api_messages,
+                    lambda sys_p, user_c: self._summarize(sys_p, user_c, compactor),
+                )
 
             # Report thinking progress at the start of each iteration
             if on_progress:

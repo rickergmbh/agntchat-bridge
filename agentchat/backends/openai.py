@@ -202,10 +202,16 @@ class OpenAIBackend(ModelBackend):
         max_tool_calls: int = 25,
         on_progress: Any = None,
         guardrail_config: dict[str, Any] | None = None,
+        compaction_config: dict[str, Any] | None = None,
     ) -> ModelResult:
         """Agentic tool-use loop using OpenAI's function calling format.
 
         Works with OpenAI and any compatible provider that supports tool_calls.
+
+        ``compaction_config`` is accepted for interface parity; in-turn context
+        compaction is currently enforced only on the Anthropic loop (this
+        backend's flat message shape differs). The server still gates context
+        size; this is a no-op here.
         """
         from ..tools.guardrails import ToolCallGuardrail
 

@@ -1095,8 +1095,14 @@ class ClaudeCliBackend(ModelBackend):
         max_tool_calls: int = 25,
         on_progress: ProgressCallback | None = None,
         guardrail_config: dict[str, Any] | None = None,
+        compaction_config: dict[str, Any] | None = None,
     ) -> ModelResult:
         """Agentic tool-use loop.
+
+        ``compaction_config`` is accepted for interface parity. On the MCP-native
+        path the CLI owns context management; on the legacy XML path the server
+        controls history size. In-turn compaction is enforced on the Anthropic
+        loop, not here.
 
         When MCP context is set (resolved_tools via set_mcp_context), Claude CLI
         handles tool calls natively via the MCP server — single invocation, no

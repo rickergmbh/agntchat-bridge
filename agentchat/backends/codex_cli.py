@@ -916,11 +916,13 @@ class CodexCliBackend(ModelBackend):
         max_tool_calls: int = 25,
         on_progress: ProgressCallback | None = None,
         guardrail_config: dict[str, Any] | None = None,
+        compaction_config: dict[str, Any] | None = None,
     ) -> ModelResult:
         """Single-invocation agentic loop: Codex runs its own tool loop via MCP.
 
         Codex owns the tool loop, so intra-turn guardrails (``guardrail_config``)
-        cannot be enforced here; the server injects guidance via the system prompt.
+        and context compaction (``compaction_config``) cannot be enforced here;
+        the CLI manages its own context and the server injects prompt guidance.
 
         Requires MCP context (call ``set_mcp_context`` with resolved_tools).
         Codex has no built-in XML <tool_call> fallback, so without MCP
