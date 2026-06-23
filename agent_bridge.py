@@ -1285,6 +1285,68 @@ def _is_outgoing_filler(reply: str) -> bool:
 
 
 
+_MSG_BLOCK_RE = re.compile(r"<msg>(.*?)</msg>", re.DOTALL | re.IGNORECASE)
+
+
+def _extract_msg_bubbles(text: str) -> tuple[list[str], str]:
+    """Split text into ordered ``<msg>`` bubble bodies + trailing remainder.
+
+    Returns ``(bubbles, remainder)`` where ``bubbles`` is the inner text of
+    each complete ``<msg>…</msg>`` (in order) and ``remainder`` is any text
+    AFTER the last ``</msg>`` with stray ``<msg>``/``</msg>`` markers stripped
+    (covers a final unclosed bubble the model never terminated). When there are
+    no ``<msg>`` tags, ``bubbles`` is empty and ``remainder`` is the whole text.
+    """
+    bubbles: list[str] = []
+    last_end = 0
+    for match in _MSG_BLOCK_RE.finditer(text):
+        inner = (match.group(1) or "").strip()
+        if inner:
+            bubbles.append(inner)
+        last_end = match.end()
+
+    remainder = re.sub(r"</?msg>", "", text[last_end:], flags=re.IGNORECASE).strip()
+    return bubbles, remainder
+
+
+class IncrementalMsgEmitter:
+    """Detects closed ``<msg>…</msg>`` bubbles in a CUMULATIVE text buffer so
+    the bridge can post each chat bubble the instant the model finishes
+    writing it — instead of generating the whole reply, then splitting and
+    staggering it on artificial timers.
+
+    The model (when the backend's human-like directive is active) wraps each
+    bubble in ``<msg>…</msg>`` as part of one coherent generation. Feed the
+    growing accumulated text in via :meth:`take_closed` on each streaming
+    delta; it returns the inner text of any bubbles whose closing ``</msg>``
+    arrived since the last call.
+
+    Tracks by BUBBLE COUNT, not byte offset: the ``<msg>`` block *sequence* is
+    identical between the raw stream buffer and the final (post-parsed) reply,
+    so the count lets the final-send step post only the bubbles streaming
+    didn't already emit — even though the bridge strips ``<dm>``/``<tool_call>``/
+    ``<result_presentation>`` tags (which live OUTSIDE ``<msg>``) from the reply.
+
+    Mechanical parsing only — no behavioral decision. If no ``<msg>`` tags ever
+    appear, ``take_closed`` yields nothing, so the caller's normal single-post
+    path runs unchanged.
+    """
+
+    def __init__(self) -> None:
+        self._emitted = 0
+
+    @property
+    def emitted_count(self) -> int:
+        return self._emitted
+
+    def take_closed(self, accumulated: str) -> list[str]:
+        """Return inner text of ``<msg>`` bubbles closed since the last call."""
+        bubbles, _remainder = _extract_msg_bubbles(accumulated)
+        fresh = bubbles[self._emitted :]
+        self._emitted += len(fresh)
+        return fresh
+
+
 def _parse_dm_blocks(reply: str) -> tuple[str, list[dict[str, str]]]:
     """Parse <dm target="AgentName" [topic="..."]>content</dm> blocks.
 
@@ -2561,6 +2623,85 @@ def make_progress_callback(
     return on_progress
 
 
+async def _finalize_humanlike_reply(
+    executor: ExecutorClient,
+    conversation_id: str,
+    reply: str,
+    *,
+    emitter: "IncrementalMsgEmitter",
+    base_metadata: dict[str, Any],
+    last_seen_message_id: str | None = None,
+) -> bool:
+    """Post whatever of a human-like reply STREAMING didn't already emit.
+
+    Streaming posts each ``<msg>`` bubble as its ``</msg>`` closes. By
+    final-send time most/all bubbles are already out; this posts only the ones
+    after ``emitter.emitted_count`` (e.g. a bubble whose closer arrived in the
+    same chunk as end-of-stream) plus any trailing non-``<msg>`` remainder.
+
+    Returns True if it handled the reply as human-like bubbles (caller should
+    NOT do its own single post), False if the reply had no ``<msg>`` structure
+    and nothing was streamed (caller falls back to its normal single post).
+    """
+    bubbles, remainder = _extract_msg_bubbles(reply)
+
+    # No <msg> structure AND streaming emitted nothing → not human-like; let
+    # the caller post normally.
+    if not bubbles and emitter.emitted_count == 0:
+        return False
+
+    pending = bubbles[emitter.emitted_count :]
+    if remainder:
+        pending = pending + [remainder]
+
+    total_emitted = emitter.emitted_count
+    for idx, bubble in enumerate(pending):
+        is_first = total_emitted == 0 and idx == 0
+        metadata = dict(base_metadata)
+        if not is_first:
+            metadata["humanlike_bubble"] = True
+        try:
+            await executor.send_message(
+                conversation_id, bubble,
+                metadata=metadata,
+                last_seen_message_id=last_seen_message_id if is_first else None,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[humanlike] finalize bubble failed in %s: %s", conversation_id, e)
+
+    return True
+
+
+async def _post_humanlike_bubble(
+    executor: ExecutorClient,
+    conversation_id: str,
+    content: str,
+    *,
+    stream_id: str,
+    is_first: bool,
+) -> None:
+    """Post one human-like chat bubble as the model finishes writing it.
+
+    The FIRST bubble of a reply is a normal message (drives the turn — gateway
+    delivery, turn-queue advance, push). Subsequent bubbles carry
+    ``metadata.humanlike_bubble=true`` so the backend routes them through the
+    continuation path (reach humans, but no turn/gateway/wake/loop), keeping
+    the whole burst one logical turn. Best-effort — a dropped follow-up bubble
+    is cosmetic.
+    """
+    metadata: dict[str, Any] = {"stream_id": stream_id}
+    if not is_first:
+        metadata["humanlike_bubble"] = True
+
+    try:
+        await executor.send_message(conversation_id, content, metadata=metadata)
+    except Exception as e:  # noqa: BLE001 - best-effort, never break the stream
+        logger.warning(
+            "[humanlike] failed to post bubble (first=%s) in conv %s: %s",
+            is_first, conversation_id, e,
+        )
+
+
 def make_stream_callback(
     executor: ExecutorClient,
     conversation_id: str,
@@ -2568,6 +2709,7 @@ def make_stream_callback(
     *,
     task_progress_cb: Any | None = None,
     suppress_stream: bool = False,
+    bubble_emitter: "IncrementalMsgEmitter | None" = None,
 ):
     """Create an on_progress callback that forwards text deltas to the streaming endpoint.
 
@@ -2640,6 +2782,23 @@ def make_stream_callback(
                         conversation_id, stream_id,
                         content=accumulated, status="streaming", phase="writing",
                     ))
+
+                # Human-like incremental delivery: post each <msg> bubble the
+                # instant its </msg> closes, so bubbles land at natural writing
+                # speed (no generate-all-then-stagger). The live "writing"
+                # indicator keeps showing between bubbles; the streamed TEXT is
+                # gated client-side by the stream_text flag, so the bubble that
+                # just posted doesn't double-render. First bubble drives the
+                # turn; the rest are continuation bubbles.
+                if bubble_emitter is not None:
+                    for bubble in bubble_emitter.take_closed(accumulated):
+                        is_first = bubble_emitter.emitted_count == 1
+                        _fire_and_forget(
+                            _post_humanlike_bubble(
+                                executor, conversation_id, bubble,
+                                stream_id=stream_id, is_first=is_first,
+                            )
+                        )
 
         elif event_type == "tool_call":
             _had_tool_calls = True
@@ -4324,7 +4483,16 @@ def run_single_agent(
         # acknowledgement that we're processing, then it transitions to
         # the real LLM phases (tool_call/writing) as those events fire.
         _msg_stream_id = str(uuid.uuid4())
-        _stream_cb = make_stream_callback(executor, msg.conversation_id, _msg_stream_id)
+        # Incremental human-like bubble delivery: post each <msg> bubble as its
+        # </msg> closes during streaming (natural pacing, no backend stagger).
+        # The emitter is shared with the final-send step so it posts only what
+        # streaming didn't already emit. Harmless no-op when the model never
+        # uses <msg> tags (non-humanlike replies).
+        _bubble_emitter = IncrementalMsgEmitter()
+        _stream_cb = make_stream_callback(
+            executor, msg.conversation_id, _msg_stream_id,
+            bubble_emitter=_bubble_emitter,
+        )
         # If the executor's outer timeout cancels this handler mid-flight,
         # the complete()/cancel() calls below are skipped and the streaming
         # bubble would spin forever. Register cancel() as a turn cleanup so
@@ -4549,11 +4717,20 @@ def run_single_agent(
 
             if reply:
                 try:
-                    await executor.send_message(
-                        msg.conversation_id, reply,
-                        metadata=msg_meta_out,
+                    handled = await _finalize_humanlike_reply(
+                        executor, msg.conversation_id, reply,
+                        emitter=_bubble_emitter,
+                        base_metadata=msg_meta_out,
                         last_seen_message_id=msg.latest_seen_message_id or msg.message_id or None,
                     )
+
+                    if not handled:
+                        await executor.send_message(
+                            msg.conversation_id, reply,
+                            metadata=msg_meta_out,
+                            last_seen_message_id=msg.latest_seen_message_id or msg.message_id or None,
+                        )
+
                     await _stream_cb.complete()
                 except StaleContextError as sce:
                     logger.info(
@@ -4799,11 +4976,20 @@ def run_single_agent(
 
             # Send reply explicitly so we can create tasks AFTER it appears in the timeline
             try:
-                await executor.send_message(
-                    msg.conversation_id, reply,
-                    metadata=msg_meta_out,
+                handled = await _finalize_humanlike_reply(
+                    executor, msg.conversation_id, reply,
+                    emitter=_bubble_emitter,
+                    base_metadata=msg_meta_out,
                     last_seen_message_id=msg.latest_seen_message_id or msg.message_id or None,
                 )
+
+                if not handled:
+                    await executor.send_message(
+                        msg.conversation_id, reply,
+                        metadata=msg_meta_out,
+                        last_seen_message_id=msg.latest_seen_message_id or msg.message_id or None,
+                    )
+
                 await _stream_cb.complete()
             except StaleContextError as sce:
                 logger.info(
