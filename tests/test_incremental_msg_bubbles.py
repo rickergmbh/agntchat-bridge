@@ -9,7 +9,35 @@ from agent_bridge import (
     _split_reply_into_bubbles,
     _reply_mentions_agent,
     _bubble_pause_s,
+    _human_expects_reply,
 )
+
+
+class TestHumanExpectsReply:
+    one_human_one_agent = [
+        {"type": "human", "displayName": "James"},
+        {"type": "agent", "displayName": "Tim"},
+    ]
+    two_humans = [
+        {"type": "human", "displayName": "James"},
+        {"type": "human", "displayName": "Sam"},
+        {"type": "agent", "displayName": "Tim"},
+    ]
+
+    def test_single_human_conversation_human_sender(self):
+        # Onboarding: 1 human + 1 agent, human sent → agent must reply.
+        assert _human_expects_reply({}, self.one_human_one_agent, True) is True
+
+    def test_explicit_address_always_expects(self):
+        assert _human_expects_reply({"agentAddressed": True}, self.two_humans, True) is True
+
+    def test_multi_human_unaddressed_does_not_expect(self):
+        # 2 humans, not addressed → silence is legitimate.
+        assert _human_expects_reply({}, self.two_humans, True) is False
+
+    def test_agent_sender_does_not_expect(self):
+        # An agent (not a human) sent the message → no forced reply.
+        assert _human_expects_reply({}, self.one_human_one_agent, False) is False
 
 
 class TestSplitReplyIntoBubbles:

@@ -1393,6 +1393,28 @@ def _parse_dm_blocks(reply: str) -> tuple[str, list[dict[str, str]]]:
 
 
 
+def _human_expects_reply(
+    directives: dict[str, Any],
+    members: list[dict[str, Any]],
+    is_human_sender: bool,
+) -> bool:
+    """True when the human clearly expects a reply from THIS agent.
+
+    - The agent was explicitly addressed (``@mention``/name → backend sets
+      ``agentAddressed``), OR
+    - it's a single-human conversation and a human sent the message (the human
+      is talking to the sole agent — a DM, or a 1-human group like onboarding).
+
+    Used to decide whether an EMPTY model result should fall back to a graceful
+    "say that again?" (silence reads as broken when the human is waiting) vs.
+    stay quiet (legitimate in multi-human / multi-agent rooms).
+    """
+    if directives.get("agentAddressed", False):
+        return True
+    human_count = sum(1 for m in members if (m or {}).get("type") == "human")
+    return bool(is_human_sender) and human_count <= 1
+
+
 def _find_member_by_name(
     name: str, members: list[dict[str, Any]]
 ) -> dict[str, Any] | None:
@@ -4395,6 +4417,15 @@ def run_single_agent(
         skip_message = directives.get("skipMessage", False)
         skip_reason = directives.get("skipReason")
         task_creation_allowed = directives.get("taskCreationAllowed", True)
+
+        # Does the human clearly expect a reply from THIS agent? In those cases
+        # an EMPTY model result is a failure, not "chose silence" — we emit a
+        # graceful fallback rather than leaving the user hanging.
+        human_expects_reply = _human_expects_reply(
+            directives,
+            getattr(msg, "conversation_members", None) or [],
+            getattr(msg, "is_human", False),
+        )
         logger.info(
             "[%s] Directives: type=%s orch=%s skip=%s",
             executor_key,
@@ -4634,11 +4665,26 @@ def run_single_agent(
                     ))
 
                 reply = result.text[:MAX_REPLY_CHARS]
-                if not reply:
-                    # Empty text from a successful model call = model chose silence
-                    # (common in MCP mode where CLI handles tools internally).
-                    # Don't send a fallback error — just stay quiet.
-                    reply = None
+                if not reply or not reply.strip():
+                    if human_expects_reply:
+                        # The human directly engaged this agent (explicit
+                        # address, or sole agent in a 1-human conversation like
+                        # onboarding) but the model returned no text — usually a
+                        # CLI/seat hiccup where the answer got swallowed. Silence
+                        # here looks broken, so emit a graceful fallback instead
+                        # of dropping the turn.
+                        logger.warning(
+                            "[%s] Empty tool_use result but human expects a reply — using fallback",
+                            executor_key,
+                        )
+                        reply = error_msgs.get(
+                            "emptyResponse",
+                            "Sorry — I blanked on that one. Could you say that again?",
+                        )
+                    else:
+                        # Multi-human / multi-agent room: empty text = the model
+                        # legitimately chose silence. Stay quiet.
+                        reply = None
 
             # Parse structured output from tool_use reply
             if not _tu_failed and reply:
@@ -4821,8 +4867,20 @@ def run_single_agent(
             reply = error_msgs.get("modelFailure",
                 "I ran into an issue processing that request. Let me know if you'd like me to try again.")
         elif not reply:
-            # Model succeeded but returned empty text — stay silent
-            reply = None
+            if human_expects_reply:
+                # Sole agent in a 1-human conversation (or explicitly addressed)
+                # but empty text — fall back rather than leave the human hanging.
+                logger.warning(
+                    "[%s] Empty single_shot result but human expects a reply — using fallback",
+                    executor_key,
+                )
+                reply = error_msgs.get(
+                    "emptyResponse",
+                    "Sorry — I blanked on that one. Could you say that again?",
+                )
+            else:
+                # Model succeeded but returned empty text — stay silent
+                reply = None
 
         # Detect structured output
         remaining_text, presentations = parse_result_presentations(reply or "")
