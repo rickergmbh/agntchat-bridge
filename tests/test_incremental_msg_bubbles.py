@@ -56,3 +56,27 @@ class TestIncrementalMsgEmitter:
         em = IncrementalMsgEmitter()
         assert em.take_closed("plain streaming text") == []
         assert em.emitted_count == 0
+
+    def test_disabled_when_reply_mentions_peer_agent(self):
+        members = [
+            {"type": "agent", "displayName": "Pip"},
+            {"type": "human", "displayName": "James"},
+        ]
+        em = IncrementalMsgEmitter(members=members)
+        # First closed bubble mentions peer agent Pip → emitter disables,
+        # emits nothing (reply will be delivered whole).
+        assert em.take_closed("<msg>Hey @Pip can you help?</msg>") == []
+        assert em.disabled is True
+        assert em.emitted_count == 0
+        # Stays disabled for the rest of the stream.
+        assert em.take_closed("<msg>Hey @Pip can you help?</msg><msg>thanks</msg>") == []
+
+    def test_mention_of_human_does_not_disable(self):
+        members = [
+            {"type": "agent", "displayName": "Pip"},
+            {"type": "human", "displayName": "James"},
+        ]
+        em = IncrementalMsgEmitter(members=members)
+        # @James is a human, not a peer agent → normal bubbling.
+        assert em.take_closed("<msg>Hey @James</msg>") == ["Hey @James"]
+        assert em.disabled is False

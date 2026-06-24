@@ -1332,15 +1332,36 @@ class IncrementalMsgEmitter:
     path runs unchanged.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, members: list[dict[str, Any]] | None = None) -> None:
         self._emitted = 0
+        self._members = members or []
+        self._disabled = False
 
     @property
     def emitted_count(self) -> int:
         return self._emitted
 
+    @property
+    def disabled(self) -> bool:
+        return self._disabled
+
     def take_closed(self, accumulated: str) -> list[str]:
-        """Return inner text of ``<msg>`` bubbles closed since the last call."""
+        """Return inner text of ``<msg>`` bubbles closed since the last call.
+
+        Disabled (returns nothing, forever) once the accumulating reply is seen
+        to @-mention a peer agent: such replies must be delivered WHOLE so the
+        mention + full context reach the peer together. If a mention appears
+        after bubble 1 already posted, we stop emitting the rest and the
+        final-send posts the remainder — the common case is the mention is in
+        the first bubble, caught before anything is emitted.
+        """
+        if self._disabled:
+            return []
+
+        if self._emitted == 0 and _reply_mentions_agent(accumulated, self._members):
+            self._disabled = True
+            return []
+
         bubbles, _remainder = _extract_msg_bubbles(accumulated)
         fresh = bubbles[self._emitted :]
         self._emitted += len(fresh)
@@ -1416,6 +1437,37 @@ def _find_member_by_name(
         if display_name and display_name.lower() == name_lower:
             return m
     return None
+
+
+_MENTION_RE = re.compile(r"@\[([^\]]+)\]|@([^\s,.:;!?@]+)")
+
+
+def _reply_mentions_agent(text: str, members: list[dict[str, Any]]) -> bool:
+    """True if the reply @-mentions an AGENT member of the conversation.
+
+    Used to disable incremental <msg> bubble emission: a reply that tags a peer
+    agent must be delivered whole (one message) so the mention + full context
+    reach the peer together — otherwise the first bubble would wake the peer
+    before the bubble carrying the actual ask has landed. Mechanical text
+    matching against known agent member names; the backend still owns what
+    happens with the mention.
+    """
+    if not text or not members:
+        return False
+
+    agent_names = {
+        (m.get("displayName") or "").lower()
+        for m in members
+        if m.get("type") == "agent" and m.get("displayName")
+    }
+    if not agent_names:
+        return False
+
+    for match in _MENTION_RE.finditer(text):
+        name = (match.group(1) or match.group(2) or "").strip().rstrip(",.:;!?").lower()
+        if name in agent_names:
+            return True
+    return False
 
 
 async def _route_dm_blocks(
@@ -2643,6 +2695,12 @@ async def _finalize_humanlike_reply(
     NOT do its own single post), False if the reply had no ``<msg>`` structure
     and nothing was streamed (caller falls back to its normal single post).
     """
+    # Emitter disabled (reply @-mentions a peer) → deliver WHOLE so the mention
+    # + full context arrive together. Let the caller post the single message;
+    # the backend flattens any <msg>/<thread> markers to clean prose.
+    if emitter.disabled:
+        return False
+
     bubbles, remainder = _extract_msg_bubbles(reply)
 
     # No <msg> structure AND streaming emitted nothing → not human-like; let
@@ -4488,7 +4546,9 @@ def run_single_agent(
         # The emitter is shared with the final-send step so it posts only what
         # streaming didn't already emit. Harmless no-op when the model never
         # uses <msg> tags (non-humanlike replies).
-        _bubble_emitter = IncrementalMsgEmitter()
+        _bubble_emitter = IncrementalMsgEmitter(
+            members=getattr(msg, "conversation_members", None) or []
+        )
         _stream_cb = make_stream_callback(
             executor, msg.conversation_id, _msg_stream_id,
             bubble_emitter=_bubble_emitter,
