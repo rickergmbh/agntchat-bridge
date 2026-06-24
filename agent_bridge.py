@@ -1332,9 +1332,14 @@ class IncrementalMsgEmitter:
     path runs unchanged.
     """
 
-    def __init__(self, members: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        members: list[dict[str, Any]] | None = None,
+        sender_name: str | None = None,
+    ) -> None:
         self._emitted = 0
         self._members = members or []
+        self._sender_name = sender_name
         self._disabled = False
 
     @property
@@ -1358,7 +1363,9 @@ class IncrementalMsgEmitter:
         if self._disabled:
             return []
 
-        if self._emitted == 0 and _reply_mentions_agent(accumulated, self._members):
+        if self._emitted == 0 and _reply_mentions_agent(
+          accumulated, self._members, self._sender_name
+        ):
             self._disabled = True
             return []
 
@@ -1442,31 +1449,51 @@ def _find_member_by_name(
 _MENTION_RE = re.compile(r"@\[([^\]]+)\]|@([^\s,.:;!?@]+)")
 
 
-def _reply_mentions_agent(text: str, members: list[dict[str, Any]]) -> bool:
-    """True if the reply @-mentions an AGENT member of the conversation.
+def _reply_mentions_agent(
+    text: str, members: list[dict[str, Any]], sender_name: str | None = None
+) -> bool:
+    """True if the reply addresses an AGENT member — by ``@mention`` OR by bare
+    display name (e.g. "Trtiw, want to take it from here?").
 
-    Used to disable incremental <msg> bubble emission: a reply that tags a peer
-    agent must be delivered whole (one message) so the mention + full context
-    reach the peer together — otherwise the first bubble would wake the peer
-    before the bubble carrying the actual ask has landed. Mechanical text
-    matching against known agent member names; the backend still owns what
-    happens with the mention.
+    Used to disable incremental <msg> bubble emission: a reply that addresses a
+    peer agent must be delivered WHOLE (one message) so the address + full
+    context reach the peer together and wake it. If split, the bubble that
+    actually hands off (often a later bubble) posts as a continuation that
+    wakes nobody, and the handoff is lost — the agent-to-agent flow collapses.
+
+    Bare-name matching mirrors the backend's `detect_implicit_name_mentions`
+    (`\\bName\\b`), so the bridge's "don't split" decision and the backend's
+    "wake the named peer" decision agree. Mechanical text matching only; the
+    backend still owns what happens with the mention.
     """
     if not text or not members:
         return False
 
+    self_name = (sender_name or "").strip().lower()
     agent_names = {
         (m.get("displayName") or "").lower()
         for m in members
-        if m.get("type") == "agent" and m.get("displayName")
+        if m.get("type") == "agent"
+        and m.get("displayName")
+        and (m.get("displayName") or "").lower() != self_name
     }
     if not agent_names:
         return False
 
+    # @mention form.
     for match in _MENTION_RE.finditer(text):
         name = (match.group(1) or match.group(2) or "").strip().rstrip(",.:;!?").lower()
         if name in agent_names:
             return True
+
+    # Bare display-name form (word-boundary, case-insensitive) — matches the
+    # backend's implicit-name-mention detection. Names <2 chars are skipped to
+    # avoid false positives (same guard the backend uses).
+    lowered = text.lower()
+    for name in agent_names:
+        if len(name) >= 2 and re.search(r"\b" + re.escape(name) + r"\b", lowered):
+            return True
+
     return False
 
 
@@ -4547,7 +4574,8 @@ def run_single_agent(
         # streaming didn't already emit. Harmless no-op when the model never
         # uses <msg> tags (non-humanlike replies).
         _bubble_emitter = IncrementalMsgEmitter(
-            members=getattr(msg, "conversation_members", None) or []
+            members=getattr(msg, "conversation_members", None) or [],
+            sender_name=agent_name,
         )
         _stream_cb = make_stream_callback(
             executor, msg.conversation_id, _msg_stream_id,

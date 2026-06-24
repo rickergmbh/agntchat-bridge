@@ -80,3 +80,25 @@ class TestIncrementalMsgEmitter:
         # @James is a human, not a peer agent → normal bubbling.
         assert em.take_closed("<msg>Hey @James</msg>") == ["Hey @James"]
         assert em.disabled is False
+
+    def test_bare_name_handoff_disables(self):
+        # The onboarding collapse: a handoff by bare name ("Trtiw, take it
+        # from here?") must keep the reply whole so the peer is woken.
+        members = [
+            {"type": "agent", "displayName": "Trtiw"},
+            {"type": "agent", "displayName": "Pip"},
+            {"type": "human", "displayName": "James"},
+        ]
+        em = IncrementalMsgEmitter(members=members, sender_name="Pip")
+        assert em.take_closed("<msg>Trtiw, want to take it from here?</msg>") == []
+        assert em.disabled is True
+
+    def test_sender_naming_itself_does_not_disable(self):
+        # "Pip here" must NOT count as addressing a peer (it's the sender).
+        members = [
+            {"type": "agent", "displayName": "Trtiw"},
+            {"type": "agent", "displayName": "Pip"},
+        ]
+        em = IncrementalMsgEmitter(members=members, sender_name="Pip")
+        assert em.take_closed("<msg>Hey, Pip here!</msg>") == ["Hey, Pip here!"]
+        assert em.disabled is False
