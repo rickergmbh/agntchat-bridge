@@ -110,6 +110,71 @@ async def test_handler_timeout_posts_visible_notice_and_acks(executor):
 
 
 @pytest.mark.asyncio
+async def test_handler_exception_posts_visible_notice_and_acks(executor):
+    """A handler that RAISES (non-timeout) posts a notice, not silence.
+
+    Regression (onboarding convs 6c0cffa7 / a6215694): the human answered a
+    question, the handler raised mid-run (e.g. a claude_cli seat error / parse
+    crash), and the agent simply appeared to stop dead — the except path only
+    posted a notice for asyncio.TimeoutError, staying silent on every other
+    exception.
+    """
+    @executor.on_message
+    async def handler(_msg):
+        raise RuntimeError("claude_cli blew up")
+
+    msg = GatewayMessage(
+        id="queue-raise",
+        message_id="trigger-raise",
+        conversation_id="conv-1",
+        content="Santa",
+    )
+
+    with (
+        patch.object(executor, "_post", new=AsyncMock(return_value={})) as post,
+        patch.object(executor, "send_message", new=AsyncMock(return_value={})) as send,
+    ):
+        await executor._handle_message(msg)
+
+    # Acked so it isn't retried.
+    post.assert_awaited_once_with(
+        "/api/gateway/messages/queue-raise/ack",
+        json={"executor_id": "executor-1"},
+    )
+    # A visible ErrorReport notice is posted instead of silence.
+    send.assert_awaited_once()
+    assert send.await_args.args[0] == "conv-1"
+    assert "hit an error" in send.await_args.args[1]
+    assert send.await_args.kwargs["message_type"] == "ErrorReport"
+    assert send.await_args.kwargs["metadata"]["error_code"] == "handler_exception"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_handler_stays_silent(executor):
+    """A CancelledError (user hit stop / stop_generation) must NOT post a
+    notice — that's a deliberate stop, not a failure."""
+    @executor.on_message
+    async def handler(_msg):
+        raise asyncio.CancelledError()
+
+    msg = GatewayMessage(
+        id="queue-cancel",
+        message_id="trigger-cancel",
+        conversation_id="conv-1",
+        content="stop",
+    )
+
+    with (
+        patch.object(executor, "_post", new=AsyncMock(return_value={})),
+        patch.object(executor, "send_message", new=AsyncMock(return_value={})) as send,
+    ):
+        with pytest.raises(asyncio.CancelledError):
+            await executor._handle_message(msg)
+
+    send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_registered_turn_cleanup_runs_on_timeout(executor):
     """A handler-registered turn cleanup runs even when the handler times out.
 

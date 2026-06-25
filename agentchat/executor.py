@@ -2712,10 +2712,15 @@ class ExecutorClient:
                 logger.info("[MSG-HANDLE] Ack succeeded in except path for %s", msg.id)
             except Exception:
                 logger.exception("[MSG-HANDLE] Failed to ack message %s even in except path", msg.id)
-            # A timeout cancels the handler mid-task with no reply. Left
-            # silent, the agent just appears to stop dead — post a visible
-            # ErrorReport (also lands in error analytics / push) so the
-            # user knows what happened and can continue it.
+            # The handler died with no reply. Left silent, the agent just
+            # appears to stop dead mid-conversation (observed in onboarding
+            # convs 6c0cffa7 / a6215694: human answered a question, the handler
+            # raised, nothing was ever posted). Post a visible ErrorReport (also
+            # lands in error analytics / push) so the user knows what happened
+            # and can continue — for a timeout AND any other non-cancellation
+            # crash (e.g. a claude_cli seat error, a parse failure, a tool
+            # executor exception). CancelledError is a deliberate stop (user hit
+            # "stop", or a stop_generation directive) — stay silent there.
             if isinstance(e, asyncio.TimeoutError):
                 try:
                     mins = max(1, self._message_timeout // 60)
@@ -2732,6 +2737,19 @@ class ExecutorClient:
                 except Exception:
                     logger.exception(
                         "[MSG-HANDLE] Failed to post timeout notice for %s", msg.id
+                    )
+            elif not isinstance(e, asyncio.CancelledError):
+                try:
+                    await self.send_message(
+                        msg.conversation_id,
+                        "⚠️ I hit an error processing that and couldn't finish my "
+                        "reply. Mind trying again, or rephrasing?",
+                        message_type="ErrorReport",
+                        metadata={"error_code": "handler_exception", "severity": "warning"},
+                    )
+                except Exception:
+                    logger.exception(
+                        "[MSG-HANDLE] Failed to post error notice for %s", msg.id
                     )
             # Re-raise CancelledError so asyncio cancellation propagates correctly
             if isinstance(e, asyncio.CancelledError):
