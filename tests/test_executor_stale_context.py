@@ -110,6 +110,40 @@ async def test_handler_timeout_posts_visible_notice_and_acks(executor):
 
 
 @pytest.mark.asyncio
+async def test_error_notices_use_server_template(executor):
+    """The notice copy is server-owned (behavioralConfig.errorMessages); the
+    bridge reads it from directives and interpolates {minutes} for timeouts."""
+    executor._message_timeout = 120  # 2 minutes
+
+    @executor.on_message
+    async def handler(_msg):
+        raise RuntimeError("boom")
+
+    msg = GatewayMessage(
+        id="queue-srv",
+        message_id="trigger-srv",
+        conversation_id="conv-1",
+        content="hi",
+        directives={
+            "behavioralConfig": {
+                "errorMessages": {
+                    "handlerException": "SERVER COPY: please retry.",
+                }
+            }
+        },
+    )
+
+    with (
+        patch.object(executor, "_post", new=AsyncMock(return_value={})),
+        patch.object(executor, "send_message", new=AsyncMock(return_value={})) as send,
+    ):
+        await executor._handle_message(msg)
+
+    send.assert_awaited_once()
+    assert send.await_args.args[1] == "SERVER COPY: please retry."
+
+
+@pytest.mark.asyncio
 async def test_handler_exception_posts_visible_notice_and_acks(executor):
     """A handler that RAISES (non-timeout) posts a notice, not silence.
 

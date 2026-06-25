@@ -1335,25 +1335,45 @@ def _split_reply_into_bubbles(reply: str) -> list[str]:
 # Splitting the old single gap into read-then-write is what makes it feel like
 # someone actually writing rather than "posting posting posting": the user
 # finishes reading, SEES the agent typing, then the next text arrives.
-_BUBBLE_READ_BASE_S = 0.5
-_BUBBLE_READ_PER_CHAR_S = 0.018
-_BUBBLE_READ_MAX_S = 4.0
+#
+# The actual numbers are SERVER-OWNED — `behavioralConfig.humanlikePacing`
+# (see BehavioralDirectives.build_behavioral_config). These constants are only
+# fallback defaults for when the directive is absent (offline/legacy paths).
+_PACING_DEFAULTS = {
+    "readBaseMs": 500,
+    "readPerCharMs": 18,
+    "readMaxMs": 4_000,
+    "writeBaseMs": 800,
+    "writePerCharMs": 28,
+    "writeMaxMs": 5_000,
+}
 
-_BUBBLE_WRITE_BASE_S = 0.8
-_BUBBLE_WRITE_PER_CHAR_S = 0.028
-_BUBBLE_WRITE_MAX_S = 5.0
+
+def _pacing(behavioral_config: dict[str, Any] | None, key: str) -> float:
+    cfg = (behavioral_config or {}).get("humanlikePacing") or {}
+    raw = cfg.get(key, _PACING_DEFAULTS[key])
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float(_PACING_DEFAULTS[key])
 
 
-def _bubble_read_pause_s(landed_bubble: str) -> float:
-    """Quiet beat to READ the bubble that just landed (sized to its length)."""
-    extra = len(landed_bubble or "") * _BUBBLE_READ_PER_CHAR_S
-    return min(_BUBBLE_READ_BASE_S + extra, _BUBBLE_READ_MAX_S)
+def _bubble_read_pause_s(landed_bubble: str, behavioral_config: dict[str, Any] | None = None) -> float:
+    """Quiet beat to READ the bubble that just landed (sized to its length).
+    Numbers come from `behavioralConfig.humanlikePacing` (server-owned)."""
+    base = _pacing(behavioral_config, "readBaseMs")
+    per_char = _pacing(behavioral_config, "readPerCharMs")
+    cap = _pacing(behavioral_config, "readMaxMs")
+    return min(base + len(landed_bubble or "") * per_char, cap) / 1000.0
 
 
-def _bubble_write_pause_s(next_bubble: str) -> float:
-    """"Writing" beat before the NEXT bubble lands (sized to ITS length)."""
-    extra = len(next_bubble or "") * _BUBBLE_WRITE_PER_CHAR_S
-    return min(_BUBBLE_WRITE_BASE_S + extra, _BUBBLE_WRITE_MAX_S)
+def _bubble_write_pause_s(next_bubble: str, behavioral_config: dict[str, Any] | None = None) -> float:
+    """"Writing" beat before the NEXT bubble lands (sized to ITS length).
+    Numbers come from `behavioralConfig.humanlikePacing` (server-owned)."""
+    base = _pacing(behavioral_config, "writeBaseMs")
+    per_char = _pacing(behavioral_config, "writePerCharMs")
+    cap = _pacing(behavioral_config, "writeMaxMs")
+    return min(base + len(next_bubble or "") * per_char, cap) / 1000.0
 
 
 async def _writing_beat(
@@ -1448,15 +1468,18 @@ def _human_expects_reply(
 ) -> bool:
     """True when the human clearly expects a reply from THIS agent.
 
-    - The agent was explicitly addressed (``@mention``/name → backend sets
-      ``agentAddressed``), OR
-    - it's a single-human conversation and a human sent the message (the human
-      is talking to the sole agent — a DM, or a 1-human group like onboarding).
-
-    Used to decide whether an EMPTY model result should fall back to a graceful
-    "say that again?" (silence reads as broken when the human is waiting) vs.
-    stay quiet (legitimate in multi-human / multi-agent rooms).
+    This is a RULE OF ENGAGEMENT owned by the backend, surfaced as
+    ``directives.humanExpectsReply`` (BehavioralDirectives computes it from
+    agentAddressed + the single-human-conversation check). The bridge just
+    reads it. The local heuristic below is only a fallback for when the
+    directive is absent (offline/legacy paths): explicitly addressed, OR a
+    human spoke in a single-human conversation (DM / 1-human onboarding group).
     """
+    val = directives.get("humanExpectsReply")
+    if isinstance(val, bool):
+        return val
+
+    # Fallback (directive absent): mirror the backend's computation.
     if directives.get("agentAddressed", False):
         return True
     human_count = sum(1 for m in members if (m or {}).get("type") == "human")
@@ -2740,6 +2763,7 @@ async def _post_paced_bubbles(
     members: list[dict[str, Any]],
     sender_name: str | None,
     last_seen_message_id: str | None = None,
+    behavioral_config: dict[str, Any] | None = None,
 ) -> bool:
     """Post a completed reply as human-paced chat bubbles.
 
@@ -2776,10 +2800,11 @@ async def _post_paced_bubbles(
             # bubble the first message gets (synthetic message_streaming event),
             # not the lesser "is processing" text indicator. See the pacing
             # constants for the why.
-            await asyncio.sleep(_bubble_read_pause_s(bubbles[idx - 1]))
+            await asyncio.sleep(_bubble_read_pause_s(bubbles[idx - 1], behavioral_config))
             beat_stream_id = f"continuation:{uuid.uuid4()}"
             await _writing_beat(
-                executor, conversation_id, beat_stream_id, _bubble_write_pause_s(bubble)
+                executor, conversation_id, beat_stream_id,
+                _bubble_write_pause_s(bubble, behavioral_config),
             )
 
         addresses_peer = _reply_mentions_agent(bubble, members, sender_name)
@@ -4884,6 +4909,7 @@ def run_single_agent(
                         members=getattr(msg, "conversation_members", None) or [],
                         sender_name=agent_name,
                         last_seen_message_id=msg.latest_seen_message_id or msg.message_id or None,
+                        behavioral_config=behavioral_config,
                     )
                     await _stream_cb.complete()
                 except StaleContextError as sce:
@@ -5148,6 +5174,7 @@ def run_single_agent(
                     members=getattr(msg, "conversation_members", None) or [],
                     sender_name=agent_name,
                     last_seen_message_id=msg.latest_seen_message_id or msg.message_id or None,
+                    behavioral_config=behavioral_config,
                 )
                 await _stream_cb.complete()
             except StaleContextError as sce:

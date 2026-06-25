@@ -107,3 +107,14 @@ class TestBubblePause:
         # bubble should exceed the "reading" beat for the same-length text.
         text = "x" * 120
         assert _bubble_write_pause_s(text) > _bubble_read_pause_s(text)
+
+    def test_pacing_honors_server_config(self):
+        # behavioralConfig.humanlikePacing is the source of truth — the bridge
+        # must use the server's numbers, not the hardcoded fallbacks.
+        cfg = {"humanlikePacing": {"readBaseMs": 2000, "readPerCharMs": 0, "readMaxMs": 9000}}
+        assert _bubble_read_pause_s("ok", cfg) == 2.0  # 2000ms base, 0/char
+
+    def test_pacing_falls_back_when_config_absent(self):
+        # No directive → fallback defaults (0.5s read base).
+        assert _bubble_read_pause_s("ok", None) >= 0.5
+        assert _bubble_read_pause_s("ok", {}) >= 0.5

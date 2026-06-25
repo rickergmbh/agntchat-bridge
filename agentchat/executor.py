@@ -2721,16 +2721,26 @@ class ExecutorClient:
             # crash (e.g. a claude_cli seat error, a parse failure, a tool
             # executor exception). CancelledError is a deliberate stop (user hit
             # "stop", or a stop_generation directive) — stay silent there.
+            # Notice copy is SERVER-OWNED (behavioralConfig.errorMessages); the
+            # bridge reads it from the message's directives, falling back to a
+            # default only when the directive is absent.
+            err_msgs = (
+                ((msg.directives or {}).get("behavioralConfig") or {}).get("errorMessages") or {}
+            )
             if isinstance(e, asyncio.TimeoutError):
                 try:
                     mins = max(1, self._message_timeout // 60)
+                    template = err_msgs.get(
+                        "turnTimeout",
+                        "⏱️ I ran out of time on that — it passed the {minutes}-minute "
+                        "limit for a single turn and was cut off mid-task. Longer jobs "
+                        "(computer use especially) can hit this; ask me to keep going "
+                        "and I'll continue from the current state, or split it into "
+                        "smaller steps.",
+                    )
                     await self.send_message(
                         msg.conversation_id,
-                        f"⏱️ I ran out of time on that — it passed the "
-                        f"{mins}-minute limit for a single turn and was cut off "
-                        f"mid-task. Longer jobs (computer use especially) can hit "
-                        f"this; ask me to keep going and I'll continue from the "
-                        f"current state, or split it into smaller steps.",
+                        template.replace("{minutes}", str(mins)),
                         message_type="ErrorReport",
                         metadata={"error_code": "turn_timeout", "severity": "warning"},
                     )
@@ -2742,8 +2752,11 @@ class ExecutorClient:
                 try:
                     await self.send_message(
                         msg.conversation_id,
-                        "⚠️ I hit an error processing that and couldn't finish my "
-                        "reply. Mind trying again, or rephrasing?",
+                        err_msgs.get(
+                            "handlerException",
+                            "⚠️ I hit an error processing that and couldn't finish my "
+                            "reply. Mind trying again, or rephrasing?",
+                        ),
                         message_type="ErrorReport",
                         metadata={"error_code": "handler_exception", "severity": "warning"},
                     )
