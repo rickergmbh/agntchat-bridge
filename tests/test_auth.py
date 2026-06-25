@@ -53,6 +53,71 @@ class TestGetToken:
         with pytest.raises(AuthError, match="No token"):
             await token_mgr.get_token()
 
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_retries_then_succeeds_on_429(
+        self, token_mgr, base_url, sample_token, monkeypatch
+    ):
+        # Don't actually sleep through the backoff in the test.
+        slept = []
+
+        async def fake_sleep(d):
+            slept.append(d)
+
+        monkeypatch.setattr("agentchat.auth.asyncio.sleep", fake_sleep)
+
+        responses = [
+            httpx.Response(429),
+            httpx.Response(429),
+            httpx.Response(200, json={"token": sample_token}),
+        ]
+        respx.post(f"{base_url}/api/auth/agent-token").mock(side_effect=responses)
+
+        token = await token_mgr.get_token()
+        assert token == sample_token
+        # Backed off once per 429 before the success.
+        assert len(slept) == 2
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_429_honors_retry_after(
+        self, token_mgr, base_url, sample_token, monkeypatch
+    ):
+        slept = []
+
+        async def fake_sleep(d):
+            slept.append(d)
+
+        monkeypatch.setattr("agentchat.auth.asyncio.sleep", fake_sleep)
+        respx.post(f"{base_url}/api/auth/agent-token").mock(
+            side_effect=[
+                httpx.Response(429, headers={"Retry-After": "7"}),
+                httpx.Response(200, json={"token": sample_token}),
+            ]
+        )
+
+        await token_mgr.get_token()
+        # Waited ~7s (Retry-After) + up to 1s jitter, not the exponential base.
+        assert 7.0 <= slept[0] <= 8.0
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_gives_up_after_max_429_retries(self, token_mgr, base_url, monkeypatch):
+        async def fake_sleep(_d):
+            return None
+
+        monkeypatch.setattr("agentchat.auth.asyncio.sleep", fake_sleep)
+        route = respx.post(f"{base_url}/api/auth/agent-token").mock(
+            return_value=httpx.Response(429)
+        )
+
+        with pytest.raises(AuthError, match="429"):
+            await token_mgr.get_token()
+        # Initial attempt + _RATELIMIT_MAX_RETRIES backed-off retries.
+        from agentchat.auth import _RATELIMIT_MAX_RETRIES
+
+        assert route.call_count == _RATELIMIT_MAX_RETRIES + 1
+
 
 class TestEnsureFresh:
     @respx.mock
