@@ -2789,6 +2789,14 @@ async def _post_paced_bubbles(
     if not bubbles:
         return False
 
+    # A burst may address the SAME peer in more than one bubble (e.g. "watch,
+    # I'll tag in @Pip" then "@Pip — say hi"). Each full-path bubble wakes the
+    # peer, so without this the peer gets woken N times and replies N times
+    # (Pip's double "Hi" in conv abb0937f). Route only the FIRST peer-addressing
+    # bubble full-path; later peer-addressing bubbles deliver as continuations
+    # (reach humans, no re-wake) — one wake per logical turn.
+    peer_wake_routed = False
+
     for idx, bubble in enumerate(bubbles):
         is_first = idx == 0
         beat_stream_id: str | None = None
@@ -2807,12 +2815,16 @@ async def _post_paced_bubbles(
                 _bubble_write_pause_s(bubble, behavioral_config),
             )
 
-        addresses_peer = _reply_mentions_agent(bubble, members, sender_name)
+        # Only the FIRST peer-addressing bubble drives the wake; a repeat
+        # mention later in the same burst must NOT re-wake the peer.
+        addresses_peer = _reply_mentions_agent(bubble, members, sender_name) and not peer_wake_routed
+        if addresses_peer:
+            peer_wake_routed = True
 
         metadata = dict(base_metadata)
-        # Continuation flag ONLY for non-first bubbles that don't address a
-        # peer. First bubble and peer-addressing bubbles take the full send
-        # path (turn/mention/wake) so handoffs actually reach the peer.
+        # Continuation flag ONLY for non-first bubbles that don't drive a peer
+        # wake. First bubble and the (single) peer-waking bubble take the full
+        # send path (turn/mention/wake) so the handoff reaches the peer once.
         if not is_first and not addresses_peer:
             metadata["humanlike_bubble"] = True
         # Tag the bubble with its writing-beat stream so the client clears that
