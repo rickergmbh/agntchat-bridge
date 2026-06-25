@@ -2803,13 +2803,38 @@ async def _post_paced_bubbles(
             )
         except StaleContextError:
             # A human interjected between bubbles — stop firing pre-written
-            # follow-ups into a changed context.
+            # follow-ups into a changed context. (`finally` still closes the
+            # writing beat below.)
             logger.info("[humanlike] stale context mid-burst in %s — stopping", conversation_id)
             break
         except Exception as e:  # noqa: BLE001
             logger.warning("[humanlike] bubble post failed in %s: %s", conversation_id, e)
+        finally:
+            # ALWAYS close the synthetic writing stream once the bubble lands
+            # (or failed). The bubble's metadata.stream_id clears the CLIENT
+            # bubble, but the backend AgentActivity tracker only drops the
+            # stream key on an explicit complete/cancelled — without this the
+            # "writing" activity lingers up to the 60s stale sweep, leaving a
+            # stuck writing bubble below the agent's last message.
+            await _close_writing_beat(executor, conversation_id, beat_stream_id)
 
     return True
+
+
+async def _close_writing_beat(
+    executor: ExecutorClient, conversation_id: str, beat_stream_id: str | None
+) -> None:
+    """Send a terminal `complete` for a writing-beat stream so the backend
+    AgentActivity tracker drops it immediately. No-op when there was no beat
+    (the first bubble). Best-effort."""
+    if not beat_stream_id:
+        return
+    try:
+        await executor.send_stream_update(
+            conversation_id, beat_stream_id, status="complete"
+        )
+    except Exception:  # noqa: BLE001
+        pass  # streaming is best-effort; never let it break the burst
 
 
 def make_stream_callback(
