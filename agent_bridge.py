@@ -4784,6 +4784,7 @@ def run_single_agent(
             if effective_backend:
                 tu_msg_meta_dm["backend"] = effective_backend
 
+            tu_dm_blocks: list[dict[str, str]] = []
             if reply:
                 reply, tu_dm_blocks = _parse_dm_blocks(reply)
                 if tu_dm_blocks:
@@ -4812,6 +4813,34 @@ def run_single_agent(
                     else:
                         targets = ", ".join(b["target"] for b in tu_dm_blocks)
                         reply = f"[Could not start agent thread with {targets}]"
+
+            # Re-apply the empty-reply guard AFTER parsing. The check at the raw
+            # result.text only catches a model that returned nothing at all. But
+            # parse_result_presentations / parse_task_requests / _parse_dm_blocks
+            # can strip a non-empty reply down to empty (the model wrapped its
+            # whole answer in an envelope/DM tag that then routed to nothing, or
+            # a CLI hiccup left only scaffolding). If that leaves NOTHING to post
+            # — no text, no cards, no routed DMs, no tasks — and the human is
+            # waiting on this agent, silence reads as broken. Emit the same
+            # graceful fallback rather than cancelling the turn. (Observed in
+            # onboarding conv 6c0cffa7: human said "Just chatting so far", the
+            # run acknowledged, and nothing was ever posted.)
+            nothing_emitted = (
+                not (reply and reply.strip())
+                and not presentations
+                and not _tu_task_requests
+                and not tu_dm_blocks
+            )
+            if nothing_emitted and human_expects_reply and not _tu_failed:
+                logger.warning(
+                    "[%s] tool_use reply parsed to empty with nothing emitted but "
+                    "human expects a reply — using fallback",
+                    executor_key,
+                )
+                reply = error_msgs.get(
+                    "emptyResponse",
+                    "Sorry — I blanked on that one. Could you say that again?",
+                )
 
             # Send structured results first, then text reply, then deferred tasks
             if presentations:
