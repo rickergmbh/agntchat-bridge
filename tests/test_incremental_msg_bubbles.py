@@ -8,7 +8,8 @@ so the peer is added + woken; the rest are turn-neutral continuations.
 from agent_bridge import (
     _split_reply_into_bubbles,
     _reply_mentions_agent,
-    _bubble_pause_s,
+    _bubble_read_pause_s,
+    _bubble_write_pause_s,
     _human_expects_reply,
 )
 
@@ -87,9 +88,22 @@ class TestReplyMentionsAgent:
 
 
 class TestBubblePause:
-    def test_pause_grows_with_length_and_caps(self):
-        short = _bubble_pause_s("ok")
-        long = _bubble_pause_s("x" * 500)
+    def test_read_pause_grows_with_landed_length_and_caps(self):
+        short = _bubble_read_pause_s("ok")
+        long = _bubble_read_pause_s("x" * 500)
         assert short < long
-        assert long <= 3.0
-        assert short >= 0.6
+        assert long <= 4.0
+        assert short >= 0.5
+
+    def test_write_pause_grows_with_next_length_and_caps(self):
+        short = _bubble_write_pause_s("ok")
+        long = _bubble_write_pause_s("x" * 500)
+        assert short < long
+        assert long <= 5.0
+        assert short >= 0.8
+
+    def test_write_beat_longer_than_read_beat_for_same_text(self):
+        # Composing reads as slower than skimming: the "writing" beat for a
+        # bubble should exceed the "reading" beat for the same-length text.
+        text = "x" * 120
+        assert _bubble_write_pause_s(text) > _bubble_read_pause_s(text)

@@ -1321,17 +1321,67 @@ def _split_reply_into_bubbles(reply: str) -> list[str]:
     return bubbles
 
 
-# Human-like pacing for posting bubbles: a short base beat plus reading time
-# proportional to the PREVIOUS bubble's length, capped. Gives the "someone is
-# typing several texts" rhythm instead of dumping them all at once.
-_BUBBLE_BASE_PAUSE_S = 0.6
-_BUBBLE_PER_CHAR_S = 0.012
-_BUBBLE_MAX_PAUSE_S = 3.0
+# Human-like pacing for posting bubbles. A burst of texts from a real person
+# has TWO distinct beats between consecutive bubbles:
+#
+#   1. READING pause — after a bubble lands, the reader needs a moment to take
+#      it in BEFORE the next one shows up. This gap is silent (no typing cue):
+#      the bubble is sitting there to be read. Sized to the bubble that JUST
+#      landed (longer message → longer read).
+#   2. WRITING pause — then the sender starts composing the next bubble. We
+#      show the "… is writing" typing indicator for this beat, sized to the
+#      NEXT bubble (longer next message → they "type" longer). Then it lands.
+#
+# Splitting the old single gap into read-then-write is what makes it feel like
+# someone actually writing rather than "posting posting posting": the user
+# finishes reading, SEES the agent typing, then the next text arrives.
+_BUBBLE_READ_BASE_S = 0.5
+_BUBBLE_READ_PER_CHAR_S = 0.018
+_BUBBLE_READ_MAX_S = 4.0
+
+_BUBBLE_WRITE_BASE_S = 0.8
+_BUBBLE_WRITE_PER_CHAR_S = 0.028
+_BUBBLE_WRITE_MAX_S = 5.0
+
+# Typing indicators decay if not refreshed; re-ping at this cadence during a
+# long writing pause so the "… is writing" cue never blinks out mid-compose.
+_TYPING_REFRESH_S = 2.5
 
 
-def _bubble_pause_s(prev_bubble: str) -> float:
-    extra = len(prev_bubble or "") * _BUBBLE_PER_CHAR_S
-    return min(_BUBBLE_BASE_PAUSE_S + extra, _BUBBLE_MAX_PAUSE_S)
+def _bubble_read_pause_s(landed_bubble: str) -> float:
+    """Quiet beat to READ the bubble that just landed (sized to its length)."""
+    extra = len(landed_bubble or "") * _BUBBLE_READ_PER_CHAR_S
+    return min(_BUBBLE_READ_BASE_S + extra, _BUBBLE_READ_MAX_S)
+
+
+def _bubble_write_pause_s(next_bubble: str) -> float:
+    """"Writing" beat before the NEXT bubble lands (sized to ITS length)."""
+    extra = len(next_bubble or "") * _BUBBLE_WRITE_PER_CHAR_S
+    return min(_BUBBLE_WRITE_BASE_S + extra, _BUBBLE_WRITE_MAX_S)
+
+
+async def _typing_for(
+    executor: ExecutorClient, conversation_id: str, seconds: float
+) -> None:
+    """Hold a 'writing' beat, keeping the typing indicator alive throughout.
+
+    Sends an initial typing ping immediately, then re-pings every
+    ``_TYPING_REFRESH_S`` until ``seconds`` elapse (the mobile/desktop typing
+    state decays on its own, so a long compose needs refreshing). Best-effort:
+    typing failures never interrupt the burst.
+    """
+    remaining = max(0.0, seconds)
+    while True:
+        try:
+            await executor.send_typing(conversation_id)
+        except Exception:  # noqa: BLE001
+            pass  # typing is best-effort; never let it break pacing
+        if remaining <= _TYPING_REFRESH_S:
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+            return
+        await asyncio.sleep(_TYPING_REFRESH_S)
+        remaining -= _TYPING_REFRESH_S
 
 
 def _parse_dm_blocks(reply: str) -> tuple[str, list[dict[str, str]]]:
@@ -2719,7 +2769,11 @@ async def _post_paced_bubbles(
 
     for idx, bubble in enumerate(bubbles):
         if idx > 0:
-            await asyncio.sleep(_bubble_pause_s(bubbles[idx - 1]))
+            # Read-then-write rhythm between bubbles: a silent beat to read the
+            # bubble that just landed, then a "… is writing" beat sized to the
+            # bubble about to land. See the pacing-constant block for the why.
+            await asyncio.sleep(_bubble_read_pause_s(bubbles[idx - 1]))
+            await _typing_for(executor, conversation_id, _bubble_write_pause_s(bubble))
 
         is_first = idx == 0
         addresses_peer = _reply_mentions_agent(bubble, members, sender_name)
