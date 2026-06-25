@@ -1343,10 +1343,6 @@ _BUBBLE_WRITE_BASE_S = 0.8
 _BUBBLE_WRITE_PER_CHAR_S = 0.028
 _BUBBLE_WRITE_MAX_S = 5.0
 
-# Typing indicators decay if not refreshed; re-ping at this cadence during a
-# long writing pause so the "… is writing" cue never blinks out mid-compose.
-_TYPING_REFRESH_S = 2.5
-
 
 def _bubble_read_pause_s(landed_bubble: str) -> float:
     """Quiet beat to READ the bubble that just landed (sized to its length)."""
@@ -1360,28 +1356,30 @@ def _bubble_write_pause_s(next_bubble: str) -> float:
     return min(_BUBBLE_WRITE_BASE_S + extra, _BUBBLE_WRITE_MAX_S)
 
 
-async def _typing_for(
-    executor: ExecutorClient, conversation_id: str, seconds: float
+async def _writing_beat(
+    executor: ExecutorClient,
+    conversation_id: str,
+    stream_id: str,
+    seconds: float,
 ) -> None:
-    """Hold a 'writing' beat, keeping the typing indicator alive throughout.
+    """Hold a "writing" beat that renders the SAME live writing bubble the first
+    message gets — not the lesser "is processing" text indicator.
 
-    Sends an initial typing ping immediately, then re-pings every
-    ``_TYPING_REFRESH_S`` until ``seconds`` elapse (the mobile/desktop typing
-    state decays on its own, so a long compose needs refreshing). Best-effort:
-    typing failures never interrupt the burst.
+    Emits a synthetic ``message_streaming`` "writing" event (via
+    ``send_stream_update``, phase="writing", no content) so the client shows the
+    StreamingBubble, waits ``seconds``, then leaves the bubble up: the following
+    bubble carries this ``stream_id`` in its metadata and clears it on arrival
+    (mirrors how the first message's real stream completes when it lands). The
+    backend's StaggeredBubbleWorker uses the identical contract for the
+    server-split fallback path. Best-effort: stream failures never break pacing.
     """
-    remaining = max(0.0, seconds)
-    while True:
-        try:
-            await executor.send_typing(conversation_id)
-        except Exception:  # noqa: BLE001
-            pass  # typing is best-effort; never let it break pacing
-        if remaining <= _TYPING_REFRESH_S:
-            if remaining > 0:
-                await asyncio.sleep(remaining)
-            return
-        await asyncio.sleep(_TYPING_REFRESH_S)
-        remaining -= _TYPING_REFRESH_S
+    try:
+        await executor.send_stream_update(
+            conversation_id, stream_id, status="started", phase="writing"
+        )
+    except Exception:  # noqa: BLE001
+        pass  # streaming is best-effort; never let it break pacing
+    await asyncio.sleep(max(0.0, seconds))
 
 
 def _parse_dm_blocks(reply: str) -> tuple[str, list[dict[str, str]]]:
@@ -2768,14 +2766,22 @@ async def _post_paced_bubbles(
         return False
 
     for idx, bubble in enumerate(bubbles):
+        is_first = idx == 0
+        beat_stream_id: str | None = None
+
         if idx > 0:
             # Read-then-write rhythm between bubbles: a silent beat to read the
-            # bubble that just landed, then a "… is writing" beat sized to the
-            # bubble about to land. See the pacing-constant block for the why.
+            # bubble that just landed, then a "writing" beat sized to the bubble
+            # about to land. The writing beat renders the SAME live writing
+            # bubble the first message gets (synthetic message_streaming event),
+            # not the lesser "is processing" text indicator. See the pacing
+            # constants for the why.
             await asyncio.sleep(_bubble_read_pause_s(bubbles[idx - 1]))
-            await _typing_for(executor, conversation_id, _bubble_write_pause_s(bubble))
+            beat_stream_id = f"continuation:{uuid.uuid4()}"
+            await _writing_beat(
+                executor, conversation_id, beat_stream_id, _bubble_write_pause_s(bubble)
+            )
 
-        is_first = idx == 0
         addresses_peer = _reply_mentions_agent(bubble, members, sender_name)
 
         metadata = dict(base_metadata)
@@ -2784,6 +2790,10 @@ async def _post_paced_bubbles(
         # path (turn/mention/wake) so handoffs actually reach the peer.
         if not is_first and not addresses_peer:
             metadata["humanlike_bubble"] = True
+        # Tag the bubble with its writing-beat stream so the client clears that
+        # writing bubble exactly as the message lands (same as the first msg).
+        if beat_stream_id:
+            metadata["stream_id"] = beat_stream_id
 
         try:
             await executor.send_message(
