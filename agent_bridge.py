@@ -4917,15 +4917,15 @@ def run_single_agent(
                     "Sorry — I blanked on that one. Could you say that again?",
                 )
 
-            # Send structured results first, then text reply, then deferred tasks
-            if presentations:
-                sent = await send_parsed_presentations(
-                    executor, msg.conversation_id, presentations,
-                    owner_lat=msg_owner_lat, owner_lng=msg_owner_lng,
-                    last_seen_message_id=msg.latest_seen_message_id or msg.message_id or None,
-                )
-                logger.info("[%s] Sent %d ResultPresentation(s) from tool_use", executor_key, sent)
-
+            # Post the text reply FIRST, then the card, then deferred tasks.
+            # A result_presentation is the CULMINATION of the model's turn — it
+            # writes the framing text ("let's get you a face") and THEN emits the
+            # <result_presentation>. The card must land AFTER that text so it
+            # reads in source order. Posting the card first (the old behavior)
+            # stamped it with an earlier timestamp than the human-paced text
+            # bubbles, so it sorted ABOVE the message that introduces it (the
+            # avatar/thread cards floating above their intro in conv 11467091).
+            reply_post_failed = False
             if reply:
                 try:
                     await _post_paced_bubbles(
@@ -4942,12 +4942,24 @@ def run_single_agent(
                         "[%s] Dropped stale tool_use reply — %d new message(s) arrived during draft",
                         executor_key, len(sce.new_messages),
                     )
+                    reply_post_failed = True
                     await _stream_cb.cancel()
                 except Exception as e:
                     logger.warning("[%s] Failed to send tool_use reply: %s", executor_key, e)
+                    reply_post_failed = True
                     await _stream_cb.cancel()
             else:
                 await _stream_cb.cancel()
+
+            # Card goes out after the intro text (skip if the text turn dropped as
+            # stale — a card without its framing would float alone).
+            if presentations and not reply_post_failed:
+                sent = await send_parsed_presentations(
+                    executor, msg.conversation_id, presentations,
+                    owner_lat=msg_owner_lat, owner_lng=msg_owner_lng,
+                    last_seen_message_id=msg.latest_seen_message_id or msg.message_id or None,
+                )
+                logger.info("[%s] Sent %d ResultPresentation(s) from tool_use", executor_key, sent)
 
             if _tu_task_requests:
                 if is_orchestrator:
@@ -5051,15 +5063,13 @@ def run_single_agent(
                 # Model succeeded but returned empty text — stay silent
                 reply = None
 
-        # Detect structured output
+        # Detect structured output. Strip the card from the text here, but DEFER
+        # sending it until AFTER the text reply is posted below — a card is the
+        # culmination of the turn (framing text THEN the card), so posting it
+        # first stamps it with an earlier timestamp than the human-paced text and
+        # floats it above its own intro (conv 11467091).
         remaining_text, presentations = parse_result_presentations(reply or "")
         if presentations:
-            sent = await send_parsed_presentations(
-                executor, msg.conversation_id, presentations,
-                owner_lat=msg_owner_lat, owner_lng=msg_owner_lng,
-                last_seen_message_id=msg.latest_seen_message_id or msg.message_id or None,
-            )
-            logger.info("[%s] Sent %d ResultPresentation(s)", executor_key, sent)
             if not remaining_text:
                 reply = ""
             else:
@@ -5183,6 +5193,7 @@ def run_single_agent(
                 reply = None
 
         # Send reply if there is one
+        reply_post_failed = False
         if reply:
             msg_meta_out: dict[str, str] = {}
             if result and result.model:
@@ -5207,13 +5218,26 @@ def run_single_agent(
                     "[%s] Dropped stale reply — %d new message(s) arrived during draft",
                     executor_key, len(sce.new_messages),
                 )
+                reply_post_failed = True
                 await _stream_cb.cancel()
             except Exception as e:
                 logger.warning("[%s] Failed to send reply: %s", executor_key, e)
+                reply_post_failed = True
                 await _stream_cb.cancel()
         else:
             # No reply to send — cancel the stream
             await _stream_cb.cancel()
+
+        # Now post any result_presentation card — AFTER the framing text so it
+        # lands below its intro in the timeline. Skip if the text turn dropped as
+        # stale (a card without its framing would float alone).
+        if presentations and not reply_post_failed:
+            sent = await send_parsed_presentations(
+                executor, msg.conversation_id, presentations,
+                owner_lat=msg_owner_lat, owner_lng=msg_owner_lng,
+                last_seen_message_id=msg.latest_seen_message_id or msg.message_id or None,
+            )
+            logger.info("[%s] Sent %d ResultPresentation(s)", executor_key, sent)
 
         # Create deferred tasks (delegation cards appear after the reply)
         # This MUST run even when reply is empty — the LLM may have produced
