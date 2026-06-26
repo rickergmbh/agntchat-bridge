@@ -2239,6 +2239,19 @@ def _extract_structured_text(msg: dict[str, Any], sender_label: str) -> str | No
 
         return "\n".join(parts)
 
+    if message_type == "UserAction":
+        # A tapped action-card button. Surface the choice (and result) so the
+        # agent reacts to it. Normally the server `readableText` above already
+        # handled this; this is the fallback for older payloads.
+        label = data.get("label") or data.get("action") or "an action"
+        result = data.get("result")
+        line = f'{sender_label} tapped "{label}"'
+        if data.get("action"):
+            line += f" (action: {data['action']})"
+        if result:
+            line += f" — result: {result}"
+        return line
+
     if message_type in ("StatusUpdate", "TaskComplete", "TaskFail"):
         # Task lifecycle cards — extract summary
         summary = data.get("summary", "")
