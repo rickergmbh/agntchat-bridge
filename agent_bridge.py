@@ -1470,20 +1470,25 @@ def _human_expects_reply(
 
     This is a RULE OF ENGAGEMENT owned by the backend, surfaced as
     ``directives.humanExpectsReply`` (BehavioralDirectives computes it from
-    agentAddressed + the single-human-conversation check). The bridge just
+    agentAddressed + the solo-agent-conversation check). The bridge just
     reads it. The local heuristic below is only a fallback for when the
     directive is absent (offline/legacy paths): explicitly addressed, OR a
-    human spoke in a single-human conversation (DM / 1-human onboarding group).
+    human spoke in a 1:1 with this agent (DM / guide-only onboarding group).
     """
     val = directives.get("humanExpectsReply")
     if isinstance(val, bool):
         return val
 
-    # Fallback (directive absent): mirror the backend's computation.
+    # Fallback (directive absent): mirror the backend's computation. A
+    # 1-human / MULTI-agent room (e.g. onboarding once a specialist joins) is
+    # NOT a solo 1:1 — every unaddressed agent assuming the human waits on it
+    # leaks the emptyResponse fallback when a peer owns the exchange
+    # (conv 0634e889). Require <=1 human AND <=1 agent.
     if directives.get("agentAddressed", False):
         return True
     human_count = sum(1 for m in members if (m or {}).get("type") == "human")
-    return bool(is_human_sender) and human_count <= 1
+    agent_count = sum(1 for m in members if (m or {}).get("type") == "agent")
+    return bool(is_human_sender) and human_count <= 1 and agent_count <= 1
 
 
 def _find_member_by_name(
@@ -4764,6 +4769,14 @@ def run_single_agent(
             }
             tool_exec = ToolExecutor(executor, context=tool_context, resolved_tools=resolved_tools)
             _tu_failed = False
+            # True when the model deliberately ended its turn via the `end_turn`
+            # tool. That is a CHOSEN silence (e.g. a peer owns the exchange and
+            # this agent stepped back), not a blank failure — so it must NOT
+            # trip the empty-reply fallback below, which would leak
+            # "I wasn't able to formulate a response" over an intentional
+            # no-op (conv 0634e889: the onboarding guide EndTurn'd to its
+            # specialist, then leaked the fallback anyway).
+            _tu_ended_turn = False
             try:
                 result = await backend.chat_with_tools(
                     msg_prompt, chat_messages, _tool_defs, tool_exec,
@@ -4803,9 +4816,19 @@ def run_single_agent(
                         executor_key,
                     ))
 
+                # Did the model deliberately end its turn? If so, an empty text
+                # reply is intentional silence — never a fallback. Use
+                # _tool_was_called (NOT a raw tc.name == "end_turn"): on the
+                # claude_cli MCP path the tool surfaces namespaced as
+                # `mcp__agentgram__end_turn` and is recorded in
+                # metadata["cli_tool_uses"], so a bare-string compare against
+                # result.tool_calls silently misses it — which is the exact
+                # path the hosted onboarding guide runs (conv 0634e889).
+                _tu_ended_turn = _tool_was_called(result, "end_turn")
+
                 reply = result.text[:MAX_REPLY_CHARS]
                 if not reply or not reply.strip():
-                    if human_expects_reply:
+                    if human_expects_reply and not _tu_ended_turn:
                         # The human directly engaged this agent (explicit
                         # address, or sole agent in a 1-human conversation like
                         # onboarding) but the model returned no text — usually a
@@ -4906,7 +4929,7 @@ def run_single_agent(
                 and not _tu_task_requests
                 and not tu_dm_blocks
             )
-            if nothing_emitted and human_expects_reply and not _tu_failed:
+            if nothing_emitted and human_expects_reply and not _tu_failed and not _tu_ended_turn:
                 logger.warning(
                     "[%s] tool_use reply parsed to empty with nothing emitted but "
                     "human expects a reply — using fallback",

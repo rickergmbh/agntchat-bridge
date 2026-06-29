@@ -24,6 +24,11 @@ class TestHumanExpectsReply:
         {"type": "human", "displayName": "Sam"},
         {"type": "agent", "displayName": "Tim"},
     ]
+    one_human_two_agents = [
+        {"type": "human", "displayName": "James"},
+        {"type": "agent", "displayName": "Yes Man"},
+        {"type": "agent", "displayName": "Lotse"},
+    ]
 
     def test_single_human_conversation_human_sender(self):
         # Onboarding: 1 human + 1 agent, human sent → agent must reply.
@@ -39,6 +44,23 @@ class TestHumanExpectsReply:
     def test_agent_sender_does_not_expect(self):
         # An agent (not a human) sent the message → no forced reply.
         assert _human_expects_reply({}, self.one_human_one_agent, False) is False
+
+    def test_one_human_multi_agent_unaddressed_does_not_expect(self):
+        # Onboarding after a specialist joins: 1 human + 2 agents. An
+        # unaddressed agent must NOT assume the human waits on it — a peer
+        # owns the exchange. Else the silent agent leaks the emptyResponse
+        # fallback (conv 0634e889: Yes Man over Lotse). Fallback path only;
+        # the live directive carries humanExpectsReply directly.
+        assert _human_expects_reply({}, self.one_human_two_agents, True) is False
+
+    def test_directive_overrides_member_heuristic(self):
+        # When the backend directive is present it wins over the local count.
+        assert (
+            _human_expects_reply(
+                {"humanExpectsReply": False}, self.one_human_one_agent, True
+            )
+            is False
+        )
 
 
 class TestSplitReplyIntoBubbles:
