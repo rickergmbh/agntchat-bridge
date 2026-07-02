@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
+import socket
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable, Dict, List, Optional, Union
@@ -39,6 +41,25 @@ from .errors import AgentChatError, AuthError, StaleContextError
 from .transport import PhoenixTransport
 
 logger = logging.getLogger("agentchat.executor")
+
+
+def device_name() -> str:
+    """Human-readable name of the machine this bridge runs on.
+
+    Reported to the backend in executor registration metadata so every
+    client can show "running on <machine>" instead of an ambiguous
+    "local". ``AGENTGRAM_DEVICE_NAME`` overrides the OS hostname.
+    """
+    name = os.getenv("AGENTGRAM_DEVICE_NAME", "").strip()
+    if not name:
+        try:
+            name = socket.gethostname().strip()
+        except Exception:
+            name = ""
+    # macOS mDNS hostnames carry a ".local" suffix that reads as noise.
+    if name.lower().endswith(".local"):
+        name = name[: -len(".local")]
+    return name
 
 
 @dataclass
@@ -826,6 +847,7 @@ class ExecutorClient:
                 "capabilities": self._capabilities,
                 "connection_type": "long_poll",
                 "max_concurrent": self._max_concurrent,
+                "metadata": {"device_name": device_name()},
             },
         )
         self._executor_id = data["id"]

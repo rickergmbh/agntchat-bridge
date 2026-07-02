@@ -77,7 +77,23 @@ class TokenManager:
                 return token
 
             if resp.status_code == 401:
-                raise AuthError("Invalid API key or deactivated agent")
+                # The backend distinguishes a deactivated agent from a bad
+                # key — pass that through so the desktop app can show the
+                # right fix (reactivate vs regenerate).
+                message = ""
+                try:
+                    message = ((resp.json().get("error") or {}).get("message") or "").lower()
+                except Exception:
+                    pass
+                if "deactivated" in message:
+                    raise AuthError(
+                        "Agent is deactivated — reactivate it before running it"
+                    )
+                raise AuthError(
+                    "Invalid API key — it may have been regenerated on another "
+                    "device. Generate a new key on this computer to run the "
+                    "agent here."
+                )
 
             if resp.status_code == 429 and ratelimit_retries < _RATELIMIT_MAX_RETRIES:
                 delay = self._ratelimit_delay(resp, ratelimit_retries)
