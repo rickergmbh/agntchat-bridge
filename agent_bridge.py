@@ -176,7 +176,6 @@ def parse_args() -> argparse.Namespace:
 
 AGENTGRAM_API_URL = os.getenv("AGENTGRAM_API_URL", "https://agentchat-backend.fly.dev")
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_TASKS", "2"))
-POLL_WAIT = int(os.getenv("POLL_WAIT", "30"))
 MAX_REPLY_CHARS = 30000  # Max chars for agent reply messages
 MAX_SUMMARY_CHARS = 5000  # Max chars for task completion summaries
 
@@ -405,8 +404,6 @@ def extract_agent_config(profile: dict[str, Any] | None) -> dict[str, Any]:
         config["model"] = model_config["runtime_api_id"]
     elif model_config.get("model"):
         config["model"] = model_config["model"]
-    elif metadata.get("model"):
-        config["model"] = metadata["model"]
     # CLI connection (auth/runtime) + its cloud region/project. The backend is
     # the single source of truth: the serializer stamps `cli_connection` (and
     # resolves `runtime_api_id` from it) onto every CLI agent's modelConfig. The
@@ -426,12 +423,8 @@ def extract_agent_config(profile: dict[str, Any] | None) -> dict[str, Any]:
         config["vertex_project"] = model_config["vertex_project"]
     if model_config.get("max_tokens"):
         config["max_tokens"] = int(model_config["max_tokens"])
-    elif metadata.get("max_tokens"):
-        config["max_tokens"] = int(metadata["max_tokens"])
     if model_config.get("timeout"):
         config["timeout"] = int(model_config["timeout"])
-    elif metadata.get("reply_timeout_ms"):
-        config["timeout"] = int(metadata["reply_timeout_ms"]) // 1000
     if model_config.get("options"):
         config["options"] = model_config["options"]
     soul_md = profile.get("soulMd")
@@ -3874,7 +3867,6 @@ def run_single_agent(
         display_name=f"Agent Bridge ({executor_key})",
         capabilities=agent_capabilities or [],
         max_concurrent=max_concurrent,
-        poll_wait=POLL_WAIT,
         message_timeout=_executor_timeout,
         task_timeout=_executor_timeout,
     )
@@ -4243,7 +4235,7 @@ def run_single_agent(
                 result.iterations, len(result.tool_calls), result.stop_reason,
             )
 
-            is_pulse = task_meta.get("source") == "pulse"
+            is_pulse = task.raw.get("task", {}).get("source") == "pulse"
             remaining_text = result.text[:MAX_REPLY_CHARS]
             send_message_called = _tool_was_called(result, "send_message")
 
@@ -5351,8 +5343,8 @@ def run_single_agent(
 
     logger.info("[%s] Starting agent bridge for %s", executor_key, agent_id)
     logger.info("[%s] API: %s | Model: %s", executor_key, AGENTGRAM_API_URL, backend.model_name)
-    logger.info("[%s] History: %d msgs, Concurrent: %d, Poll: %ds",
-                executor_key, history_limit, max_concurrent, POLL_WAIT)
+    logger.info("[%s] History: %d msgs, Concurrent: %d",
+                executor_key, history_limit, max_concurrent)
 
     executor.run()
 

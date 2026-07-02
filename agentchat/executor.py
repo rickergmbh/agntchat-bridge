@@ -220,7 +220,6 @@ class ExecutorClient:
         display_name: str | None = None,
         capabilities: list[str] | None = None,
         max_concurrent: int = 1,
-        poll_wait: int = 30,
         poll_timeout: int = 90,
         task_timeout: int = 1800,
         message_timeout: int = 300,
@@ -237,7 +236,6 @@ class ExecutorClient:
         self._display_name = display_name or executor_key
         self._capabilities = capabilities or []
         self._max_concurrent = max_concurrent
-        self._poll_wait = poll_wait
         self._poll_timeout = poll_timeout
         self._task_timeout = task_timeout
         self._message_timeout = message_timeout
@@ -918,7 +916,7 @@ class ExecutorClient:
             # queue id; the atomic-completion MCP tools look up
             # `Repo.get(Task, task_id)` so they need the real one.
             real_task_id = task.task_id or task.id
-            task_source = (task.raw.get("task", {}).get("metadata") or {}).get("source")
+            task_source = task.raw.get("task", {}).get("source")
             delivered_via_tool = extra.get("delivered_via_tool")
 
             if not (response_text and response_text.strip()):
@@ -1002,7 +1000,7 @@ class ExecutorClient:
         try:
             data = await self._get(f"/api/tasks/{task_id}")
             status = data.get("status") or (data.get("task") or {}).get("status")
-            return status in {"complete", "cancelled", "rejected", "exhausted"}
+            return status in {"complete", "cancelled", "failed", "rejected", "exhausted"}
         except Exception as e:
             logger.debug("Failed to check task %s terminal status: %s", task_id, e)
             return False
