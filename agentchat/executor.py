@@ -1315,12 +1315,9 @@ class ExecutorClient:
             ),
         }
 
-    async def send_typing(self, conversation_id: str) -> None:
-        """Send a typing indicator to a conversation."""
-        try:
-            await self._post(f"/api/conversations/{conversation_id}/typing", json={})
-        except Exception:
-            pass  # typing indicators are best-effort
+    # NOTE: no send_typing. Agents convey "writing" exclusively through
+    # message_streaming phase events (send_stream_update) — the lightweight
+    # typing channel is for humans.
 
     async def send_stream_update(
         self,

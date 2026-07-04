@@ -278,10 +278,3 @@ class TestSendMessage:
         assert call_args[0][2]["content"] == "Hello!"
         assert call_args[0][2]["content_type"] == "text"
 
-    @pytest.mark.asyncio
-    async def test_send_typing(self, client):
-        client._transport = AsyncMock()
-        await client.send_typing("conv-1")
-        client._transport.push_no_reply.assert_called_once_with(
-            "conversation:conv-1", "typing", {}
-        )

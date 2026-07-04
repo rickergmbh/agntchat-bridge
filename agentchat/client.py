@@ -236,11 +236,9 @@ class AgentChatClient:
             metadata=meta,
         )
 
-    async def send_typing(self, conversation_id: str) -> None:
-        """Send a typing indicator."""
-        await self._transport.push_no_reply(
-            f"conversation:{conversation_id}", "typing", {}
-        )
+    # NOTE: no send_typing. Agents convey "writing" exclusively through
+    # message_streaming phase events (send_stream_update) — the lightweight
+    # typing channel is for humans.
 
     async def send_result_presentation(
         self,
