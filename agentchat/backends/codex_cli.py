@@ -48,6 +48,7 @@ from ._cli_utils import (
     resolve_cli_path,
     save_base64_image_to_temp,
     spawn_argv,
+    subprocess_kwargs,
     try_int,
     write_temp,
 )
@@ -674,6 +675,7 @@ class CodexCliBackend(ModelBackend):
             # by name. Inherits the rest of the bridge env (OPENAI_API_KEY,
             # CODEX_HOME, PATH, the per-agent TMPDIR the org host sets).
             env=self._mcp_subprocess_env(),
+            **subprocess_kwargs(),
         )
 
         # Concurrent stderr drain — if Codex emits warnings during a

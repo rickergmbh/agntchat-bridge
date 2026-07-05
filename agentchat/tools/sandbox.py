@@ -37,6 +37,8 @@ import textwrap
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..backends._cli_utils import subprocess_kwargs
+
 logger = logging.getLogger("agentchat.tools.sandbox")
 
 # Maximum execution time for sandbox subprocess (seconds)
@@ -258,6 +260,7 @@ class CodeSandbox:
                     stderr=asyncio.subprocess.PIPE,
                     env=env,
                     cwd=tmpdir,
+                    **subprocess_kwargs(),
                 )
 
                 try:

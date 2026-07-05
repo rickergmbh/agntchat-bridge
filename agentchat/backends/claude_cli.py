@@ -44,6 +44,7 @@ from ._cli_utils import (
     resolve_cli_path,
     save_base64_image_to_temp,
     spawn_argv,
+    subprocess_kwargs,
     try_int,
     write_temp,
 )
@@ -801,6 +802,7 @@ class ClaudeCliBackend(ModelBackend):
             limit=_STREAM_LIMIT,
             env=self._isolated_env(),
             start_new_session=True,
+            **subprocess_kwargs(),
         )
 
         try:
@@ -869,6 +871,7 @@ class ClaudeCliBackend(ModelBackend):
             limit=_STREAM_LIMIT,
             env=self._isolated_env(),
             start_new_session=True,
+            **subprocess_kwargs(),
         )
 
         # Write prompt to stdin and close — CLI reads it and begins processing

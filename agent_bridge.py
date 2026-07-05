@@ -3448,6 +3448,8 @@ def _spawn_child_executor(
     skip_permissions inherits the parent's --dangerously-skip-permissions so a
     helper doesn't stall on an interactive sandbox-approval prompt it can't
     answer (skip-permissions is a CLI flag, not part of the backend record)."""
+    from agentchat.backends._cli_utils import subprocess_kwargs
+
     global _child_cleanup_registered
 
     with _child_processes_lock:
@@ -3468,7 +3470,7 @@ def _spawn_child_executor(
             cmd = cmd + ["--dangerously-skip-permissions"]
 
         try:
-            proc = subprocess.Popen(cmd, env=env)
+            proc = subprocess.Popen(cmd, env=env, **subprocess_kwargs())
         except Exception as e:
             logger.error("[%s] Failed to spawn sub-agent %s: %s",
                          parent_key, child_agent_id, e)

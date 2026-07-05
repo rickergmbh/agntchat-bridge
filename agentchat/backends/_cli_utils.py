@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import urllib.request
@@ -160,6 +161,20 @@ def spawn_argv(cmd: list[str]) -> list[str]:
     return cmd
 
 
+def subprocess_kwargs() -> dict:
+    """Platform kwargs for asyncio.create_subprocess_exec / subprocess.Popen.
+
+    On Windows, CREATE_NO_WINDOW stops every console-subsystem child (the
+    claude/codex CLIs, their cmd.exe shim wrappers, spawned sub-agent
+    bridges) from opening a visible terminal window when the bridge itself
+    runs windowless under the desktop app. Elsewhere: no-op. Every spawn in
+    the bridge must splat this in.
+    """
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
+
+
 def try_int(val: str | None) -> int | None:
     """Parse an int from a string, returning None on failure."""
     if val is None:
@@ -293,6 +308,7 @@ __all__ = [
     "resolve_cli_path",
     "save_base64_image_to_temp",
     "spawn_argv",
+    "subprocess_kwargs",
     "try_int",
     "write_temp",
 ]
