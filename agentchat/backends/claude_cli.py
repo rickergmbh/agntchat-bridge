@@ -191,6 +191,39 @@ def _attachment_to_cli_pointer(block: dict, cleanup_paths: list[str] | None = No
     return att.fallback_text(block)
 
 
+_USAGE_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+)
+
+
+def _extract_cli_usage(event: dict) -> dict[str, int] | None:
+    """Token counts from a stream-json ``result`` event's ``usage`` object.
+
+    Feeds ModelResult.usage, which the bridge's usage wrapper POSTs to
+    /api/usage — without this the whole CLI backend reports no token usage
+    at all (the platform's model-usage analytics stay empty).
+    """
+    raw = event.get("usage")
+    if not isinstance(raw, dict):
+        return None
+    out = {k: int(raw[k]) for k in _USAGE_KEYS if isinstance(raw.get(k), (int, float))}
+    return out or None
+
+
+def _merge_usage(total: dict[str, int] | None, add: dict[str, int] | None) -> dict[str, int] | None:
+    """Accumulate per-iteration usage across a multi-call tool loop."""
+    if not add:
+        return total
+    if not total:
+        return dict(add)
+    for k, v in add.items():
+        total[k] = total.get(k, 0) + v
+    return total
+
+
 class ClaudeCliBackend(ModelBackend):
     """Backend using the Claude Code CLI via asyncio subprocess."""
 
@@ -859,6 +892,10 @@ class ClaudeCliBackend(ModelBackend):
         # of hard-coded zeros.
         _tool_uses: list[dict[str, Any]] = []
         _num_turns: int = 0
+        # Token usage + real model id from the result event — feeds
+        # ModelResult.usage → the bridge's /api/usage reporting.
+        _usage: dict[str, int] | None = None
+        _result_model: str | None = None
 
         # Anthropic streaming delivers tool_use input via `input_json_delta`
         # events that arrive AFTER the `content_block_start`. We accumulate
@@ -871,7 +908,7 @@ class ClaudeCliBackend(ModelBackend):
         try:
             async def read_stream():
                 nonlocal result_text, _last_delta_time, _accumulated_text, _result_error_subtype, _result_subtype, _result_is_error, _num_turns
-                nonlocal _active_tool_use
+                nonlocal _active_tool_use, _usage, _result_model
                 assert proc.stdout is not None
                 async for line in iter_event_lines(
                     proc.stdout, timeout=self._timeout, max_line=_STREAM_LIMIT
@@ -893,6 +930,13 @@ class ClaudeCliBackend(ModelBackend):
                         _num_turns = int(event.get("num_turns") or 0)
                         _result_subtype = event.get("subtype", "")
                         _result_is_error = bool(event.get("is_error"))
+                        _usage = _extract_cli_usage(event)
+                        # modelUsage keys are the real model ids the CLI hit —
+                        # better analytics attribution than the generic
+                        # "claude-cli" fallback.
+                        model_usage = event.get("modelUsage")
+                        if isinstance(model_usage, dict) and model_usage:
+                            _result_model = next(iter(model_usage))
                         # Detect error results (max_turns, permission denied, etc.)
                         if event.get("is_error"):
                             _result_error_subtype = event.get("subtype", "unknown_error")
@@ -1068,8 +1112,9 @@ class ClaudeCliBackend(ModelBackend):
 
         return ModelResult(
             text=clean_text,
-            model=self._model or "claude-cli",
+            model=_result_model or self._model or "claude-cli",
             elapsed_seconds=round(elapsed, 1),
+            usage=_usage or {},
             metadata={
                 "backend": "claude_cli",
                 "cli_path": self._cli_path,
@@ -1185,6 +1230,7 @@ class ClaudeCliBackend(ModelBackend):
                 text=result.text,
                 model=result.model,
                 elapsed_seconds=round(elapsed, 1),
+                usage=result.usage,
                 metadata=merged_metadata,
                 tool_calls=tool_calls,
                 iterations=cli_num_turns,
@@ -1205,6 +1251,7 @@ class ClaudeCliBackend(ModelBackend):
         )
 
         all_tool_calls: list[ToolCall] = []
+        loop_usage: dict[str, int] | None = None
         start = time.monotonic()
         total_budget = self._timeout * 1.5
         iteration = 0
@@ -1251,6 +1298,7 @@ class ClaudeCliBackend(ModelBackend):
                     text=f"[Tool loop aborted: {e}]",
                     model=self._model or "claude-cli",
                     elapsed_seconds=round(elapsed, 1),
+                    usage=loop_usage or {},
                     tool_calls=all_tool_calls,
                     iterations=iteration,
                     stop_reason="error",
@@ -1258,6 +1306,7 @@ class ClaudeCliBackend(ModelBackend):
             finally:
                 cleanup_temp_files(cleanup)
 
+            loop_usage = _merge_usage(loop_usage, result.usage)
             remaining_text, calls = parse_tool_calls(result.text)
 
             # DEBUG: log what the LLM actually returned
@@ -1277,6 +1326,7 @@ class ClaudeCliBackend(ModelBackend):
                     text=final_text,
                     model=result.model,
                     elapsed_seconds=round(elapsed, 1),
+                    usage=loop_usage or {},
                     tool_calls=all_tool_calls,
                     iterations=iteration,
                     stop_reason="end_turn",
@@ -1381,6 +1431,7 @@ class ClaudeCliBackend(ModelBackend):
                     text=remaining_text,
                     model=self._model or "claude-cli",
                     elapsed_seconds=round(elapsed, 1),
+                    usage=loop_usage or {},
                     tool_calls=all_tool_calls,
                     iterations=iteration,
                     stop_reason="max_tool_calls",
@@ -1394,6 +1445,7 @@ class ClaudeCliBackend(ModelBackend):
             text="[Agent exceeded maximum iterations without completing]",
             model=self._model or "claude-cli",
             elapsed_seconds=round(elapsed, 1),
+            usage=loop_usage or {},
             tool_calls=all_tool_calls,
             iterations=iteration,
             stop_reason="max_iterations",
