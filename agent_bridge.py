@@ -3706,41 +3706,29 @@ def run_single_agent(
 
     backend = create_backend(effective_backend, **backend_kwargs)
 
-    # Model config sync
+    # Model config sync — one-way, startup-only. The server's model_config is
+    # the user's explicit selection and the server is its source of truth: the
+    # bridge NEVER writes a model back over a profile-provided one. (It used to
+    # re-sync whatever model each result reported; Claude CLI runs report every
+    # model they touch — including Haiku for internal utility calls — which
+    # kept clobbering the user's pick.) The sync below only fills the gap for
+    # bridges configured purely via env/CLI args, where the server would
+    # otherwise have no model to display.
     sync_backend_name = effective_backend or os.getenv("MODEL_BACKEND", "anthropic")
-    _last_synced_model: str | None = None
 
-    def _do_sync(model: str | None) -> None:
-        nonlocal _last_synced_model
-        config: dict[str, Any] = {}
-        if model:
-            config["model"] = model
+    if not (profile_resolved_model or agent_config.get("model")):
+        startup_model = backend_kwargs.get("model") or getattr(backend, "_model", None)
+        sync_config: dict[str, Any] = {}
+        if startup_model:
+            sync_config["model"] = startup_model
         if sync_backend_name:
-            config["backend"] = sync_backend_name
-        if not config:
-            return
-        try:
-            asyncio.run(_sync_model_config(AGENTGRAM_API_URL, agent_id, api_key, config))
-            _last_synced_model = model
-            logger.info("[%s] Synced model config: %s", executor_key, config)
-        except Exception as e:
-            logger.warning("[%s] Failed to sync model config: %s", executor_key, e)
-
-    async def _maybe_sync_model(result_model: str) -> None:
-        nonlocal _last_synced_model
-        if result_model and result_model != _last_synced_model:
+            sync_config["backend"] = sync_backend_name
+        if sync_config:
             try:
-                config: dict[str, Any] = {"model": result_model}
-                if sync_backend_name:
-                    config["backend"] = sync_backend_name
-                await _sync_model_config(AGENTGRAM_API_URL, agent_id, api_key, config)
-                _last_synced_model = result_model
-                logger.info("[%s] Model changed → synced: %s", executor_key, result_model)
+                asyncio.run(_sync_model_config(AGENTGRAM_API_URL, agent_id, api_key, sync_config))
+                logger.info("[%s] Synced model config: %s", executor_key, sync_config)
             except Exception as e:
-                logger.warning("[%s] Failed to sync model change: %s", executor_key, e)
-
-    startup_model = backend_kwargs.get("model") or getattr(backend, "_model", None)
-    _do_sync(startup_model)
+                logger.warning("[%s] Failed to sync model config: %s", executor_key, e)
 
     # Runtime settings
     if args.history_limit is not None:
@@ -4227,7 +4215,6 @@ def run_single_agent(
             if hasattr(progress_cb, "flush"):
                 await progress_cb.flush()
             await _task_stream_cb({"type": "stage", "stage": "processing_results", "force": True})
-            await _maybe_sync_model(result.model)
 
             _cli_internal = bool((result.metadata or {}).get("cli_internal_loop"))
             _loop_label = "CLI-internal loop" if _cli_internal else "outer loop"
@@ -4358,7 +4345,6 @@ def run_single_agent(
             if hasattr(progress_cb, "flush"):
                 await progress_cb.flush()
             await _task_stream_cb({"type": "stage", "stage": "processing_results", "force": True})
-            await _maybe_sync_model(result.model)
 
             code = extract_python_code(result.text)
             error_msgs = (behavioral_config or {}).get("errorMessages", {})
@@ -4406,7 +4392,6 @@ def run_single_agent(
             if hasattr(progress_cb, "flush"):
                 await progress_cb.flush()
             await _task_stream_cb({"type": "stage", "stage": "processing_results", "force": True})
-            await _maybe_sync_model(result.model)
 
             logger.info("[%s] Model completed in %.1fs (%d chars)",
                          executor_key, result.elapsed_seconds, len(result.text))
@@ -4788,7 +4773,6 @@ def run_single_agent(
                 reply = error_msgs.get("modelFailure",
                     "I ran into an issue processing that request. Let me know if you'd like me to try again.")
             else:
-                await _maybe_sync_model(result.model)
                 _cli_internal = bool((result.metadata or {}).get("cli_internal_loop"))
                 _loop_label = "CLI-internal loop" if _cli_internal else "outer loop"
                 logger.info(
@@ -5015,7 +4999,6 @@ def run_single_agent(
                 reply = error_msgs.get("modelFailure",
                     "I ran into an issue processing that request. Let me know if you'd like me to try again.")
             else:
-                await _maybe_sync_model(result.model)
                 code = extract_python_code(result.text)
 
                 if code:
@@ -5055,7 +5038,6 @@ def run_single_agent(
             await _stream_cb.cancel()
 
         if result is not None:
-            await _maybe_sync_model(result.model)
             reply = result.text[:MAX_REPLY_CHARS]
         else:
             reply = ""

@@ -934,9 +934,12 @@ class ClaudeCliBackend(ModelBackend):
                         _result_subtype = event.get("subtype", "")
                         _result_is_error = bool(event.get("is_error"))
                         _usage = _extract_cli_usage(event)
-                        # modelUsage keys are the real model ids the CLI hit —
-                        # better analytics attribution than the generic
-                        # "claude-cli" fallback.
+                        # modelUsage lists EVERY model the CLI touched during
+                        # the run — including internal utility models (Haiku
+                        # for background tasks) — in arbitrary order. It is
+                        # only trustworthy as a fallback when no model was
+                        # configured; the configured model always wins in
+                        # ModelResult.model (see below).
                         model_usage = event.get("modelUsage")
                         if isinstance(model_usage, dict) and model_usage:
                             _result_model = next(iter(model_usage))
@@ -1115,7 +1118,7 @@ class ClaudeCliBackend(ModelBackend):
 
         return ModelResult(
             text=clean_text,
-            model=_result_model or self._model or "claude-cli",
+            model=self._model or _result_model or "claude-cli",
             elapsed_seconds=round(elapsed, 1),
             usage=_usage or {},
             metadata={
