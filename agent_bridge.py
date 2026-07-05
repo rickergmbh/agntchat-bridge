@@ -47,6 +47,7 @@ import subprocess
 import sys
 import threading
 import uuid
+from collections import deque
 from typing import Any
 
 # Load .env from repo root (two levels up from desktop/bridge/)
@@ -2914,16 +2915,65 @@ def make_stream_callback(
     card already shows progress — avoids duplicate streaming bubble + task card.
     """
     _started = False
-    _pending_tasks: list[asyncio.Task[None]] = []
     _iteration = 0
     _had_tool_calls = False  # Whether ANY iteration so far used tools
     _stream_terminal = False  # Set by complete()/cancel() — no more deltas to wire
 
-    def _fire_and_forget(coro) -> None:
-        """Schedule a coroutine without blocking the caller."""
-        task = asyncio.create_task(coro)
-        _pending_tasks.append(task)
-        task.add_done_callback(lambda t: _pending_tasks.remove(t) if t in _pending_tasks else None)
+    # Ordered emission. The LLM loop must never block on an HTTP round-trip
+    # (~200ms each) — a stall triggers silent fallback to batch mode — but the
+    # updates must still reach the backend IN ORDER. With bare fire-and-forget,
+    # a phase transition (e.g. writing → tool_call) could be overtaken by an
+    # earlier, slower POST, so a client shows a stale phase ("Writing…" while
+    # the agent is actually running a tool). So on_progress only ENQUEUES
+    # (non-blocking); a single background sender drains the queue serially,
+    # preserving emission order. Consecutive cumulative "writing" frames
+    # coalesce to the newest — each carries the full transcript-so-far, so the
+    # older ones are redundant — which keeps a fast token stream from backing
+    # the queue up under serial sending. `None` is the stop sentinel.
+    _send_queue: deque[dict[str, Any] | None] = deque()
+    _send_wake = asyncio.Event()
+    _sender_task: asyncio.Task[None] | None = None
+
+    async def _sender_loop() -> None:
+        while True:
+            if not _send_queue:
+                _send_wake.clear()
+                await _send_wake.wait()
+                continue
+            item = _send_queue.popleft()
+            if item is None:  # stop sentinel — everything before it already drained
+                return
+            # Collapse a run of cumulative writing frames to the newest. Phase
+            # transitions and terminal frames are never dropped, so order across
+            # phases is preserved.
+            if item.get("phase") == "writing" and "content" in item:
+                while (
+                    _send_queue
+                    and _send_queue[0] is not None
+                    and _send_queue[0].get("phase") == "writing"
+                    and "content" in _send_queue[0]
+                ):
+                    item = _send_queue.popleft()
+            try:
+                await executor.send_stream_update(conversation_id, stream_id, **item)
+            except Exception:  # noqa: BLE001
+                pass  # streaming is best-effort; never surface transport errors
+
+    def _enqueue(**kwargs: Any) -> None:
+        """Queue a streaming update for in-order delivery (never blocks the caller)."""
+        nonlocal _sender_task
+        _send_queue.append(kwargs)
+        if _sender_task is None:
+            _sender_task = asyncio.create_task(_sender_loop())
+        _send_wake.set()
+
+    async def _drain_and_stop() -> None:
+        """Flush queued updates in order, then let the sender exit."""
+        if _sender_task is None:
+            return
+        _send_queue.append(None)  # sentinel: sender returns after draining the rest
+        _send_wake.set()
+        await _sender_task
 
     async def on_progress(event: dict[str, Any]) -> None:
         nonlocal _started, _iteration, _had_tool_calls
@@ -2950,20 +3000,14 @@ def make_stream_callback(
                 _started = True
                 logger.info("[stream:%s] started (thinking)", stream_id[:8])
             if not suppress_stream:
-                _fire_and_forget(executor.send_stream_update(
-                    conversation_id, stream_id,
-                    status=status, phase="thinking", phase_detail=detail,
-                ))
+                _enqueue(status=status, phase="thinking", phase_detail=detail)
 
         elif event_type == "text_delta":
             accumulated = event.get("accumulated", "")
             if accumulated:
                 logger.info("[stream:%s] text_delta (%d chars)", stream_id[:8], len(accumulated))
                 if not suppress_stream:
-                    _fire_and_forget(executor.send_stream_update(
-                        conversation_id, stream_id,
-                        content=accumulated, status="streaming", phase="writing",
-                    ))
+                    _enqueue(content=accumulated, status="streaming", phase="writing")
 
         elif event_type == "tool_call":
             _had_tool_calls = True
@@ -2985,19 +3029,15 @@ def make_stream_callback(
             # "Thinking..." bubble.
             summary = _summarize_tool(tool_name, tool_args) if (tool_args or is_final_delivery) else None
             if not suppress_stream:
-                _fire_and_forget(executor.send_stream_update(
-                    conversation_id, stream_id,
+                _enqueue(
                     content="" if is_final_delivery else None,
                     status="streaming", phase="tool_call", phase_detail=summary,
-                ))
+                )
 
         elif event_type == "section":
             section = event.get("section", "")
             if not suppress_stream:
-                _fire_and_forget(executor.send_stream_update(
-                    conversation_id, stream_id,
-                    status="streaming", phase="analyzing", phase_detail=section,
-                ))
+                _enqueue(status="streaming", phase="analyzing", phase_detail=section)
 
     async def complete() -> None:
         """Signal the stream is done. Called after the final message is sent."""
@@ -3011,12 +3051,15 @@ def make_stream_callback(
         _stream_terminal = True
         if suppress_stream:
             return
-        # Wait for any in-flight streaming updates to finish before signaling complete
-        if _pending_tasks:
-            await asyncio.gather(*_pending_tasks, return_exceptions=True)
-        await executor.send_stream_update(
-            conversation_id, stream_id, status="complete",
-        )
+        # Enqueue the terminal frame so it lands AFTER every prior update, then
+        # drain in order. If no updates ever flowed (no sender), send directly.
+        if _sender_task is None:
+            await executor.send_stream_update(
+                conversation_id, stream_id, status="complete",
+            )
+            return
+        _send_queue.append({"status": "complete"})
+        await _drain_and_stop()
 
     async def cancel() -> None:
         """Signal the stream was cancelled (error/empty response/timeout)."""
@@ -3026,11 +3069,13 @@ def make_stream_callback(
         _stream_terminal = True
         if suppress_stream:
             return
-        if _pending_tasks:
-            await asyncio.gather(*_pending_tasks, return_exceptions=True)
-        await executor.send_stream_update(
-            conversation_id, stream_id, status="cancelled",
-        )
+        if _sender_task is None:
+            await executor.send_stream_update(
+                conversation_id, stream_id, status="cancelled",
+            )
+            return
+        _send_queue.append({"status": "cancelled"})
+        await _drain_and_stop()
 
     on_progress.complete = complete  # type: ignore[attr-defined]
     on_progress.cancel = cancel  # type: ignore[attr-defined]
