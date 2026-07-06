@@ -3248,6 +3248,46 @@ def _build_tool_param_details_from_resolved(tools: list[dict[str, Any]]) -> str:
     return "\n".join(lines) if len(lines) > 2 else ""
 
 
+def _diff_resolved_toolkit(
+    all_resolved: list[dict[str, Any]],
+    current_resolved: list[dict[str, Any]],
+    current_server: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Partition a freshly-fetched ``resolvedTools`` list and diff it against the
+    toolkit currently loaded in the process.
+
+    Splits the fetched catalog into server-only (`server_tool`) entries — which
+    the bridge never dispatches locally — and everything else (the tools that
+    gate dispatch, whether via a local SDK method or the backend passthrough).
+
+    Returns ``None`` when there is nothing to apply:
+      - the fetch was empty (treated as a transient blip; keep the current
+        toolkit rather than clobbering it to nothing), or
+      - the resolved names and server-tool count are unchanged.
+
+    Otherwise returns ``{"resolved", "server", "added", "removed"}`` so the
+    caller can swap in the new partitions, rebuild derived tool defs, and log
+    the delta. Pure — no I/O, no mutation of the inputs — which is what makes
+    the wake-time refresh path unit-testable (issue #54)."""
+    if not all_resolved:
+        return None
+
+    new_server = [t for t in all_resolved if t.get("category") == "server_tool"]
+    new_resolved = [t for t in all_resolved if t.get("category") != "server_tool"]
+
+    old_names = {t.get("name") for t in current_resolved}
+    new_names = {t.get("name") for t in new_resolved}
+    if new_names == old_names and len(new_server) == len(current_server):
+        return None
+
+    return {
+        "resolved": new_resolved,
+        "server": new_server,
+        "added": sorted(n for n in new_names - old_names if n),
+        "removed": sorted(n for n in old_names - new_names if n),
+    }
+
+
 def _build_system_prompt_from_directives(
     directives: dict[str, Any] | None,
 ) -> str | None:
@@ -4067,24 +4107,16 @@ def run_single_agent(
             return
 
         all_resolved = (fresh or {}).get("resolvedTools") or []
-        if not all_resolved:
-            # An empty resolve is treated as a transient blip, not a real
-            # "all tools removed" event — clobbering to empty would break tool
-            # access for the rest of the session. Keep the current toolkit.
+        # Partition + diff the fetched catalog. Returns None on an empty fetch
+        # (transient blip — keep the current toolkit) or when nothing changed.
+        diff = _diff_resolved_toolkit(all_resolved, resolved_tools, server_tools)
+        if diff is None:
             return
 
-        new_server = [t for t in all_resolved if t.get("category") == "server_tool"]
-        new_resolved = [t for t in all_resolved if t.get("category") != "server_tool"]
-
-        old_names = {t.get("name") for t in resolved_tools}
-        new_names = {t.get("name") for t in new_resolved}
-        if new_names == old_names and len(new_server) == len(server_tools):
-            return  # toolkit unchanged — nothing to rebuild
-
-        added = sorted(n for n in new_names - old_names if n)
-        removed = sorted(n for n in old_names - new_names if n)
-        resolved_tools = new_resolved
-        server_tools = new_server
+        added = diff["added"]
+        removed = diff["removed"]
+        resolved_tools = diff["resolved"]
+        server_tools = diff["server"]
 
         # Rebuild everything the startup block derived from the toolkit. Mirror
         # the setup at "--- Tool-use mode setup ---" exactly so a refreshed tool
