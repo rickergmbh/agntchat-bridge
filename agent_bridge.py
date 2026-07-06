@@ -1333,6 +1333,14 @@ def _split_reply_into_bubbles(reply: str) -> list[str]:
 # The actual numbers are SERVER-OWNED — `behavioralConfig.humanlikePacing`
 # (see BehavioralDirectives.build_behavioral_config). These constants are only
 # fallback defaults for when the directive is absent (offline/legacy paths).
+# Closing a writing beat is best-effort, but for an INTERRUPTED burst
+# (StaleContextError) or a failed bubble post there's no landed message for the
+# backend to self-close on — this explicit terminal frame is then the ONLY
+# thing that clears the "Writing…" activity before the 60s stale-sweep. So a
+# single transient failure is retried instead of silently swallowed.
+_WRITING_BEAT_CLOSE_ATTEMPTS = 3
+_WRITING_BEAT_CLOSE_RETRY_S = 0.2
+
 _PACING_DEFAULTS = {
     "readBaseMs": 500,
     "readPerCharMs": 18,
@@ -2876,15 +2884,34 @@ async def _close_writing_beat(
 ) -> None:
     """Send a terminal `complete` for a writing-beat stream so the backend
     AgentActivity tracker drops it immediately. No-op when there was no beat
-    (the first bubble). Best-effort."""
+    (the first bubble).
+
+    A LANDED bubble is self-closing on the backend — it carries the beat's
+    `metadata.stream_id`, and `AgentActivity` drops that key on message-arrival.
+    But an INTERRUPTED burst (StaleContextError) or a failed bubble post has no
+    landed message, so this explicit terminal frame is the ONLY thing that
+    clears the "Writing…" activity before the 60s stale-sweep. Don't silently
+    swallow a single transient failure — retry briefly, then log if it still
+    fails (never raise: streaming must not break the burst)."""
     if not beat_stream_id:
         return
-    try:
-        await executor.send_stream_update(
-            conversation_id, beat_stream_id, status="complete"
-        )
-    except Exception:  # noqa: BLE001
-        pass  # streaming is best-effort; never let it break the burst
+    for attempt in range(_WRITING_BEAT_CLOSE_ATTEMPTS):
+        try:
+            await executor.send_stream_update(
+                conversation_id, beat_stream_id, status="complete"
+            )
+            return
+        except Exception as e:  # noqa: BLE001
+            if attempt + 1 >= _WRITING_BEAT_CLOSE_ATTEMPTS:
+                # Exhausted retries. The backend message-arrival drop covers
+                # landed bubbles; only an interrupted burst whose close also
+                # keeps failing falls back to the 60s sweep. Log, don't raise.
+                logger.warning(
+                    "[humanlike] failed to close writing beat %s in %s after %d attempts: %s",
+                    beat_stream_id, conversation_id, _WRITING_BEAT_CLOSE_ATTEMPTS, e,
+                )
+                return
+            await asyncio.sleep(_WRITING_BEAT_CLOSE_RETRY_S)
 
 
 def make_stream_callback(
