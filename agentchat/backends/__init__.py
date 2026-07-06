@@ -130,6 +130,18 @@ class ModelBackend(ABC):
             timeout=timeout,
         )
 
+    def set_skip_permissions(self, enabled: bool) -> None:
+        """Update the skip-permissions mode for subsequent generations.
+
+        Backend = single source of truth: the bridge calls this each turn with
+        the server-delivered ``behavioralConfig.dangerouslySkipPermissions`` so
+        toggling the setting in the UI takes effect live, without a process
+        restart (issue #68). No-op for backends that have no permission gate
+        (API backends never prompt); CLI backends override it to flip the flag
+        that controls ``--dangerously-skip-permissions`` on the next spawn.
+        """
+        return None
+
     def outer_timeout(self) -> int:
         """Seconds an executor should wait before force-cancelling a turn.
 

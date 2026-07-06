@@ -4120,6 +4120,28 @@ def run_single_agent(
             executor_key, added or "none", removed or "none", len(resolved_tools),
         )
 
+    # Operator override: the --dangerously-skip-permissions CLI flag forces
+    # skip-permissions ON for the whole process and always wins over the
+    # server toggle, so a machine owner can guarantee an unattended sandbox.
+    _operator_skip_permissions = bool(args.dangerously_skip_permissions)
+
+    def _sync_skip_permissions(behavioral_config: dict[str, Any] | None) -> None:
+        """Apply the server's live skip-permissions directive to the backend.
+
+        Backend = single source of truth (issue #68): every turn carries
+        ``behavioralConfig.dangerouslySkipPermissions``, so toggling the setting
+        in the UI takes effect on the next turn with no process restart. The
+        operator CLI flag still wins. Absent directive (cold cache) = no-op.
+        """
+        if _operator_skip_permissions:
+            return
+        if not behavioral_config:
+            return
+        desired = behavioral_config.get("dangerouslySkipPermissions")
+        if desired is None:
+            return
+        backend.set_skip_permissions(bool(desired))
+
     @executor.on_task
     async def handle_task(task: GatewayTask) -> dict[str, Any]:
         nonlocal _cached_directives_by_conv, _cached_directives_fallback
@@ -4139,6 +4161,8 @@ def run_single_agent(
         behavioral_config = task_directives.get("behavioralConfig")
         _guardrail_config = (behavioral_config or {}).get("toolLoopGuardrails")
         _compaction_config = (behavioral_config or {}).get("compaction")
+        # Resolve skip-permissions live from this turn's directive (issue #68).
+        _sync_skip_permissions(behavioral_config)
 
         task_meta = task.raw.get("task", {}).get("metadata", {})
 
@@ -4609,6 +4633,8 @@ def run_single_agent(
         behavioral_config = directives.get("behavioralConfig", {})
         _guardrail_config = (behavioral_config or {}).get("toolLoopGuardrails")
         _compaction_config = (behavioral_config or {}).get("compaction")
+        # Resolve skip-permissions live from this turn's directive (issue #68).
+        _sync_skip_permissions(behavioral_config)
         is_orchestrator = directives.get("isOrchestrator", False)
         skip_message = directives.get("skipMessage", False)
         skip_reason = directives.get("skipReason")
@@ -5375,9 +5401,12 @@ def run_single_agent(
             if child_id and child_key:
                 # A spawned helper inherits the parent's skip-permissions so
                 # its code sandbox doesn't stall on an interactive approval.
+                # Use the parent's LIVE value (kept current per-turn by
+                # _sync_skip_permissions, issue #68), not the stale boot config,
+                # so a just-toggled parent propagates the new mode to children.
                 skip_perms = bool(
-                    args.dangerously_skip_permissions
-                    or agent_config.get("dangerously_skip_permissions")
+                    _operator_skip_permissions
+                    or getattr(backend, "_skip_permissions", False)
                 )
                 await loop.run_in_executor(
                     None, _spawn_child_executor,

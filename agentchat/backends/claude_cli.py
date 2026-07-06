@@ -528,6 +528,22 @@ class ClaudeCliBackend(ModelBackend):
             name += f" ({self._model})"
         return name
 
+    def set_skip_permissions(self, enabled: bool) -> None:
+        """Flip --dangerously-skip-permissions for the next CLI spawn.
+
+        _build_command reads self._skip_permissions on every generation, so
+        updating it here makes the UI toggle take effect on the agent's next
+        turn without a restart (issue #68). Logs on an actual change only.
+        """
+        enabled = bool(enabled)
+        if enabled != self._skip_permissions:
+            logger.info(
+                "Skip-permissions %s live (was %s)",
+                "enabled" if enabled else "disabled",
+                self._skip_permissions,
+            )
+            self._skip_permissions = enabled
+
     async def generate_quick(
         self,
         system_prompt: str,
