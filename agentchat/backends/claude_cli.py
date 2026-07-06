@@ -393,12 +393,17 @@ class ClaudeCliBackend(ModelBackend):
         owner_id: str = "",
         source_message_id: str = "",
         last_seen_message_id: str = "",
+        force_agentgram: bool = False,
     ) -> str:
         """Build MCP config JSON string for --mcp-config.
 
         Composes one or more stdio MCP servers under `mcpServers`. The
         AgentGram server (platform tools, backend-routed) and the local
         computer-use server (desktop control, mode-gated) coexist here.
+
+        `force_agentgram` keeps the AgentGram server present even with no
+        resolved platform tools — needed so the permission-prompt tool
+        (#67) is reachable when skip-permissions is OFF.
         """
         servers: dict[str, Any] = {}
 
@@ -410,6 +415,7 @@ class ClaudeCliBackend(ModelBackend):
             source_message_id=source_message_id,
             last_seen_message_id=last_seen_message_id,
         )
+        _ = force_agentgram
         if agentgram_entry:
             servers["agentgram"] = agentgram_entry
 
@@ -687,16 +693,28 @@ class ClaudeCliBackend(ModelBackend):
         # tools (send_message, create_task, etc.) are also exposed via MCP.
         cmd.extend(["--tools", ",".join(self._CLI_TOOLS)])
 
-        want_agentgram_mcp = bool(resolved_tools) and bool(self._mcp_server_script)
+        # Permission prompts (#67): when skip-permissions is OFF, route every
+        # gated tool call through the AgentGram permission-prompt tool. Without
+        # this the CLI in headless `-p` mode has nowhere to ask, so a gated
+        # call just hangs. This forces the AgentGram MCP server to spawn even
+        # when the agent resolved no platform tools (native Bash/Write still
+        # need a gate).
+        want_permission_prompt = (not self._skip_permissions) and bool(self._mcp_server_script)
+
+        want_agentgram_mcp = (
+            (bool(resolved_tools) or want_permission_prompt) and bool(self._mcp_server_script)
+        )
         want_computer_use_mcp = (
             self._computer_use_mode == "local" and bool(self._computer_use_script)
         )
         use_mcp = want_agentgram_mcp or want_computer_use_mcp
 
+        agentgram_mcp_wired = False
         if use_mcp:
             mcp_config = self._build_mcp_config(
                 resolved_tools or [], conversation_id, task_id, owner_id,
                 source_message_id, last_seen_message_id,
+                force_agentgram=want_permission_prompt,
             )
             if mcp_config:
                 # Always via a temp FILE, never inline in argv. The MCP config
@@ -706,6 +724,13 @@ class ClaudeCliBackend(ModelBackend):
                 # org-host. (Also dodges the Windows cmd.exe re-parse of
                 # `?a=1&b=2` / `%` in the JSON.) Unlinked via cleanup_paths.
                 cmd.extend(["--mcp-config", write_temp(mcp_config, ".json", "agentchat_mcp_", cleanup_paths)])
+                agentgram_mcp_wired = want_agentgram_mcp
+
+        # Bind the permission-prompt tool only once the AgentGram MCP server is
+        # actually wired — otherwise the CLI would reference a tool that
+        # doesn't exist and reject every action.
+        if want_permission_prompt and agentgram_mcp_wired:
+            cmd.extend(["--permission-prompt-tool", "mcp__agentgram__permission_prompt"])
 
         return cmd, user_prompt, cleanup_paths
 

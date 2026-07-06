@@ -2897,6 +2897,37 @@ class ExecutorClient:
         )
 
     # ------------------------------------------------------------------
+    # Permission prompts (#67)
+    # ------------------------------------------------------------------
+
+    async def create_permission_request(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any] | None = None,
+        description: str | None = None,
+        conversation_id: str | None = None,
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Ask the backend whether a gated tool call may run.
+
+        Returns the backend's JSON: ``{"status": "approved", ...}`` when a
+        standing grant covers it, or a pending request (with ``id``) the
+        caller polls via ``get_permission_request``.
+        """
+        body: dict[str, Any] = {"toolName": tool_name, "toolInput": tool_input or {}}
+        if description:
+            body["description"] = description
+        if conversation_id:
+            body["conversationId"] = conversation_id
+        if task_id:
+            body["taskId"] = task_id
+        return await self._post("/api/agent/permission-requests", json=body)
+
+    async def get_permission_request(self, request_id: str) -> dict[str, Any]:
+        """Poll a pending permission request for its current status."""
+        return await self._get(f"/api/agent/permission-requests/{request_id}")
+
+    # ------------------------------------------------------------------
     # HTTP helpers
     # ------------------------------------------------------------------
 

@@ -64,10 +64,33 @@ def load_tools() -> list[dict[str, Any]]:
 TOOLS = load_tools()
 TOOL_MAP = {t["name"]: t for t in TOOLS if t.get("name")}
 
+# --- Permission prompt (#67) ---
+#
+# When skip-permissions is OFF, the bridge spawns Claude CLI with
+# `--permission-prompt-tool mcp__agentgram__permission_prompt`. The CLI calls
+# this tool for every action needing approval; we relay it to the backend
+# (single source of truth: grant check, human approve/deny, expiry) and poll
+# for the decision, then answer allow/deny IN THE SAME TURN. The runtime
+# never restarts and never loses context.
+
+PERMISSION_PROMPT_TOOL = "permission_prompt"
+# Poll cadence + ceiling. The ceiling tracks the backend's request TTL
+# (Permissions.ttl_seconds = 300s) with a little slack; a stale row reads as
+# expired server-side, so we deny once it does.
+_PERMISSION_POLL_INTERVAL = 2.0
+_PERMISSION_MAX_WAIT = 330.0
+
 # --- Executor setup (reuses SDK's ExecutorClient + ToolExecutor) ---
 
 _executor: ExecutorClient | None = None
 _tool_executor: ToolExecutor | None = None
+
+
+def get_executor() -> ExecutorClient:
+    """Lazily initialize (and return) the shared ExecutorClient."""
+    get_tool_executor()
+    assert _executor is not None
+    return _executor
 
 
 def get_tool_executor() -> ToolExecutor:
@@ -131,6 +154,24 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
                 "description": t.get("description", ""),
                 "inputSchema": schema,
             })
+        # Advertise the permission-prompt tool so the CLI can bind
+        # --permission-prompt-tool to it. Its input is the CLI's standard
+        # permission-request shape (tool being gated + that tool's input).
+        mcp_tools.append({
+            "name": PERMISSION_PROMPT_TOOL,
+            "description": (
+                "Internal: gates a tool call behind the owner's in-app "
+                "approval. Not called directly by the agent."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tool_name": {"type": "string"},
+                    "input": {"type": "object"},
+                    "tool_use_id": {"type": "string"},
+                },
+            },
+        })
         return {
             "jsonrpc": "2.0",
             "id": req_id,
@@ -140,6 +181,18 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
     if method == "tools/call":
         tool_name = params.get("name", "")
         arguments = params.get("arguments", {})
+
+        # Permission-prompt tool: the CLI is asking whether a gated action may
+        # run. Relay to the backend and answer allow/deny (never routed
+        # through ToolExecutor).
+        if tool_name == PERMISSION_PROMPT_TOOL:
+            decision = asyncio.run(handle_permission_prompt(arguments))
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {"content": [{"type": "text", "text": json.dumps(decision)}]},
+            }
+
         logger.info("Executing tool: %s | args=%s | ctx_conv=%s | ctx_task=%s | source=%s",
                      tool_name, json.dumps(arguments, default=str)[:200],
                      CONVERSATION_ID[:12] if CONVERSATION_ID else "none",
@@ -180,6 +233,89 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
         "id": req_id,
         "error": {"code": -32601, "message": f"Method not found: {method}"},
     }
+
+
+def _describe(gated_tool: str, tool_input: dict[str, Any]) -> str:
+    """Short human-readable line for the approve/deny toast."""
+    if gated_tool == "Bash" and isinstance(tool_input.get("command"), str):
+        return f"Run command: {tool_input['command'][:160]}"
+    if gated_tool in ("Write", "Edit") and isinstance(tool_input.get("file_path"), str):
+        return f"{gated_tool} file: {tool_input['file_path']}"
+    if gated_tool in ("WebFetch", "WebSearch"):
+        target = tool_input.get("url") or tool_input.get("query") or ""
+        return f"{gated_tool}: {str(target)[:160]}"
+    return f"Use tool: {gated_tool}"
+
+
+def _allow(tool_input: dict[str, Any]) -> dict[str, Any]:
+    # Claude CLI requires updatedInput echoed back on allow.
+    return {"behavior": "allow", "updatedInput": tool_input}
+
+
+def _deny(message: str) -> dict[str, Any]:
+    return {"behavior": "deny", "message": message}
+
+
+async def handle_permission_prompt(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Relay a CLI permission request to the backend and await the decision.
+
+    Returns the CLI's permission-prompt contract: an ``allow``/``deny`` dict.
+    Fails closed — any error denies, so a backend hiccup can never silently
+    grant an ungated action.
+    """
+    gated_tool = arguments.get("tool_name") or arguments.get("toolName") or "unknown"
+    tool_input = arguments.get("input") or arguments.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+
+    executor = get_executor()
+
+    try:
+        resp = await executor.create_permission_request(
+            tool_name=gated_tool,
+            tool_input=tool_input,
+            description=_describe(gated_tool, tool_input),
+            conversation_id=CONVERSATION_ID or None,
+            task_id=TASK_ID or None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("permission_prompt: create failed for %s", gated_tool)
+        return _deny(f"Permission request failed: {exc}")
+
+    status = resp.get("status")
+    if status == "approved":
+        logger.info("permission_prompt: %s auto-approved (standing grant)", gated_tool)
+        return _allow(tool_input)
+
+    request_id = resp.get("requestId") or resp.get("id")
+    if not request_id:
+        logger.warning("permission_prompt: no request id in response: %s", resp)
+        return _deny("Permission request could not be created.")
+
+    logger.info("permission_prompt: %s pending (id=%s) — awaiting owner", gated_tool, request_id)
+
+    waited = 0.0
+    while waited < _PERMISSION_MAX_WAIT:
+        await asyncio.sleep(_PERMISSION_POLL_INTERVAL)
+        waited += _PERMISSION_POLL_INTERVAL
+        try:
+            poll = await executor.get_permission_request(request_id)
+        except Exception:  # noqa: BLE001
+            logger.warning("permission_prompt: poll error for %s (continuing)", request_id)
+            continue
+
+        status = poll.get("status")
+        if status == "approved":
+            logger.info("permission_prompt: %s approved by owner", gated_tool)
+            return _allow(tool_input)
+        if status == "denied":
+            logger.info("permission_prompt: %s denied by owner", gated_tool)
+            return _deny("The owner denied this action.")
+        if status == "expired":
+            logger.info("permission_prompt: %s expired", gated_tool)
+            return _deny("Permission request expired without a response.")
+
+    return _deny("Permission request timed out without a response.")
 
 
 def main() -> None:
