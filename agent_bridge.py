@@ -2450,6 +2450,7 @@ _PLATFORM_TOOL_LABELS: dict[str, str] = {
     "list_issues": "Listing issues",
     "get_issue": "Reading issue",
     "create_issue": "Creating issue",
+    "close_issue": "Closing issue",
     "comment_on_issue": "Commenting on issue",
     "list_pull_requests": "Listing PRs",
     "get_pull_request": "Reading PR",

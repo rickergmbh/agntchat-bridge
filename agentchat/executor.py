@@ -2444,6 +2444,22 @@ class ExecutorClient:
             f"/api/github/repos/{owner}/{repo}/issues", json=payload
         )
 
+    async def close_issue(
+        self, owner: str, repo: str, number: int, *,
+        state_reason: str | None = None, comment: str | None = None,
+    ) -> dict[str, Any]:
+        """Close an issue. state_reason: 'completed' (default) or 'not_planned'.
+        Optional comment is posted before closing."""
+        payload: dict[str, Any] = {}
+        if state_reason:
+            payload["state_reason"] = state_reason
+        if comment:
+            payload["comment"] = comment
+        return await self._patch(
+            f"/api/github/repos/{owner}/{repo}/issues/{number}/close",
+            json=payload or None,
+        )
+
     async def comment_on_issue(
         self, owner: str, repo: str, number: int, body: str,
     ) -> dict[str, Any]:
