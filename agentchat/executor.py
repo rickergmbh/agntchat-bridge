@@ -25,6 +25,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import os
 import signal
@@ -41,6 +42,16 @@ from .errors import AgentChatError, AuthError, StaleContextError
 from .transport import PhoenixTransport
 
 logger = logging.getLogger("agentchat.executor")
+
+# The underlying Task id of the task being handled in the current asyncio
+# context, set for the duration of the task handler. Lets decoupled telemetry
+# (the usage POST fired from the backend.chat wrappers in agent_bridge.py)
+# attribute a turn to its task — loop iteration token budgets depend on it.
+# A contextvar (not an executor attribute) so concurrent task runs can't
+# cross-attribute: asyncio.create_task snapshots the context at creation.
+CURRENT_TASK_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "agentgram_current_task_id", default=None
+)
 
 
 def device_name() -> str:
@@ -890,10 +901,16 @@ class ExecutorClient:
             return
 
         try:
-            result = await asyncio.wait_for(
-                self._task_handler(task),
-                timeout=self._task_timeout,
-            )
+            # Scope the current task id to the handler call: every LLM call
+            # (and its fire-and-forget usage report) happens inside it.
+            _ctx_token = CURRENT_TASK_ID.set(task.task_id or task.id)
+            try:
+                result = await asyncio.wait_for(
+                    self._task_handler(task),
+                    timeout=self._task_timeout,
+                )
+            finally:
+                CURRENT_TASK_ID.reset(_ctx_token)
 
             # Atomic completion contract (protocol v2):
             # - String result → the agent's full user-facing reply, posted in

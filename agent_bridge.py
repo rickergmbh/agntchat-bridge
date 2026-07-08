@@ -72,7 +72,13 @@ import time as _time  # noqa: E402
 from agentchat.auth import TokenManager  # noqa: E402
 from agentchat.errors import AgentChatError, AuthError, StaleContextError  # noqa: E402
 from agentchat.backends import ChatMessage, create_backend  # noqa: E402
-from agentchat.executor import ExecutorClient, GatewayMessage, GatewayTask, ScopeRequest  # noqa: E402
+from agentchat.executor import (  # noqa: E402
+    CURRENT_TASK_ID,
+    ExecutorClient,
+    GatewayMessage,
+    GatewayTask,
+    ScopeRequest,
+)
 from agentchat.tools.executor import ToolExecutor  # noqa: E402
 from agentchat.tools.parsing import parse_tool_calls as _parse_tool_calls_shared  # noqa: E402
 from agentchat.tools.sandbox import CodeSandbox, extract_python_code  # noqa: E402
@@ -515,14 +521,21 @@ async def _report_usage(
     Best-effort telemetry: the backend buckets it (ETS + batched flush) for the
     operator console's per-agent/month token totals. Attributed server-side to
     the authenticated agent. Failures log but never propagate to the turn.
+
+    Turns that ran inside a task handler carry the task id (via the
+    executor's CURRENT_TASK_ID contextvar — inherited here because
+    _maybe_report_usage's create_task snapshots the handler's context), so
+    the backend can attribute loop-iteration usage to its loop's token
+    budget. Non-task turns simply omit it.
     """
     if not usage:
         return
+    payload: dict[str, Any] = {"usage": usage, "model": model}
+    task_id = CURRENT_TASK_ID.get()
+    if task_id:
+        payload["task_id"] = task_id
     try:
-        await executor._post(  # type: ignore[attr-defined]
-            "/api/usage",
-            {"usage": usage, "model": model},
-        )
+        await executor._post("/api/usage", payload)  # type: ignore[attr-defined]
     except Exception as e:
         logger.debug("[%s] Usage telemetry POST failed: %s", executor_key, e)
 
