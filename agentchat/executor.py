@@ -34,6 +34,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable, Dict, List, Optional, Union
 
+from .version import BRIDGE_VERSION
+
 import httpx
 
 from ._dedup import MessageDedup
@@ -522,9 +524,14 @@ class ExecutorClient:
                 # Join user:{agent_id} with executor_id. The server-side
                 # UserChannel uses this to route gateway claims to this executor
                 # and push full payloads (see backend user_channel.ex:bind_executor).
+                # bridge_version lets the backend gate incompatible bridges at
+                # the join (audit-remediation-plan H3).
                 await transport.join(
                     f"user:{self._agent_id}",
-                    params={"executor_id": self._executor_id},
+                    params={
+                        "executor_id": self._executor_id,
+                        "bridge_version": BRIDGE_VERSION,
+                    },
                 )
                 self._ws_transport = transport
                 self._ws_healthy = True
@@ -858,7 +865,10 @@ class ExecutorClient:
                 "capabilities": self._capabilities,
                 "connection_type": "long_poll",
                 "max_concurrent": self._max_concurrent,
-                "metadata": {"device_name": device_name()},
+                "metadata": {
+                    "device_name": device_name(),
+                    "bridge_version": BRIDGE_VERSION,
+                },
             },
         )
         self._executor_id = data["id"]

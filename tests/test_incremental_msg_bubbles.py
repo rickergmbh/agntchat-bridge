@@ -15,52 +15,25 @@ from agent_bridge import (
 
 
 class TestHumanExpectsReply:
-    one_human_one_agent = [
-        {"type": "human", "displayName": "James"},
-        {"type": "agent", "displayName": "Tim"},
-    ]
-    two_humans = [
-        {"type": "human", "displayName": "James"},
-        {"type": "human", "displayName": "Sam"},
-        {"type": "agent", "displayName": "Tim"},
-    ]
-    one_human_two_agents = [
-        {"type": "human", "displayName": "James"},
-        {"type": "agent", "displayName": "Yes Man"},
-        {"type": "agent", "displayName": "Lotse"},
-    ]
+    # H4 (audit-remediation-plan): the bridge reads the backend's
+    # humanExpectsReply directive with NO local recomputation. The old
+    # member-count heuristic tests died with the fallback — the backend's
+    # side of the contract is locked by behavioral_directives_test
+    # ("bridge decision-field contract").
 
-    def test_single_human_conversation_human_sender(self):
-        # Onboarding: 1 human + 1 agent, human sent → agent must reply.
-        assert _human_expects_reply({}, self.one_human_one_agent, True) is True
+    def test_directive_true(self):
+        assert _human_expects_reply({"humanExpectsReply": True}) is True
 
-    def test_explicit_address_always_expects(self):
-        assert _human_expects_reply({"agentAddressed": True}, self.two_humans, True) is True
+    def test_directive_false(self):
+        assert _human_expects_reply({"humanExpectsReply": False}) is False
 
-    def test_multi_human_unaddressed_does_not_expect(self):
-        # 2 humans, not addressed → silence is legitimate.
-        assert _human_expects_reply({}, self.two_humans, True) is False
+    def test_missing_directive_is_protocol_error_defaulting_to_false(self):
+        # Never improvise: silence over a leaked "couldn't formulate a
+        # response" fallback. The bridge logs a protocol error here.
+        assert _human_expects_reply({}) is False
 
-    def test_agent_sender_does_not_expect(self):
-        # An agent (not a human) sent the message → no forced reply.
-        assert _human_expects_reply({}, self.one_human_one_agent, False) is False
-
-    def test_one_human_multi_agent_unaddressed_does_not_expect(self):
-        # Onboarding after a specialist joins: 1 human + 2 agents. An
-        # unaddressed agent must NOT assume the human waits on it — a peer
-        # owns the exchange. Else the silent agent leaks the emptyResponse
-        # fallback (conv 0634e889: Yes Man over Lotse). Fallback path only;
-        # the live directive carries humanExpectsReply directly.
-        assert _human_expects_reply({}, self.one_human_two_agents, True) is False
-
-    def test_directive_overrides_member_heuristic(self):
-        # When the backend directive is present it wins over the local count.
-        assert (
-            _human_expects_reply(
-                {"humanExpectsReply": False}, self.one_human_one_agent, True
-            )
-            is False
-        )
+    def test_non_bool_value_treated_as_missing(self):
+        assert _human_expects_reply({"humanExpectsReply": "yes"}) is False
 
 
 class TestSplitReplyIntoBubbles:

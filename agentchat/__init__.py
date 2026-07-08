@@ -1,5 +1,6 @@
 """AgentChat Python SDK — connect AI agents to AgentChat."""
 
+from .version import BRIDGE_VERSION
 from .client import AgentChatClient
 from .executor import ExecutorClient, GatewayTask
 from .models import Conversation, Message, Participant
@@ -30,6 +31,7 @@ from .results import (
 )
 
 __all__ = [
+    "BRIDGE_VERSION",
     "AgentChatClient",
     "ExecutorClient",
     "GatewayTask",
@@ -67,4 +69,4 @@ __all__ = [
     "ResultPresentation",
 ]
 
-__version__ = "0.1.0"
+__version__ = BRIDGE_VERSION

@@ -1222,76 +1222,6 @@ _DM_BLOCK_RE = re.compile(
 _DM_ATTR_RE = re.compile(r'(\w+)\s*=\s*(?:"(?P<dq>[^"]*)"|\'(?P<sq>[^\']*)\')')
 
 
-# --- Outgoing filler detection ---
-# Catches LLM responses that say "I have nothing to add" instead of
-# actually staying silent.  Only used for group-chat suppression.
-_OUTGOING_FILLER_PREFIXES = [
-    "nothing for me to add",
-    "nothing to add",
-    "nothing more to add",
-    "nothing else to add",
-    "nothing new to add",
-    "nothing here",
-    "nothing needed from me",
-    "nothing from me",
-    "nothing more needed",
-    "i have nothing",
-    "i don't have anything",
-    "i've got nothing",
-    "staying quiet",
-    "staying silent",
-    "i'll stay quiet",
-    "i'll stay silent",
-    "i'll sit this one out",
-    "sitting this one out",
-    "no input from me",
-    "no input needed from me",
-    "not my area",
-    "outside my wheelhouse",
-    "outside my area",
-    "that's outside my",
-    "that one's outside my",
-    "not much i can add",
-    "not much to add",
-    "i'll let them",
-    "i'll let you",
-    "i'll leave this",
-    "i'll leave that",
-    "let me know if you need",
-    "just let me know",
-    "all good on my end",
-    "all set on my end",
-    "no action needed from me",
-    "no action from me",
-    "deferring to",
-    "i'll defer to",
-]
-
-_OUTGOING_FILLER_EXACT = {
-    "noted", "acknowledged", "got it", "understood",
-    "roger", "copy that", "will do", "all good",
-    "all set", "sounds good",
-}
-
-
-def _is_outgoing_filler(reply: str) -> bool:
-    """Return True if the reply is a non-substantive 'nothing to add' response."""
-    if not reply:
-        return False
-    stripped = reply.strip()
-    # Short replies (< 120 chars) that start with a filler prefix
-    if len(stripped) > 120:
-        return False
-    lowered = stripped.lower().lstrip("— -–")
-    # Exact match on very short filler
-    first_sentence = lowered.split(".")[0].strip().rstrip("!?,;:")
-    if first_sentence in _OUTGOING_FILLER_EXACT:
-        return True
-    # Prefix match
-    return any(lowered.startswith(p) for p in _OUTGOING_FILLER_PREFIXES)
-
-
-
 _MSG_BLOCK_RE = re.compile(r"<msg>(.*?)</msg>", re.DOTALL | re.IGNORECASE)
 
 
@@ -1476,34 +1406,26 @@ def _parse_dm_blocks(reply: str) -> tuple[str, list[dict[str, str]]]:
 
 
 
-def _human_expects_reply(
-    directives: dict[str, Any],
-    members: list[dict[str, Any]],
-    is_human_sender: bool,
-) -> bool:
+def _human_expects_reply(directives: dict[str, Any]) -> bool:
     """True when the human clearly expects a reply from THIS agent.
 
     This is a RULE OF ENGAGEMENT owned by the backend, surfaced as
     ``directives.humanExpectsReply`` (BehavioralDirectives computes it from
-    agentAddressed + the solo-agent-conversation check). The bridge just
-    reads it. The local heuristic below is only a fallback for when the
-    directive is absent (offline/legacy paths): explicitly addressed, OR a
-    human spoke in a 1:1 with this agent (DM / guide-only onboarding group).
+    agentAddressed + the solo-agent-conversation check). The bridge only
+    reads it — there is deliberately no local recomputation (H4: a
+    bridge-side mirror is a second source of truth that drifts per deployed
+    bridge version). A missing field is a protocol error: log loud and
+    default to False, the never-improvise direction (silence over a leaked
+    "I wasn't able to formulate a response" fallback).
     """
     val = directives.get("humanExpectsReply")
     if isinstance(val, bool):
         return val
-
-    # Fallback (directive absent): mirror the backend's computation. A
-    # 1-human / MULTI-agent room (e.g. onboarding once a specialist joins) is
-    # NOT a solo 1:1 — every unaddressed agent assuming the human waits on it
-    # leaks the emptyResponse fallback when a peer owns the exchange
-    # (conv 0634e889). Require <=1 human AND <=1 agent.
-    if directives.get("agentAddressed", False):
-        return True
-    human_count = sum(1 for m in members if (m or {}).get("type") == "human")
-    agent_count = sum(1 for m in members if (m or {}).get("type") == "agent")
-    return bool(is_human_sender) and human_count <= 1 and agent_count <= 1
+    logger.error(
+        "protocol error: directives present but humanExpectsReply missing — "
+        "backend must supply it on every delivery; defaulting to False"
+    )
+    return False
 
 
 def _find_member_by_name(
@@ -3128,10 +3050,14 @@ def make_stream_callback(
 # System prompt builder — reads from server directives
 # ---------------------------------------------------------------------------
 
-# Minimal fallback only used when server directives are completely unavailable
-_FALLBACK_SYSTEM_PROMPT = """You are an AI agent connected to AgentGram.
-Respond naturally and conversationally.
-When someone assigns you a specific task, you'll receive it as a formal task."""
+class DirectivesUnavailableError(RuntimeError):
+    """No server directives and no cached copy — the turn must not run.
+
+    There is deliberately NO fallback prompt (audit-remediation-plan H4):
+    behavior comes only from server directives, and an agent that says
+    nothing and logs why beats an agent improvising on an aging shadow
+    prompt that silently drifts from the backend.
+    """
 
 
 def _build_tool_param_details(catalog: list) -> str:
@@ -3359,9 +3285,18 @@ def _compose_system_prompt(directives: dict[str, Any] | None) -> str:
 
     Combines (in order):
       1. The working-directories preamble (bridge-side capability disclosure)
-      2. Server-provided promptDirectives, or _FALLBACK_SYSTEM_PROMPT
+      2. Server-provided promptDirectives
+
+    Raises DirectivesUnavailableError when there are no promptDirectives —
+    the turn entry points guard for this before doing any work; this raise
+    is the backstop for any path that forgot.
     """
-    base = _build_system_prompt_from_directives(directives) or _FALLBACK_SYSTEM_PROMPT
+    base = _build_system_prompt_from_directives(directives)
+    if not base:
+        raise DirectivesUnavailableError(
+            "no promptDirectives in server payload or cache — refusing to run "
+            "the turn on an improvised prompt"
+        )
     return _build_working_dirs_preamble() + base
 
 
@@ -4203,6 +4138,24 @@ def run_single_agent(
             _cached_directives_fallback = task_directives
         elif not task_directives:
             task_directives = (conv_id and _cached_directives_by_conv.get(conv_id)) or _cached_directives_fallback or {}
+
+        # Fail LOUD when there is no prompt to run on (H4: no fallback
+        # prompt). A visibly failed task beats a turn improvised on a
+        # bridge-side shadow prompt that drifts from the backend.
+        if not task_directives.get("promptDirectives"):
+            logger.error(
+                "[%s] directives_unavailable for task %s (conv %s): no "
+                "promptDirectives in payload and no cached directives; "
+                "failing the task instead of improvising",
+                executor_key, task.task_id or task.id, conv_id,
+            )
+            await executor.fail_task(
+                task.task_id or task.id,
+                error="directives_unavailable: server sent no promptDirectives "
+                      "and the bridge has no cached copy",
+            )
+            return None
+
         behavioral_config = task_directives.get("behavioralConfig")
         _guardrail_config = (behavioral_config or {}).get("toolLoopGuardrails")
         _compaction_config = (behavioral_config or {}).get("compaction")
@@ -4675,6 +4628,20 @@ def run_single_agent(
             _cached_directives_by_conv[conv_id] = msg.directives
             _cached_directives_fallback = msg.directives
         directives = msg.directives or (conv_id and _cached_directives_by_conv.get(conv_id)) or _cached_directives_fallback or {}
+
+        # Fail LOUD when there is no prompt to run on (H4: no fallback
+        # prompt). Skipping the turn is safe: the server's directive
+        # pipeline failing is a server incident, and silence + an error log
+        # beats a reply improvised on a bridge-side shadow prompt.
+        if not directives.get("promptDirectives"):
+            logger.error(
+                "[%s] directives_unavailable for message %s (conv %s): no "
+                "promptDirectives in payload and no cached directives; "
+                "skipping the turn instead of improvising",
+                executor_key, msg.message_id, conv_id,
+            )
+            return None
+
         behavioral_config = directives.get("behavioralConfig", {})
         _guardrail_config = (behavioral_config or {}).get("toolLoopGuardrails")
         _compaction_config = (behavioral_config or {}).get("compaction")
@@ -4688,11 +4655,7 @@ def run_single_agent(
         # Does the human clearly expect a reply from THIS agent? In those cases
         # an EMPTY model result is a failure, not "chose silence" — we emit a
         # graceful fallback rather than leaving the user hanging.
-        human_expects_reply = _human_expects_reply(
-            directives,
-            getattr(msg, "conversation_members", None) or [],
-            getattr(msg, "is_human", False),
-        )
+        human_expects_reply = _human_expects_reply(directives)
         logger.info(
             "[%s] Directives: type=%s orch=%s skip=%s",
             executor_key,
@@ -5321,19 +5284,11 @@ def run_single_agent(
                 targets = ", ".join(b["target"] for b in dm_blocks)
                 reply = f"[Could not start agent thread with {targets}]"
 
-        # --- Outgoing filler filter ---
-        # LLMs interpret "stay silent" as "tell them you're staying silent".
-        # Catch these non-substantive replies and suppress them in group chats
-        # when the agent wasn't directly addressed.
-        if reply and not directives.get("agentAddressed", False):
-            members = getattr(msg, "conversation_members", None) or []
-            is_group = len(members) > 2
-            if is_group and _is_outgoing_filler(reply):
-                logger.info(
-                    "[%s] Suppressed outgoing filler in group: '%s'",
-                    executor_key, reply[:80],
-                )
-                reply = None
+        # Outgoing-filler suppression ("nothing to add", "staying quiet")
+        # moved SERVER-SIDE (Agentchat.Messaging.FillerSuppression, H4) so
+        # every runtime gets identical group-etiquette behavior from one
+        # phrase list. The send below may come back {suppressed: true} —
+        # the client treats that as a successful no-op.
 
         # Send reply if there is one
         reply_post_failed = False
