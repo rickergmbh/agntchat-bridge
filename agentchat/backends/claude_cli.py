@@ -341,6 +341,12 @@ class ClaudeCliBackend(ModelBackend):
                 "Use 'local' until Anthropic supports -p mode."
             )
 
+        # Per-agent app allow-list. `None` = fall back to the
+        # AGENTGRAM_COMPUTER_USE_ALLOWED_APPS env var (the spawn-time value);
+        # a list = the live value pushed by set_computer_use from this turn's
+        # server directive. Empty list means "no restriction" (all apps).
+        self._computer_use_allowed_apps: list[str] | None = None
+
         self._computer_use_script: str | None = None
         if self._computer_use_mode == "local":
             self._computer_use_script = find_sibling_script("computer_use_mcp_server.py")
@@ -493,12 +499,21 @@ class ClaudeCliBackend(ModelBackend):
             ),
         }
 
-        # Per-agent allow-list. Set by Tauri at bridge spawn from
-        # `agent.metadata.computer_use_allowed_apps`. Must be forwarded
-        # here explicitly — see the env-inheritance note above.
-        allowed_apps = os.getenv("AGENTGRAM_COMPUTER_USE_ALLOWED_APPS")
-        if allowed_apps:
-            env["AGENTGRAM_COMPUTER_USE_ALLOWED_APPS"] = allowed_apps
+        # Per-agent allow-list. The live value (pushed each turn by
+        # set_computer_use from the server directive) wins; if it was never
+        # set we fall back to the spawn-time env var Tauri wrote from
+        # `agent.metadata.computer_use_allowed_apps`. Newline-separated to
+        # match Tauri and the MCP server's parser. Must be forwarded
+        # explicitly — see the env-inheritance note above.
+        if self._computer_use_allowed_apps is not None:
+            if self._computer_use_allowed_apps:
+                env["AGENTGRAM_COMPUTER_USE_ALLOWED_APPS"] = "\n".join(
+                    self._computer_use_allowed_apps
+                )
+        else:
+            allowed_apps = os.getenv("AGENTGRAM_COMPUTER_USE_ALLOWED_APPS")
+            if allowed_apps:
+                env["AGENTGRAM_COMPUTER_USE_ALLOWED_APPS"] = allowed_apps
 
         # Optional lock-file override (mostly for tests). Same propagation
         # rule: ambient env doesn't reach the MCP server unless listed here.
@@ -549,6 +564,60 @@ class ClaudeCliBackend(ModelBackend):
                 self._skip_permissions,
             )
             self._skip_permissions = enabled
+
+    def set_computer_use(
+        self, enabled: bool, allowed_apps: list[str] | None = None
+    ) -> None:
+        """Flip local computer-use for the next CLI spawn (no restart).
+
+        Mirrors set_skip_permissions: _build_command / _build_mcp_config read
+        self._computer_use_mode on every generation, so updating it here makes
+        the UI toggle take effect on the agent's next turn. The bridge calls
+        this each turn from the server's `behavioralConfig.computerUse`
+        directive (backend = single source of truth).
+
+        Enabling on an agent that booted with computer use OFF resolves the MCP
+        server script lazily and bumps the timeout floor — the same setup the
+        constructor does for a boot-time `local` agent. `builtin` is never
+        reachable here (the constructor raised), so we only ever toggle between
+        `off` and `local`.
+        """
+        enabled = bool(enabled)
+
+        # Always track the latest allow-list so a running agent picks up app
+        # changes even when the enabled bit didn't flip.
+        if allowed_apps is not None:
+            self._computer_use_allowed_apps = [
+                a.strip() for a in allowed_apps if isinstance(a, str) and a.strip()
+            ]
+
+        desired_mode = "local" if enabled else "off"
+        if desired_mode == self._computer_use_mode:
+            return
+
+        if enabled:
+            # Lazily resolve the script if we booted OFF and never found it.
+            if not self._computer_use_script:
+                self._computer_use_script = find_sibling_script(
+                    "computer_use_mcp_server.py"
+                )
+            if not self._computer_use_script:
+                # Fail loud rather than silently no-op'ing the toggle — an
+                # agent told "computer use is on" that can't act is worse than
+                # a visible error. Leave mode OFF so the next turn retries.
+                logger.error(
+                    "Computer use requested live but computer_use_mcp_server.py "
+                    "could not be found — leaving computer use disabled."
+                )
+                return
+            self._timeout = max(self._timeout, _COMPUTER_USE_TIMEOUT)
+
+        logger.info(
+            "Computer use %s live (was %s)",
+            "enabled" if enabled else "disabled",
+            self._computer_use_mode,
+        )
+        self._computer_use_mode = desired_mode
 
     async def generate_quick(
         self,

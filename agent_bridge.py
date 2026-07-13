@@ -4122,6 +4122,29 @@ def run_single_agent(
             return
         backend.set_skip_permissions(bool(desired))
 
+    def _sync_computer_use(behavioral_config: dict[str, Any] | None) -> None:
+        """Apply the server's live computer-use directive to the backend.
+
+        Same model as _sync_skip_permissions: every turn carries
+        ``behavioralConfig.computerUse`` ({enabled, allowedApps}), so flipping
+        the toggle in the agent-detail page takes effect on the next turn with
+        no process restart. Backends without set_computer_use (codex, API) just
+        skip it. Absent directive (cold cache) = no-op.
+        """
+        if not behavioral_config:
+            return
+        cfg = behavioral_config.get("computerUse")
+        if not isinstance(cfg, dict):
+            return
+        enabled = cfg.get("enabled")
+        if enabled is None:
+            return
+        allowed = cfg.get("allowedApps")
+        backend.set_computer_use(
+            bool(enabled),
+            allowed if isinstance(allowed, list) else None,
+        )
+
     @executor.on_task
     async def handle_task(task: GatewayTask) -> dict[str, Any]:
         nonlocal _cached_directives_by_conv, _cached_directives_fallback
@@ -4161,6 +4184,8 @@ def run_single_agent(
         _compaction_config = (behavioral_config or {}).get("compaction")
         # Resolve skip-permissions live from this turn's directive (issue #68).
         _sync_skip_permissions(behavioral_config)
+        # Resolve computer-use live from this turn's directive (same rationale).
+        _sync_computer_use(behavioral_config)
 
         task_meta = task.raw.get("task", {}).get("metadata", {})
 
@@ -4647,6 +4672,8 @@ def run_single_agent(
         _compaction_config = (behavioral_config or {}).get("compaction")
         # Resolve skip-permissions live from this turn's directive (issue #68).
         _sync_skip_permissions(behavioral_config)
+        # Resolve computer-use live from this turn's directive (same rationale).
+        _sync_computer_use(behavioral_config)
         is_orchestrator = directives.get("isOrchestrator", False)
         skip_message = directives.get("skipMessage", False)
         skip_reason = directives.get("skipReason")

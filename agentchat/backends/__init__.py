@@ -142,6 +142,20 @@ class ModelBackend(ABC):
         """
         return None
 
+    def set_computer_use(
+        self, enabled: bool, allowed_apps: "list[str] | None" = None
+    ) -> None:
+        """Update the local computer-use mode for subsequent generations.
+
+        Backend = single source of truth: the bridge calls this each turn with
+        the server-delivered ``behavioralConfig.computerUse`` so toggling the
+        setting in the UI takes effect live, without a process restart. No-op
+        for backends that can't drive the desktop (only the Claude CLI backend
+        wires the local computer_use MCP server today); that backend overrides
+        this to wire/unwire the server on the next spawn.
+        """
+        return None
+
     def outer_timeout(self) -> int:
         """Seconds an executor should wait before force-cancelling a turn.
 
