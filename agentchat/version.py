@@ -10,4 +10,8 @@ Distinct from the ACP message-envelope schema_version ("2.0") — they version
 different things.
 """
 
-BRIDGE_VERSION = "2.1.0"
+# 2.2.0 — task-request sequencing moved server-side (H4 item 4, issue #86):
+# the bridge submits parsed <task_request> blocks to
+# POST /api/gateway/task-requests instead of running the orchestrator
+# scope→create flow and default-assignee policy locally.
+BRIDGE_VERSION = "2.2.0"

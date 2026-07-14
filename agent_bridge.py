@@ -1825,123 +1825,35 @@ async def _handle_compound_task(
 # ---------------------------------------------------------------------------
 
 
-async def _orchestrator_scope_and_create_tasks(
+async def _submit_task_requests(
     executor: "ExecutorClient",
     conversation_id: str,
     task_requests: list[dict[str, Any]],
+    trigger_message_id: str | None = None,
     executor_key: str = "",
-) -> str:
-    """Orchestrator flow: scope tasks with target agents before creating them."""
-    scoped_tasks: list[dict[str, Any]] = []
-    unscoped_tasks: list[dict[str, Any]] = []
+) -> None:
+    """Hand parsed <task_request> blocks to the backend for sequencing.
 
-    for tr in task_requests:
-        assigned = tr.get("assigned_to")
-        if assigned and isinstance(assigned, str):
-            assigned = [assigned]
-        if assigned and len(assigned) > 0:
-            scoped_tasks.append(tr)
-        else:
-            unscoped_tasks.append(tr)
-
-    for tr in unscoped_tasks:
-        try:
-            await executor.create_task(
-                conversation_id,
-                tr["title"],
-                tr.get("description", ""),
-                assigned_to=tr.get("assigned_to"),
-                metadata=_task_metadata(tr),
-            )
-            logger.info("[%s] Created unscoped task: %s", executor_key, tr["title"])
-        except Exception as e:
-            logger.warning("[%s] Failed to create task '%s': %s", executor_key, tr["title"], e)
-
-    if not scoped_tasks:
-        return ""
-
-    scope_request_ids: list[str] = []
-    request_map: dict[str, dict[str, Any]] = {}
-
-    for tr in scoped_tasks:
-        assigned = tr.get("assigned_to")
-        if isinstance(assigned, str):
-            assigned = [assigned]
-        agent_id = assigned[0]
-
-        try:
-            results = await executor.create_scope_requests(
-                [agent_id], conversation_id, tr["title"]
-                + (f"\n{tr['description']}" if tr.get("description") else ""),
-            )
-            if results:
-                sr_id = results[0].get("id")
-                if sr_id:
-                    scope_request_ids.append(sr_id)
-                    request_map[sr_id] = tr
-                    logger.info("[%s] Sent scope request to agent %s", executor_key, agent_id)
-        except Exception as e:
-            logger.warning("[%s] Failed to create scope request: %s", executor_key, e)
-            try:
-                _meta = {"scoped_by_agent": False}
-                if tr.get("response_template"):
-                    _meta["response_template"] = tr["response_template"]
-                await executor.create_task(
-                    conversation_id,
-                    tr["title"],
-                    tr.get("description", ""),
-                    assigned_to=tr.get("assigned_to"),
-                    metadata=_meta,
-                )
-            except Exception:
-                pass
-
-    if not scope_request_ids:
-        return ""
-
+    The backend owns the whole flow — orchestrator scope→create and the
+    default-assignee policy (H4 item 4, issue #86). On failure we log
+    loudly and do NOT improvise a local fallback (dumb-pipe contract).
+    """
     try:
-        responses = await executor.collect_scope_responses(scope_request_ids, timeout=25)
+        await executor.submit_task_requests(
+            conversation_id,
+            task_requests,
+            trigger_message_id=trigger_message_id,
+        )
+        logger.info(
+            "[%s] Submitted %d task request(s) for backend sequencing",
+            executor_key, len(task_requests),
+        )
     except Exception as e:
-        logger.warning("[%s] Scope response collection failed: %s", executor_key, e)
-        responses = {}
-
-    for sr_id in scope_request_ids:
-        tr = request_map.get(sr_id)
-        if not tr:
-            continue
-
-        assigned = tr.get("assigned_to")
-        if isinstance(assigned, str):
-            assigned = [assigned]
-        agent_id = assigned[0] if assigned else None
-
-        agent_response = responses.get(agent_id) if agent_id else None
-
-        if agent_response:
-            title = agent_response.get("title", tr["title"])
-            description = agent_response.get("description", tr.get("description", ""))
-            metadata = {"scoped_by_agent": True}
-        else:
-            title = tr["title"]
-            description = tr.get("description", "")
-            metadata = {"scoped_by_agent": False}
-
-        if tr.get("response_template"):
-            metadata["response_template"] = tr["response_template"]
-
-        try:
-            await executor.create_task(
-                conversation_id,
-                title,
-                description,
-                assigned_to=tr.get("assigned_to"),
-                metadata=metadata,
-            )
-            logger.info("[%s] Created task: %s", executor_key, title)
-        except Exception as e:
-            logger.warning("[%s] Failed to create scoped task '%s': %s", executor_key, title, e)
-
-    return ""
+        logger.error(
+            "[%s] TASK_REQUEST_SUBMIT_FAILED conversation=%s count=%d error=%s — "
+            "backend owns task-request sequencing; no local fallback",
+            executor_key, conversation_id, len(task_requests), e,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -5126,26 +5038,11 @@ def run_single_agent(
                 logger.info("[%s] Sent %d ResultPresentation(s) from tool_use", executor_key, sent)
 
             if _tu_task_requests:
-                if is_orchestrator:
-                    await _orchestrator_scope_and_create_tasks(
-                        executor, msg.conversation_id, _tu_task_requests, executor_key,
-                    )
-                else:
-                    for tr in _tu_task_requests:
-                        try:
-                            task_assigned_to = tr.get("assigned_to")
-                            if not task_assigned_to:
-                                default_assignee = behavioral_config.get("defaultTaskAssignee", "self")
-                                if default_assignee == "self":
-                                    task_assigned_to = [my_participant_id]
-                            await executor.create_task(
-                                msg.conversation_id, tr["title"],
-                                tr.get("description", ""), assigned_to=task_assigned_to,
-                                metadata=_task_metadata(tr),
-                            )
-                            logger.info("[%s] Created task (tool_use): %s", executor_key, tr["title"])
-                        except Exception as e:
-                            logger.warning("[%s] Failed to create task '%s': %s", executor_key, tr["title"], e)
+                await _submit_task_requests(
+                    executor, msg.conversation_id, _tu_task_requests,
+                    trigger_message_id=(msg.message_id or None),
+                    executor_key=executor_key,
+                )
 
             return None  # reply already sent explicitly
 
@@ -5288,14 +5185,10 @@ def run_single_agent(
                         executor_key, len(confirmations),
                     )
 
-        # Detect task requests (parse now to strip tags, but defer creation until after reply is sent)
+        # Detect task requests (parse now to strip tags, but defer submission until after reply is sent)
         _deferred_task_requests: list[dict[str, Any]] = []
-        _deferred_orchestrator_tasks = False
         if task_creation_allowed:
-            reply, task_requests = parse_task_requests(reply or "")
-            if task_requests:
-                _deferred_task_requests = task_requests
-                _deferred_orchestrator_tasks = is_orchestrator
+            reply, _deferred_task_requests = parse_task_requests(reply or "")
         else:
             reply, _ = parse_task_requests(reply or "")
 
@@ -5393,39 +5286,17 @@ def run_single_agent(
             )
             logger.info("[%s] Sent %d ResultPresentation(s)", executor_key, sent)
 
-        # Create deferred tasks (delegation cards appear after the reply)
+        # Submit deferred task requests (delegation cards appear after the reply)
         # This MUST run even when reply is empty — the LLM may have produced
         # only structured output (<task_request> tags with no surrounding text).
+        # msg.message_id defaults to "" (not None) on GatewayMessage; pass None
+        # when empty so a missing trigger is omitted from the payload.
         if _deferred_task_requests:
-            if _deferred_orchestrator_tasks:
-                await _orchestrator_scope_and_create_tasks(
-                    executor, msg.conversation_id, _deferred_task_requests, executor_key,
-                )
-            else:
-                for tr in _deferred_task_requests:
-                    try:
-                        # Default assignee policy comes from server behavioralConfig
-                        task_assigned_to = tr.get("assigned_to")
-                        if not task_assigned_to:
-                            default_assignee = behavioral_config.get("defaultTaskAssignee", "self")
-                            if default_assignee == "self":
-                                task_assigned_to = [my_participant_id]
-                        # msg.message_id defaults to "" (not None) on GatewayMessage.
-                        # Pass None when empty so downstream truthiness checks
-                        # correctly omit a missing trigger.
-                        await executor.create_task(
-                            msg.conversation_id,
-                            tr["title"],
-                            tr.get("description", ""),
-                            assigned_to=task_assigned_to,
-                            metadata=_task_metadata(
-                                tr,
-                                trigger_message_id=(msg.message_id or None),
-                            ),
-                        )
-                        logger.info("[%s] Created task: %s", executor_key, tr["title"])
-                    except Exception as e:
-                        logger.warning("[%s] Failed to create task '%s': %s", executor_key, tr["title"], e)
+            await _submit_task_requests(
+                executor, msg.conversation_id, _deferred_task_requests,
+                trigger_message_id=(msg.message_id or None),
+                executor_key=executor_key,
+            )
 
         return None
 

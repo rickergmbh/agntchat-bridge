@@ -2642,6 +2642,30 @@ class ExecutorClient:
         )
         return result.get("responses", {})
 
+    async def submit_task_requests(
+        self,
+        conversation_id: str,
+        task_requests: list[dict[str, Any]],
+        trigger_message_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Submit parsed <task_request> blocks for backend sequencing.
+
+        The backend owns the whole flow — orchestrator scope->create and
+        the default-assignee policy (H4 item 4, issue #86). The bridge
+        only emits the parsed blocks as data.
+
+        `trigger_message_id` is the message that triggered this turn; the
+        backend stamps it on created tasks so same-trigger peer duplicates
+        can be absorbed.
+        """
+        body: dict[str, Any] = {
+            "conversation_id": conversation_id,
+            "task_requests": task_requests,
+        }
+        if trigger_message_id:
+            body["trigger_message_id"] = trigger_message_id
+        return await self._post("/api/gateway/task-requests", json=body)
+
     async def respond_to_scope_request(
         self,
         scope_request_id: str,
