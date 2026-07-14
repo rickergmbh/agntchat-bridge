@@ -223,6 +223,12 @@ class DetailTemplate:
 # Base result item
 # ---------------------------------------------------------------------------
 
+# Mirror of the canonical list in the backend's
+# Agentchat.ResponseTemplates.Schema.result_types/0 (served in the
+# `resultTypes` catalog of GET /api/response-template-schema). This is
+# client-side convenience validation only — the backend normalizes
+# result_type at insert time regardless, so a stale mirror degrades to a
+# less helpful local error, never a wire incompatibility.
 VALID_RESULT_TYPES = {"hotel", "flight", "restaurant", "event", "product", "generic", "email", "finance", "contact"}
 
 
