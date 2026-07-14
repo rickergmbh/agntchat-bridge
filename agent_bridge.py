@@ -4182,6 +4182,35 @@ def run_single_agent(
         behavioral_config = task_directives.get("behavioralConfig")
         _guardrail_config = (behavioral_config or {}).get("toolLoopGuardrails")
         _compaction_config = (behavioral_config or {}).get("compaction")
+
+        # Server-decided per-turn tool subset (#96): when the payload carries
+        # toolAllowlist (pulse turns), advertise and execute only those tools
+        # for this turn. The server decides the subset; the bridge applies it
+        # dumbly — no task-type logic here.
+        _allowlist = task_directives.get("toolAllowlist")
+        if isinstance(_allowlist, list) and _allowlist:
+            _allowed_names = set(_allowlist)
+            turn_tool_defs = [
+                d for d in _tool_defs
+                if d.get("name", d.get("type")) in _allowed_names
+            ]
+            turn_resolved_tools = [
+                t for t in (resolved_tools or [])
+                if t.get("name") in _allowed_names
+            ]
+            turn_tool_prompt_suffix = (
+                _build_tool_param_details_from_resolved(turn_resolved_tools)
+                if _tool_prompt_suffix else ""
+            )
+            logger.info(
+                "[%s] toolAllowlist active for task %s: %d/%d tool defs advertised",
+                executor_key, task.task_id or task.id,
+                len(turn_tool_defs), len(_tool_defs),
+            )
+        else:
+            turn_tool_defs = _tool_defs
+            turn_resolved_tools = resolved_tools
+            turn_tool_prompt_suffix = _tool_prompt_suffix
         # Resolve skip-permissions live from this turn's directive (issue #68).
         _sync_skip_permissions(behavioral_config)
         # Resolve computer-use live from this turn's directive (same rationale).
@@ -4215,8 +4244,8 @@ def run_single_agent(
         # --- Build system prompt from server directives ---
         task_prompt = _compose_system_prompt(task_directives)
 
-        if _tool_prompt_suffix:
-            task_prompt += _tool_prompt_suffix
+        if turn_tool_prompt_suffix:
+            task_prompt += turn_tool_prompt_suffix
 
         # Append task suffix from behavioral config
         task_suffix = (behavioral_config or {}).get("taskSuffix", "")
@@ -4317,7 +4346,7 @@ def run_single_agent(
 
         presentations: list[dict[str, Any]] = []
 
-        if execution_mode == "tool_use" and _tool_defs:
+        if execution_mode == "tool_use" and turn_tool_defs:
             tool_context = {
                 "conversation_id": task.work_conversation_id or task.conversation_id,
                 "task_id": task.task_id,
@@ -4325,9 +4354,9 @@ def run_single_agent(
                 "source_type": "task",
                 "source_message_id": task_source_message_id,
             }
-            tool_exec = ToolExecutor(executor, context=tool_context, resolved_tools=resolved_tools)
+            tool_exec = ToolExecutor(executor, context=tool_context, resolved_tools=turn_resolved_tools)
             result = await backend.chat_with_tools(
-                task_prompt, chat_messages, _tool_defs, tool_exec,
+                task_prompt, chat_messages, turn_tool_defs, tool_exec,
                 on_progress=_task_stream_cb,
                 guardrail_config=_guardrail_config,
                 compaction_config=_compaction_config,
@@ -4537,7 +4566,7 @@ def run_single_agent(
             if task_tool_calls:
                 task_tool_results = await execute_tool_calls(
                     executor, task_tool_calls, executor_key,
-                    resolved_tools=resolved_tools,
+                    resolved_tools=turn_resolved_tools,
                     context={
                         "conversation_id": task.work_conversation_id or task.conversation_id or "",
                         "task_id": task.task_id or "",
