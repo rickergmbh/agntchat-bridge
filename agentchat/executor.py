@@ -2901,6 +2901,20 @@ class ExecutorClient:
     # Execution Plan / Step Progress
     # ------------------------------------------------------------------
 
+    async def claim_next_step(self, queued_task_id: str) -> dict[str, Any]:
+        """Claim the next runnable execution-plan step for a compound task.
+
+        The backend owns the DAG walk (H4 item 4, issue #86): it picks
+        the next runnable step, marks it in_progress, and returns
+        `{"status": "step", "step": {"id", "title", "prompt"}}` — or
+        `{"status": "done", "summary", "executionPlan", ...}` when
+        nothing is runnable.
+        """
+        return await self._post(
+            f"/api/gateway/tasks/{queued_task_id}/claim-step",
+            json={"executor_id": self._executor_id},
+        )
+
     async def report_step_progress(
         self,
         queued_task_id: str,

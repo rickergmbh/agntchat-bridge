@@ -1602,73 +1602,6 @@ def _generate_task_title(content: str, max_len: int = 80) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Memory flush handler
-# ---------------------------------------------------------------------------
-
-
-async def _handle_memory_flush(
-    task: GatewayTask,
-    executor: ExecutorClient,
-    backend: Any,
-    behavioral_config: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Handle a memory_flush task using server-provided flush prompt."""
-    conv_memory = None
-    conv_id = task.conversation_id
-    if task.conversation_memory and task.conversation_memory.get("memory"):
-        conv_memory = task.conversation_memory["memory"]
-    if not conv_memory and conv_id:
-        try:
-            conv_memory = await executor.get_memory(conv_id)
-        except Exception:
-            pass
-
-    if not conv_memory:
-        return {"summary": "No conversation memory to flush", "memories_saved": 0}
-
-    # Get flush prompt from server config
-    cfg = (behavioral_config or {}).get("memoryFlush", {})
-    flush_prompt = cfg.get("prompt", "Extract key learnings from this conversation memory.")
-
-    # Format memory as simple text
-    memory_text = json.dumps(conv_memory, indent=2, default=str)[:3000]
-
-    try:
-        result = await backend.chat(
-            flush_prompt,
-            [ChatMessage(role="user", content=memory_text)],
-        )
-        response_text = result.text if hasattr(result, "text") else str(result)
-    except Exception as e:
-        logger.debug("Memory flush LLM call failed: %s", e)
-        return {"summary": f"LLM failed: {e}", "memories_saved": 0}
-
-    saved = 0
-    for line in response_text.strip().split("\n"):
-        line = line.strip()
-        if not line or not line.startswith("{"):
-            continue
-        try:
-            entry = json.loads(line)
-            category = entry.get("category", "learning")
-            key = entry.get("key", "")
-            content = entry.get("content", "")
-            if key and content:
-                await executor.save_agent_memory(
-                    category=category,
-                    key=key,
-                    content=content,
-                    confidence=0.7,
-                    source_conversation_id=conv_id,
-                )
-                saved += 1
-        except (json.JSONDecodeError, Exception) as e:
-            logger.debug("Failed to parse/save memory entry: %s", e)
-
-    return {"summary": f"Flushed {saved} memories before compaction", "memories_saved": saved}
-
-
-# ---------------------------------------------------------------------------
 # Compound task execution
 # ---------------------------------------------------------------------------
 
@@ -1686,65 +1619,46 @@ async def _handle_compound_task(
     tool_defs: list[dict[str, Any]] | None,
     resolved_tools: list[dict[str, Any]] | None = None,
     my_display_name: str | None = None,
+    owner_id: str = "",
 ) -> dict[str, Any]:
-    """Execute a compound task with an execution plan (DAG of steps)."""
-    steps = execution_plan.get("steps", [])
-    completed_steps: dict[str, str] = {}
+    """Execute a compound task; the backend owns the DAG walk (H4 item 4).
+
+    The bridge loops on claim-step: the server picks the next runnable
+    step (dependency resolution, in_progress transition, step prompt with
+    dependency results) and the bridge only runs the LLM and reports the
+    outcome. Claim or report failures propagate — the task fails loud
+    rather than falling back to a local DAG walk.
+    """
     all_results: list[dict[str, Any]] = []
+    conv_id = task.work_conversation_id or task.conversation_id
 
-    logger.info("[%s] Compound task: %d steps", executor_key, len(steps))
+    logger.info(
+        "[%s] Compound task: %d steps (server-sequenced)",
+        executor_key, len(execution_plan.get("steps", [])),
+    )
 
-    max_iterations = len(steps) * 2
-    iteration = 0
+    # Runaway protection only — the server ends the loop by returning
+    # "done" once nothing is runnable (each claim moves a step out of
+    # pending, so a step is never handed out twice).
+    for _ in range(200):
+        claim = await executor.claim_next_step(task.id)
 
-    while iteration < max_iterations:
-        iteration += 1
+        if claim.get("status") == "done":
+            return {
+                "summary": claim.get("summary", "Execution plan finished"),
+                "execution_plan": claim.get("executionPlan") or execution_plan,
+                "step_results": all_results,
+            }
 
-        runnable = [
-            s for s in steps
-            if s.get("status", "pending") == "pending"
-            and all(d in completed_steps for d in (s.get("depends_on") or []))
-        ]
-
-        if not runnable:
-            all_done = all(
-                s.get("status") in ("completed", "failed", "skipped")
-                for s in steps
-            )
-            if all_done:
-                break
-            else:
-                logger.warning("[%s] No runnable steps but plan not complete", executor_key)
-                break
-
-        step = runnable[0]
-        step_id = step["id"]
+        step = claim.get("step") or {}
+        step_id = step.get("id")
         step_title = step.get("title", step_id)
+        step_prompt = step.get("prompt", "")
+        if not step_id or not step_prompt:
+            raise RuntimeError(f"claim-step returned malformed step: {claim!r}")
 
         logger.info("[%s] Executing step %s: %s", executor_key, step_id, step_title)
 
-        try:
-            await executor.report_step_progress(task.id, step_id, "in_progress")
-        except Exception:
-            pass
-
-        step_prompt = (
-            f"You are working on step {step_id} of a compound task.\n\n"
-            f"Overall task: {task.title}\n"
-            f"Current step: {step_title}\n"
-        )
-
-        if step.get("description"):
-            step_prompt += f"Step description: {step['description']}\n"
-
-        deps = step.get("depends_on") or []
-        if deps:
-            step_prompt += "\nResults from previous steps:\n"
-            for dep_id in deps:
-                if dep_id in completed_steps:
-                    step_prompt += f"  Step {dep_id}: {completed_steps[dep_id][:500]}\n"
-
-        conv_id = task.work_conversation_id or task.conversation_id
         chat_messages: list[ChatMessage] = []
         if conv_id:
             try:
@@ -1760,9 +1674,13 @@ async def _handle_compound_task(
 
         chat_messages.append(ChatMessage(role="user", content=step_prompt))
 
+        step_result: str | None = None
+        step_error: str | None = None
+        elapsed = 0.0
+
         try:
             if execution_mode == "tool_use" and tool_defs:
-                tool_context = {"conversation_id": conv_id or "", "task_id": task.task_id, "owner_id": agent_owner_id, "source_type": "task"}
+                tool_context = {"conversation_id": conv_id or "", "task_id": task.task_id, "owner_id": owner_id, "source_type": "task"}
                 tool_exec = ToolExecutor(executor, context=tool_context, resolved_tools=resolved_tools)
                 result = await backend.chat_with_tools(
                     system_prompt, chat_messages, tool_defs, tool_exec,
@@ -1771,53 +1689,39 @@ async def _handle_compound_task(
                 result = await backend.chat(system_prompt, chat_messages)
 
             step_result = result.text[:2000]
-            step["status"] = "completed"
-            completed_steps[step_id] = step_result
+            elapsed = result.elapsed_seconds
+        except Exception as e:
+            step_error = str(e)
 
+        # The report is load-bearing now — server state drives the loop —
+        # so failures here propagate instead of being swallowed.
+        if step_result is not None:
             all_results.append({
                 "step_id": step_id,
                 "title": step_title,
                 "status": "completed",
                 "result": step_result,
-                "elapsed_seconds": result.elapsed_seconds,
+                "elapsed_seconds": elapsed,
             })
-
-            try:
-                await executor.report_step_progress(
-                    task.id, step_id, "completed",
-                    result={"summary": step_result[:500]},
-                )
-            except Exception:
-                pass
-
-            logger.info("[%s] Step %s completed (%.1fs)", executor_key, step_id, result.elapsed_seconds)
-
-        except Exception as e:
-            logger.warning("[%s] Step %s failed: %s", executor_key, step_id, e)
-            step["status"] = "failed"
+            await executor.report_step_progress(
+                task.id, step_id, "completed",
+                result={"summary": step_result[:500]},
+            )
+            logger.info("[%s] Step %s completed (%.1fs)", executor_key, step_id, elapsed)
+        else:
+            logger.warning("[%s] Step %s failed: %s", executor_key, step_id, step_error)
             all_results.append({
                 "step_id": step_id,
                 "title": step_title,
                 "status": "failed",
-                "error": str(e),
+                "error": step_error,
             })
+            await executor.report_step_progress(
+                task.id, step_id, "failed",
+                result={"error": (step_error or "")[:500]},
+            )
 
-            try:
-                await executor.report_step_progress(
-                    task.id, step_id, "failed",
-                    result={"error": str(e)[:500]},
-                )
-            except Exception:
-                pass
-
-    total_steps = len(steps)
-    completed_count = sum(1 for s in steps if s.get("status") == "completed")
-
-    return {
-        "summary": f"Completed {completed_count}/{total_steps} steps",
-        "execution_plan": execution_plan,
-        "step_results": all_results,
-    }
+    raise RuntimeError("compound task exceeded 200 step claims — aborting")
 
 
 # ---------------------------------------------------------------------------
@@ -4130,11 +4034,6 @@ def run_single_agent(
 
         task_meta = task.raw.get("task", {}).get("metadata", {})
 
-        # Handle memory_flush tasks
-        if task_meta.get("type") == "memory_flush":
-            logger.info("[%s] Memory flush task for conversation %s", executor_key, task.conversation_id)
-            return await _handle_memory_flush(task, executor, backend, behavioral_config)
-
         logger.info("[%s] === Handling task: %s (id=%s) ===", executor_key, task.title, task.task_id)
 
         # --- Compound task ---
@@ -4148,6 +4047,7 @@ def run_single_agent(
                 execution_mode, _tool_defs,
                 resolved_tools=resolved_tools,
                 my_display_name=agent_name,
+                owner_id=agent_owner_id,
             )
 
         task_title = task.title

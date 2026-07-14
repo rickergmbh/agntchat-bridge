@@ -14,4 +14,8 @@ different things.
 # the bridge submits parsed <task_request> blocks to
 # POST /api/gateway/task-requests instead of running the orchestrator
 # scope→create flow and default-assignee policy locally.
-BRIDGE_VERSION = "2.2.0"
+# 2.3.0 — compound-task DAG walk moved server-side (H4 item 4 flows 2–3):
+# the bridge loops on POST /api/gateway/tasks/:id/claim-step and only
+# runs the per-step LLM; the dead memory_flush handler (no producer,
+# zero tasks ever created) was deleted outright.
+BRIDGE_VERSION = "2.3.0"
