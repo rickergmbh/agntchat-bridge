@@ -134,6 +134,69 @@ class AnthropicBackend(ModelBackend):
             }
         ]
 
+    # Content-block types that accept a cache_control marker. thinking /
+    # redacted_thinking blocks do not — attaching one is an API error.
+    _CACHEABLE_BLOCK_TYPES = {"text", "image", "tool_result", "tool_use", "document"}
+
+    @staticmethod
+    def _cached_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Mark the last tool definition with cache_control.
+
+        With a breakpoint only at the end of the system prompt, the tools
+        array is part of the cached prefix implicitly — but marking it
+        separately means a system-prompt change (5-min directive refresh)
+        still reuses the cached tools segment. Copies the last def so the
+        shared _tool_defs list is never mutated.
+        """
+        if not tools:
+            return tools
+        cached = list(tools)
+        last = dict(cached[-1])
+        last["cache_control"] = {"type": "ephemeral"}
+        cached[-1] = last
+        return cached
+
+    @classmethod
+    def _with_history_cache(cls, api_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Mark the last message's last content block with cache_control.
+
+        This caches the conversation history prefix: the next turn (or the
+        next tool-loop iteration) re-reads everything up to here at the
+        cache-read rate instead of full input price. Without it, history was
+        never cached at all. Skips blocks that don't accept cache_control
+        (thinking) and leaves the input untouched on any unexpected shape.
+        """
+        if not api_messages:
+            return api_messages
+
+        out = list(api_messages)
+        last = dict(out[-1])
+        content = last.get("content")
+
+        if isinstance(content, str):
+            if not content.strip():
+                return api_messages
+            last["content"] = [
+                {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+            ]
+        elif isinstance(content, list) and content:
+            blocks = list(content)
+            last_block = blocks[-1]
+            if (
+                not isinstance(last_block, dict)
+                or last_block.get("type") not in cls._CACHEABLE_BLOCK_TYPES
+            ):
+                return api_messages
+            marked = dict(last_block)
+            marked["cache_control"] = {"type": "ephemeral"}
+            blocks[-1] = marked
+            last["content"] = blocks
+        else:
+            return api_messages
+
+        out[-1] = last
+        return out
+
     @staticmethod
     def _usage_dict(usage: Any) -> dict[str, int]:
         """Extract token usage including prompt-cache fields.
@@ -229,7 +292,9 @@ class AnthropicBackend(ModelBackend):
         SDK supports streaming, the response is streamed so that intermediate
         progress events can be emitted to the live activity feed.
         """
-        api_messages = _coalesce_messages(_translate_attachments(messages))
+        api_messages = self._with_history_cache(
+            _coalesce_messages(_translate_attachments(messages))
+        )
         start = time.monotonic()
 
         # Stream for real-time progress when a callback is provided
@@ -415,6 +480,13 @@ class AnthropicBackend(ModelBackend):
             if self._server_tool_betas
             else None
         )
+
+        # Cache breakpoints: tools (stable per connection) and the current
+        # end of history — the next iteration/turn re-reads the whole prefix
+        # at the cache-read rate. Together with the system-prompt breakpoint
+        # that's 3 of Anthropic's 4 allowed markers.
+        api_messages = self._with_history_cache(api_messages)
+        tools = self._cached_tools(tools)
 
         if not on_progress or not hasattr(self._client.messages, "stream"):
             return await self._client.messages.create(

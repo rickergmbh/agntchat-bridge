@@ -18,4 +18,8 @@ different things.
 # the bridge loops on POST /api/gateway/tasks/:id/claim-step and only
 # runs the per-step LLM; the dead memory_flush handler (no producer,
 # zero tasks ever created) was deleted outright.
-BRIDGE_VERSION = "2.3.0"
+# 2.4.0 — prompt-cache restructure: per-turn-fresh blocks (temporal
+# context, live presence, speaking order) moved out of promptDirectives
+# into directives.volatileContext, which the bridge appends to the USER
+# turn. A 2.3.x bridge on a 2.4 backend would silently lose those blocks.
+BRIDGE_VERSION = "2.4.0"

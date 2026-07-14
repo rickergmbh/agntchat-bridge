@@ -3060,6 +3060,19 @@ def _build_system_prompt_from_directives(
     return "".join(prompt_directives)
 
 
+def _volatile_context_text(directives: dict[str, Any] | None) -> str:
+    """Join the server's per-turn `volatileContext` blocks (temporal context,
+    live agent presence, speaking order).
+
+    These are deliberately delivered OUTSIDE promptDirectives: they change on
+    every turn, and a single changed byte in the system prompt re-bills the
+    whole prompt as an Anthropic cache write. They belong in the USER turn,
+    next to live location (same rationale, bridge 2.4.0).
+    """
+    blocks = (directives or {}).get("volatileContext") or []
+    return "".join(b for b in blocks if isinstance(b, str)).strip()
+
+
 # Cached at first build so we don't re-scan the filesystem and re-log a
 # warning for every task. The desktop bridge restarts when the operator
 # changes addDirs, so caching for the process lifetime is safe.
@@ -4136,10 +4149,15 @@ def run_single_agent(
             for k, v in input_values.items():
                 task_content += f"\n  {k}: {v}"
 
-        # Prepend dynamic per-call context (live location) to the user message
-        # so the system prompt stays cache-stable across calls.
-        if live_loc_ctx:
-            task_content = f"{live_loc_ctx.strip()}\n\n{task_content}"
+        # Prepend dynamic per-call context (server volatileContext + live
+        # location) to the user message so the system prompt stays
+        # cache-stable across calls.
+        task_volatile_ctx = _volatile_context_text(task_directives)
+        task_per_turn_ctx = "\n\n".join(
+            part for part in (task_volatile_ctx, (live_loc_ctx or "").strip()) if part
+        )
+        if task_per_turn_ctx:
+            task_content = f"{task_per_turn_ctx}\n\n{task_content}"
 
         chat_messages.append(ChatMessage(role="user", content=task_content))
 
@@ -4679,17 +4697,23 @@ def run_single_agent(
         if _tool_prompt_suffix:
             msg_prompt += _tool_prompt_suffix
 
-        # Dynamic per-message context (live location + timestamps) goes into the
-        # user turn, NOT the system prompt. Appending to the system prompt would
+        # Dynamic per-message context (server volatileContext — temporal, live
+        # presence, speaking order — plus live location) goes into the user
+        # turn, NOT the system prompt. Appending to the system prompt would
         # bust Anthropic's prompt cache on every call — losing the ~1-2s TTFB
         # win on large prompts. Keeping the system prompt stable lets consecutive
         # messages in the same conversation hit the cache.
-        if live_loc_ctx and chat_messages:
+        volatile_ctx = _volatile_context_text(directives)
+        per_turn_ctx = "\n\n".join(
+            part for part in (volatile_ctx, (live_loc_ctx or "").strip()) if part
+        )
+
+        if per_turn_ctx and chat_messages:
             last = chat_messages[-1]
             if last.role == "user" and isinstance(last.content, str):
                 chat_messages[-1] = ChatMessage(
                     role="user",
-                    content=f"{live_loc_ctx.strip()}\n\n{last.content}",
+                    content=f"{per_turn_ctx}\n\n{last.content}",
                 )
 
         # Get error messages from server config
