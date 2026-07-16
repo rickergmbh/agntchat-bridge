@@ -71,7 +71,7 @@ import time as _time  # noqa: E402
 
 from agentchat.auth import TokenManager  # noqa: E402
 from agentchat.errors import AgentChatError, AuthError, StaleContextError  # noqa: E402
-from agentchat.backends import ChatMessage, create_backend  # noqa: E402
+from agentchat.backends import MODEL_OVERRIDE, ChatMessage, create_backend  # noqa: E402
 from agentchat.executor import (  # noqa: E402
     CURRENT_TASK_ID,
     ExecutorClient,
@@ -4094,6 +4094,20 @@ def run_single_agent(
         _sync_computer_use(behavioral_config)
 
         task_meta = task.raw.get("task", {}).get("metadata", {})
+
+        # Server-stamped per-turn model (PulseExecutionWorker stamps pulse
+        # config's `model` as metadata.model_override). Set for this asyncio
+        # context only — concurrent task handlers each run in their own
+        # create_task context, so the override can't bleed across turns.
+        # Backends read it at request time via _request_model().
+        _model_override = task_meta.get("model_override")
+        if isinstance(_model_override, str) and _model_override:
+            MODEL_OVERRIDE.set(_model_override)
+            logger.info(
+                "[%s] model_override active for task %s: %s (configured: %s)",
+                executor_key, task.task_id or task.id,
+                _model_override, backend.model_name,
+            )
 
         logger.info("[%s] === Handling task: %s (id=%s) ===", executor_key, task.title, task.task_id)
 

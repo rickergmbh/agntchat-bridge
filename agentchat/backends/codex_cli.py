@@ -558,8 +558,9 @@ class CodexCliBackend(ModelBackend):
                 roots_toml = "[" + ", ".join(_toml_quote(d) for d in self._add_dirs) + "]"
                 cmd.extend(["-c", f"sandbox_workspace_write.writable_roots={roots_toml}"])
 
-        if self._model:
-            cmd.extend(["-m", self._model])
+        _model = self._request_model()
+        if _model:
+            cmd.extend(["-m", _model])
 
         # Image attachments (one -i per file). The temp files were created
         # by the caller (via _content_to_cli) and are appended to cleanup.
@@ -883,7 +884,7 @@ class CodexCliBackend(ModelBackend):
 
         return ModelResult(
             text=final_text,
-            model=self._model or "codex-cli",
+            model=self._request_model() or "codex-cli",
             elapsed_seconds=round(elapsed, 1),
             usage=usage,
             metadata={

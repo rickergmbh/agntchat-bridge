@@ -736,11 +736,16 @@ class ClaudeCliBackend(ModelBackend):
             cmd.extend(["--system-prompt-file", write_temp(system_prompt, ".txt", "agentchat_sp_", cleanup_paths)])
         if self._max_tokens:
             cmd.extend(["--settings", json.dumps({"maxOutputTokens": self._max_tokens})])
-        if self._model:
+        _model = self._request_model()
+        if _model:
             # `self._model` is the platform-specific API ID resolved by
             # the backend (`runtime_api_id` from model_config) — already
             # in the right format for the CLI's current runtime.
-            cmd.extend(["--model", self._model])
+            # `_request_model()` swaps in the per-turn MODEL_OVERRIDE when
+            # the server stamped one (pulse config model); an id that
+            # doesn't fit the CLI's runtime fails the turn loudly, same as
+            # a bad model_config would.
+            cmd.extend(["--model", _model])
         if self._skip_permissions:
             cmd.append("--dangerously-skip-permissions")
         if self._effort:
@@ -947,7 +952,7 @@ class ClaudeCliBackend(ModelBackend):
 
         return ModelResult(
             text=text,
-            model=self._model or "claude-cli",
+            model=self._request_model() or "claude-cli",
             elapsed_seconds=round(elapsed, 1),
             metadata={"backend": "claude_cli", "cli_path": self._cli_path},
         )
@@ -1228,7 +1233,7 @@ class ClaudeCliBackend(ModelBackend):
 
         return ModelResult(
             text=clean_text,
-            model=self._model or _result_model or "claude-cli",
+            model=self._request_model() or _result_model or "claude-cli",
             elapsed_seconds=round(elapsed, 1),
             usage=_usage or {},
             metadata={
@@ -1412,7 +1417,7 @@ class ClaudeCliBackend(ModelBackend):
                 cleanup_temp_files(attachment_cleanup)
                 return ModelResult(
                     text=f"[Tool loop aborted: {e}]",
-                    model=self._model or "claude-cli",
+                    model=self._request_model() or "claude-cli",
                     elapsed_seconds=round(elapsed, 1),
                     usage=loop_usage or {},
                     tool_calls=all_tool_calls,
@@ -1545,7 +1550,7 @@ class ClaudeCliBackend(ModelBackend):
                 cleanup_temp_files(attachment_cleanup)
                 return ModelResult(
                     text=remaining_text,
-                    model=self._model or "claude-cli",
+                    model=self._request_model() or "claude-cli",
                     elapsed_seconds=round(elapsed, 1),
                     usage=loop_usage or {},
                     tool_calls=all_tool_calls,
@@ -1559,7 +1564,7 @@ class ClaudeCliBackend(ModelBackend):
         cleanup_temp_files(attachment_cleanup)
         return ModelResult(
             text="[Agent exceeded maximum iterations without completing]",
-            model=self._model or "claude-cli",
+            model=self._request_model() or "claude-cli",
             elapsed_seconds=round(elapsed, 1),
             usage=loop_usage or {},
             tool_calls=all_tool_calls,

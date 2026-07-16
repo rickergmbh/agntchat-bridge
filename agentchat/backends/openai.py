@@ -111,7 +111,7 @@ class OpenAIBackend(ModelBackend):
 
         try:
             response = await self._client.chat.completions.create(
-                model=self._model,
+                model=self._request_model(),
                 max_tokens=self._max_tokens,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -139,7 +139,7 @@ class OpenAIBackend(ModelBackend):
 
         return ModelResult(
             text=text,
-            model=response.model or self._model,
+            model=response.model or self._request_model(),
             elapsed_seconds=round(elapsed, 1),
             usage=usage,
         )
@@ -162,7 +162,7 @@ class OpenAIBackend(ModelBackend):
 
         try:
             response = await self._client.chat.completions.create(
-                model=self._model,
+                model=self._request_model(),
                 max_tokens=self._max_tokens,
                 messages=api_messages,
                 **self._sampling_kwargs(),
@@ -186,7 +186,7 @@ class OpenAIBackend(ModelBackend):
 
         return ModelResult(
             text=text,
-            model=response.model or self._model,
+            model=response.model or self._request_model(),
             elapsed_seconds=round(elapsed, 1),
             usage=usage,
         )
@@ -234,7 +234,7 @@ class OpenAIBackend(ModelBackend):
 
             try:
                 response = await self._client.chat.completions.create(
-                    model=self._model,
+                    model=self._request_model(),
                     max_tokens=self._max_tokens,
                     messages=api_messages,
                     tools=tools,
@@ -265,7 +265,7 @@ class OpenAIBackend(ModelBackend):
 
                 return ModelResult(
                     text=text,
-                    model=response.model or self._model,
+                    model=response.model or self._request_model(),
                     elapsed_seconds=round(elapsed, 1),
                     usage=total_usage,
                     tool_calls=all_tool_calls,
@@ -361,7 +361,7 @@ class OpenAIBackend(ModelBackend):
                 )
                 return ModelResult(
                     text="",
-                    model=self._model,
+                    model=self._request_model(),
                     elapsed_seconds=round(elapsed, 1),
                     usage=total_usage,
                     tool_calls=all_tool_calls,
@@ -377,7 +377,7 @@ class OpenAIBackend(ModelBackend):
                 )
                 try:
                     response = await self._client.chat.completions.create(
-                        model=self._model,
+                        model=self._request_model(),
                         max_tokens=self._max_tokens,
                         messages=api_messages,
                         # No tools = forces text-only response
@@ -399,7 +399,7 @@ class OpenAIBackend(ModelBackend):
                 elapsed = time.monotonic() - start
                 return ModelResult(
                     text=text,
-                    model=response.model or self._model,
+                    model=response.model or self._request_model(),
                     elapsed_seconds=round(elapsed, 1),
                     usage=total_usage,
                     tool_calls=all_tool_calls,
@@ -412,7 +412,7 @@ class OpenAIBackend(ModelBackend):
         logger.warning("Max iterations (%d) reached", max_iterations)
         return ModelResult(
             text="[Agent exceeded maximum iterations without completing]",
-            model=self._model,
+            model=self._request_model(),
             elapsed_seconds=round(elapsed, 1),
             usage=total_usage,
             tool_calls=all_tool_calls,

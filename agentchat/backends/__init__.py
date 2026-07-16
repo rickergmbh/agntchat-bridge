@@ -25,6 +25,7 @@ Usage:
 
 from __future__ import annotations
 
+import contextvars
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -33,6 +34,17 @@ from typing import Any, Awaitable, Callable, Union
 # Optional callback for streaming progress events from the backend.
 # Called with a dict representing each intermediate event (tool calls, etc.).
 ProgressCallback = Callable[[dict[str, Any]], Awaitable[None]]
+
+# Per-turn model override, set by the bridge from the server-stamped task
+# metadata (`model_override`, e.g. a pulse config's cheaper model) for the
+# duration of the task handler. A contextvar (not a backend attribute) so
+# concurrent task runs on the same backend instance can't cross-apply each
+# other's model: asyncio.create_task snapshots the context at creation, the
+# same isolation CURRENT_TASK_ID in executor.py relies on. Backends read it
+# at request time via ModelBackend._request_model().
+MODEL_OVERRIDE: contextvars.ContextVar[Union[str, None]] = contextvars.ContextVar(
+    "agentgram_model_override", default=None
+)
 
 
 # Tools that finalize a task on the backend (visible reply already posted via
@@ -106,6 +118,16 @@ class ModelBackend(ABC):
     @abstractmethod
     def model_name(self) -> str:
         """Return the model identifier string."""
+
+    def _request_model(self) -> Union[str, None]:
+        """Model id to use for the current request.
+
+        The per-turn MODEL_OVERRIDE (server-stamped task metadata, e.g. pulse
+        config `model`) when set in this asyncio context, else the backend's
+        configured model. Backends call this at request-build time — never
+        cache the result across turns.
+        """
+        return MODEL_OVERRIDE.get() or getattr(self, "_model", None)
 
     @abstractmethod
     async def generate(

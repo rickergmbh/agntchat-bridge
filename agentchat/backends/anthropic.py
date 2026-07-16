@@ -303,7 +303,7 @@ class AnthropicBackend(ModelBackend):
 
         try:
             response = await self._client.messages.create(
-                model=self._model,
+                model=self._request_model(),
                 max_tokens=self._max_tokens,
                 system=self._cached_system(system_prompt),
                 messages=[{"role": "user", "content": user_prompt}],
@@ -320,7 +320,7 @@ class AnthropicBackend(ModelBackend):
 
         return ModelResult(
             text=text,
-            model=self._model,
+            model=self._request_model(),
             elapsed_seconds=round(elapsed, 1),
             usage=self._usage_dict(response.usage),
         )
@@ -357,7 +357,7 @@ class AnthropicBackend(ModelBackend):
         # Non-streaming path (original)
         try:
             response = await self._client.messages.create(
-                model=self._model,
+                model=self._request_model(),
                 max_tokens=self._max_tokens,
                 system=self._cached_system(system_prompt),
                 messages=api_messages,
@@ -374,7 +374,7 @@ class AnthropicBackend(ModelBackend):
 
         return ModelResult(
             text=text,
-            model=self._model,
+            model=self._request_model(),
             elapsed_seconds=round(elapsed, 1),
             usage=self._usage_dict(response.usage),
         )
@@ -410,11 +410,11 @@ class AnthropicBackend(ModelBackend):
         last_delta_time = 0.0
         _delta_count = 0
 
-        logger.info("Streaming chat started (model=%s)", self._model)
+        logger.info("Streaming chat started (model=%s)", self._request_model())
 
         message = None
         async with self._client.messages.stream(
-            model=self._model,
+            model=self._request_model(),
             max_tokens=self._max_tokens,
             system=self._cached_system(system_prompt),
             messages=api_messages,
@@ -470,7 +470,7 @@ class AnthropicBackend(ModelBackend):
 
         return ModelResult(
             text=full_text,
-            model=self._model,
+            model=self._request_model(),
             elapsed_seconds=round(elapsed, 1),
             usage=self._usage_dict(message.usage),
         )
@@ -492,7 +492,7 @@ class AnthropicBackend(ModelBackend):
 
         try:
             response = await self._client.messages.create(
-                model=self._model,
+                model=self._request_model(),
                 max_tokens=max_tokens,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_content}],
@@ -535,7 +535,7 @@ class AnthropicBackend(ModelBackend):
 
         if not on_progress or not hasattr(self._client.messages, "stream"):
             return await self._client.messages.create(
-                model=self._model,
+                model=self._request_model(),
                 max_tokens=self._max_tokens,
                 system=self._cached_system(system_prompt),
                 messages=api_messages,
@@ -551,7 +551,7 @@ class AnthropicBackend(ModelBackend):
         detected_sections: set[str] = set()
 
         async with self._client.messages.stream(
-            model=self._model,
+            model=self._request_model(),
             max_tokens=self._max_tokens,
             system=self._cached_system(system_prompt),
             messages=api_messages,
@@ -693,7 +693,7 @@ class AnthropicBackend(ModelBackend):
 
                 return ModelResult(
                     text=text,
-                    model=self._model,
+                    model=self._request_model(),
                     elapsed_seconds=round(elapsed, 1),
                     usage=total_usage,
                     tool_calls=all_tool_calls,
@@ -807,7 +807,7 @@ class AnthropicBackend(ModelBackend):
                 )
                 return ModelResult(
                     text="",
-                    model=self._model,
+                    model=self._request_model(),
                     elapsed_seconds=round(elapsed, 1),
                     usage=total_usage,
                     tool_calls=all_tool_calls,
@@ -839,7 +839,7 @@ class AnthropicBackend(ModelBackend):
                 elapsed = time.monotonic() - start
                 return ModelResult(
                     text=text,
-                    model=self._model,
+                    model=self._request_model(),
                     elapsed_seconds=round(elapsed, 1),
                     usage=total_usage,
                     tool_calls=all_tool_calls,
@@ -852,7 +852,7 @@ class AnthropicBackend(ModelBackend):
         logger.warning("Max iterations (%d) reached", max_iterations)
         return ModelResult(
             text="[Agent exceeded maximum iterations without completing]",
-            model=self._model,
+            model=self._request_model(),
             elapsed_seconds=round(elapsed, 1),
             usage=total_usage,
             tool_calls=all_tool_calls,

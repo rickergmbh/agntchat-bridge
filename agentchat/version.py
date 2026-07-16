@@ -28,4 +28,10 @@ different things.
 # window in _cached_get_messages, and trigger echo deduped when it already
 # rendered as the newest history message. Bridge-internal (no backend
 # payload change), but listed for fleet-roll tracking.
-BRIDGE_VERSION = "2.4.1"
+# 2.5.0 — per-turn model override consumed: the bridge now applies
+# task metadata `model_override` (stamped by PulseExecutionWorker from
+# pulse config `model`) to every LLM call in that task's turn via the
+# MODEL_OVERRIDE contextvar; backends resolve it at request time
+# (_request_model). Older bridges silently ran pulses on the agent's
+# static model.
+BRIDGE_VERSION = "2.5.0"
