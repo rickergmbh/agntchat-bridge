@@ -54,10 +54,23 @@ class ChatMessage:
     - str: plain text message
     - list: multimodal content blocks (for vision/images), e.g.:
       [{"type": "image", "source": {"type": "base64", ...}}, {"type": "text", "text": "..."}]
+
+    cache_boundary marks the end of the *stable* prefix (rendered
+    conversation history): everything after it is per-turn-fresh (volatile
+    context, trigger echo, identity anchor). Backends that support prompt
+    caching pin a cache breakpoint here so consecutive turns re-read the
+    history at the cache-read rate instead of re-writing it. Backends
+    without prompt caching ignore it.
     """
 
     role: str  # "user" or "assistant"
     content: Union[str, list]
+    cache_boundary: bool = False
+    # Platform message id this ChatMessage was rendered from (None for
+    # synthesized messages). Lets callers dedup against rendered history —
+    # e.g. skip echoing the trigger when it already rendered as the newest
+    # history message. Backends ignore it.
+    source_id: Union[str, None] = None
 
 
 @dataclass

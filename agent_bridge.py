@@ -1662,17 +1662,22 @@ async def _handle_compound_task(
         chat_messages: list[ChatMessage] = []
         if conv_id:
             try:
-                raw_messages = await executor.get_messages(conv_id, limit=history_limit)
+                raw_messages = await _cached_get_messages(executor, conv_id, limit=history_limit)
                 vision_token = await executor._token_manager.ensure_fresh()
                 chat_messages = await messages_to_chat_history(
                     raw_messages, my_participant_id,
                     base_url=executor._base_url, token=vision_token,
-                    my_display_name=my_display_name,
                 )
             except Exception:
                 pass
 
-        chat_messages.append(ChatMessage(role="user", content=step_prompt))
+        # Step prompt + identity anchor go after the cache boundary so
+        # consecutive steps re-read the shared history from the prompt cache.
+        _mark_cache_boundary(chat_messages)
+        chat_messages.append(ChatMessage(
+            role="user",
+            content=_per_turn_tail([step_prompt], my_display_name),
+        ))
 
         step_result: str | None = None
         step_error: str | None = None
@@ -1778,12 +1783,26 @@ async def _cached_get_messages(
     executor: Any,
     conversation_id: str,
     limit: int = 20,
+    preloaded: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch messages with caching. Returns raw message dicts.
 
     On first call for a conversation: full fetch, cache result.
     On subsequent calls: fetch only messages after the latest cached one
     and merge. Falls back to full fetch on error or stale cache.
+
+    `preloaded` is the gateway's tier-2 recent-messages payload: when given,
+    it replaces the HTTP fetch entirely (merge source on a warm cache, seed
+    on a cold one).
+
+    Anchored window: the window START stays fixed while new messages append,
+    growing up to 2×limit before rebasing to the newest `limit`. A window
+    that slid on every message changed the rendered-history prefix each
+    turn, so the Anthropic prompt cache never hit across turns and the whole
+    history re-billed as a cache write. Rebases now happen at most once per
+    `limit` messages — and the TTL-expired full fetch also rebases, which is
+    free cache-wise because the 5-minute prompt cache has expired by then
+    anyway.
     """
     import time as _time
 
@@ -1797,18 +1816,22 @@ async def _cached_get_messages(
 
         if latest_ts and cached_msgs:
             try:
-                # Fetch only new messages (after latest cached)
-                new_msgs = await executor.get_messages(
-                    conversation_id, limit=limit,
-                )
+                # Newest messages: gateway payload when present, else fetch
+                if preloaded is not None:
+                    new_msgs = preloaded
+                else:
+                    new_msgs = await executor.get_messages(
+                        conversation_id, limit=limit,
+                    )
                 # Deduplicate by ID
                 cached_ids = {m.get("id") for m in cached_msgs}
                 fresh = [m for m in new_msgs if m.get("id") not in cached_ids]
 
                 if fresh:
                     merged = cached_msgs + fresh
-                    # Keep only the latest `limit` messages
-                    merged = merged[-limit:]
+                    # Rebase only on overflow (anchored window, see above)
+                    if len(merged) > 2 * limit:
+                        merged = merged[-limit:]
                     latest = merged[-1] if merged else None
                     _conv_message_cache[conversation_id] = {
                         "messages": merged,
@@ -1823,8 +1846,12 @@ async def _cached_get_messages(
             except Exception:
                 pass  # Fall through to full fetch
 
-    # Full fetch (cold cache or expired)
-    msgs = await executor.get_messages(conversation_id, limit=limit)
+    # Full fetch (cold cache or expired) — the gateway payload seeds a cold
+    # cache directly, saving the HTTP round-trip like the old tier-2 path did.
+    if preloaded is not None:
+        msgs = preloaded
+    else:
+        msgs = await executor.get_messages(conversation_id, limit=limit)
 
     # Evict oldest if at capacity
     if len(_conv_message_cache) >= _CONV_CACHE_MAX:
@@ -2027,12 +2054,44 @@ def _extract_structured_text(msg: dict[str, Any], sender_label: str) -> str | No
     return None
 
 
+def _identity_anchor_text(name: str) -> str:
+    """Identity-anchor reminder that counters in-context voice drift when
+    an agent sees a long history of other speakers and no assistant turns
+    of its own. Lives in the per-turn tail (after the cache boundary) —
+    its text is static, but appending it to the rendered history shifted
+    its position every turn and busted the history cache prefix."""
+    return (
+        f"[SYSTEM REMINDER: You are {name}. Respond in your own voice. "
+        f"Do not address yourself in third person, and do not speak as any of the "
+        f"other participants whose messages appear above.]"
+    )
+
+
+def _per_turn_tail(parts: list[str], anchor_name: str | None) -> str:
+    """Join the per-turn-fresh segments (volatile context, live location,
+    trigger echo, primary content) plus the identity anchor into the single
+    user message that follows the cache boundary."""
+    segs = [p.strip() for p in parts if p and p.strip()]
+    if anchor_name:
+        segs.append(_identity_anchor_text(anchor_name))
+    return "\n\n".join(segs)
+
+
+def _mark_cache_boundary(chat_messages: list[ChatMessage]) -> None:
+    """Flag the last stable-history message as the prompt-cache boundary.
+
+    Everything appended after this point is per-turn-fresh and must stay
+    out of the cached prefix (see AnthropicBackend._apply_cache_boundary).
+    """
+    if chat_messages:
+        chat_messages[-1].cache_boundary = True
+
+
 async def messages_to_chat_history(
     messages: list[dict[str, Any]],
     my_participant_id: str,
     base_url: str = "",
     token: str = "",
-    my_display_name: str | None = None,
 ) -> list[ChatMessage]:
     """Convert API message dicts to ChatMessage list for the model.
 
@@ -2040,10 +2099,9 @@ async def messages_to_chat_history(
     blocks and PDF attachments become `document` content blocks, both
     pointing at presigned Supabase Storage URLs.
 
-    When `my_display_name` is provided, appends a final identity-anchor
-    user turn that reminds the model whose voice it must speak in. This
-    counters in-context drift when a fresh joiner sees a long history of
-    other speakers and no assistant turns of its own.
+    Returns ONLY the rendered history — byte-stable per message. Per-turn
+    content (volatile context, identity anchor, trigger echo) goes in the
+    caller's tail message via `_per_turn_tail`, after `_mark_cache_boundary`.
     """
     history: list[ChatMessage] = []
     for msg in messages:
@@ -2112,7 +2170,7 @@ async def messages_to_chat_history(
                 "summary_status": (info or {}).get("summaryStatus"),
                 "extraction_status": (info or {}).get("extractionStatus"),
             }
-            history.append(ChatMessage(role=role, content=[attachment_block]))
+            history.append(ChatMessage(role=role, content=[attachment_block], source_id=msg.get("id")))
             continue
 
         # Structured messages (ResultPresentation, StatusUpdate, TaskComplete, etc.)
@@ -2120,7 +2178,7 @@ async def messages_to_chat_history(
         if content_type in ("structured", "status_update"):
             text = _extract_structured_text(msg, sender_label)
             if text:
-                history.append(ChatMessage(role=role, content=f"{ts_prefix}{text}"))
+                history.append(ChatMessage(role=role, content=f"{ts_prefix}{text}", source_id=msg.get("id")))
             continue
 
         # Regular text message
@@ -2133,17 +2191,7 @@ async def messages_to_chat_history(
             content = f"{ts_prefix}{content}"
             if _contains_stale_tool_error(content):
                 content += "\n\n[SYSTEM: The tool errors above are STALE — the platform has been updated. These tools now work. You MUST retry them.]"
-        history.append(ChatMessage(role=role, content=content))
-
-    if my_display_name:
-        history.append(ChatMessage(
-            role="user",
-            content=(
-                f"[SYSTEM REMINDER: You are {my_display_name}. Respond in your own voice. "
-                f"Do not address yourself in third person, and do not speak as any of the "
-                f"other participants whose messages appear above.]"
-            ),
-        ))
+        history.append(ChatMessage(role=role, content=content, source_id=msg.get("id")))
 
     return history
 
@@ -4130,12 +4178,13 @@ def run_single_agent(
         chat_messages: list[ChatMessage] = []
         if context_conv_id:
             try:
-                raw_messages = await executor.get_messages(context_conv_id, limit=history_limit)
+                raw_messages = await _cached_get_messages(
+                    executor, context_conv_id, limit=history_limit,
+                )
                 vision_token = await executor._token_manager.ensure_fresh()
                 chat_messages = await messages_to_chat_history(
                     raw_messages, my_participant_id,
                     base_url=executor._base_url, token=vision_token,
-                    my_display_name=agent_name,
                 )
             except Exception:
                 logger.warning("[%s] Failed to fetch conversation history for task", executor_key)
@@ -4149,17 +4198,18 @@ def run_single_agent(
             for k, v in input_values.items():
                 task_content += f"\n  {k}: {v}"
 
-        # Prepend dynamic per-call context (server volatileContext + live
-        # location) to the user message so the system prompt stays
-        # cache-stable across calls.
+        # Per-turn tail after the cache boundary: volatile context + live
+        # location + task body + identity anchor. Keeps both the system
+        # prompt AND the rendered-history prefix cache-stable across calls.
+        _mark_cache_boundary(chat_messages)
         task_volatile_ctx = _volatile_context_text(task_directives)
-        task_per_turn_ctx = "\n\n".join(
-            part for part in (task_volatile_ctx, (live_loc_ctx or "").strip()) if part
-        )
-        if task_per_turn_ctx:
-            task_content = f"{task_per_turn_ctx}\n\n{task_content}"
-
-        chat_messages.append(ChatMessage(role="user", content=task_content))
+        chat_messages.append(ChatMessage(
+            role="user",
+            content=_per_turn_tail(
+                [task_volatile_ctx, (live_loc_ctx or ""), task_content],
+                agent_name,
+            ),
+        ))
 
         await _task_stream_cb({"type": "stage", "stage": "calling_model", "force": True})
 
@@ -4650,19 +4700,19 @@ def run_single_agent(
             ))
 
         # --- Fetch conversation history + location in parallel ---
-        # Use pre-loaded messages from gateway response (tier 2) when available,
-        # eliminating a full HTTP round-trip (~300-1000ms saved).
+        # Pre-loaded messages from the gateway response (tier 2) feed the
+        # conversation cache instead of an HTTP round-trip (~300-1000ms saved)
+        # while keeping the anchored history window byte-stable across turns.
         async def _fetch_history():
             try:
-                if msg.recent_messages:
-                    raw = msg.recent_messages
-                else:
-                    raw = await _cached_get_messages(executor, msg.conversation_id, limit=history_limit)
+                raw = await _cached_get_messages(
+                    executor, msg.conversation_id, limit=history_limit,
+                    preloaded=msg.recent_messages or None,
+                )
                 vt = await executor._token_manager.ensure_fresh()
                 return await messages_to_chat_history(
                     raw, my_participant_id,
                     base_url=executor._base_url, token=vt,
-                    my_display_name=agent_name,
                 )
             except Exception:
                 logger.warning("[%s] Failed to fetch conversation history", executor_key)
@@ -4674,14 +4724,24 @@ def run_single_agent(
         chat_messages = await history_task
         live_loc_ctx, msg_owner_lat, msg_owner_lng = await location_task
 
+        # Echo the trigger in the per-turn tail only when it isn't already the
+        # newest RENDERED history message — it almost always is, and
+        # re-appending it duplicated the trigger text in every prompt. The
+        # source_id check also covers triggers that raw history contains but
+        # rendering filtered out. In a burst (newer messages landed after the
+        # trigger) the echo keeps it salient.
         trigger_body = msg.readable_text or msg.content
-        if not chat_messages or chat_messages[-1].content != trigger_body:
+        trigger_is_latest = bool(
+            chat_messages
+            and msg.message_id
+            and chat_messages[-1].source_id == msg.message_id
+        )
+        trigger_echo = ""
+        if not trigger_is_latest:
             sender_label = _format_speaker_label(
                 msg.sender_name or "Someone", msg.sender_type
             )
-            chat_messages.append(
-                ChatMessage(role="user", content=f"{sender_label}: {trigger_body}")
-            )
+            trigger_echo = f"{sender_label}: {trigger_body}"
 
         # --- Agent decides task vs reply inline ---
         # The agent LLM sees the message and decides whether to create a
@@ -4697,24 +4757,21 @@ def run_single_agent(
         if _tool_prompt_suffix:
             msg_prompt += _tool_prompt_suffix
 
-        # Dynamic per-message context (server volatileContext — temporal, live
-        # presence, speaking order — plus live location) goes into the user
-        # turn, NOT the system prompt. Appending to the system prompt would
-        # bust Anthropic's prompt cache on every call — losing the ~1-2s TTFB
-        # win on large prompts. Keeping the system prompt stable lets consecutive
-        # messages in the same conversation hit the cache.
+        # Everything per-turn-fresh (server volatileContext — temporal, live
+        # presence, speaking order — live location, trigger echo, identity
+        # anchor) goes in ONE tail user message AFTER the cache boundary.
+        # In the system prompt it would bust the prompt cache on every call;
+        # baked into the last history message (the old shape) it busted the
+        # HISTORY prefix across turns instead — same tokens, re-billed as
+        # cache writes each turn.
+        _mark_cache_boundary(chat_messages)
         volatile_ctx = _volatile_context_text(directives)
-        per_turn_ctx = "\n\n".join(
-            part for part in (volatile_ctx, (live_loc_ctx or "").strip()) if part
+        tail = _per_turn_tail(
+            [volatile_ctx, (live_loc_ctx or ""), trigger_echo],
+            agent_name,
         )
-
-        if per_turn_ctx and chat_messages:
-            last = chat_messages[-1]
-            if last.role == "user" and isinstance(last.content, str):
-                chat_messages[-1] = ChatMessage(
-                    role="user",
-                    content=f"{per_turn_ctx}\n\n{last.content}",
-                )
+        if tail:
+            chat_messages.append(ChatMessage(role="user", content=tail))
 
         # Get error messages from server config
         error_msgs = (behavioral_config or {}).get("errorMessages", {})

@@ -157,6 +157,49 @@ class AnthropicBackend(ModelBackend):
         return cached
 
     @classmethod
+    def _apply_cache_boundary(cls, api_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Pin a cache breakpoint at the bridge-flagged stable-history boundary.
+
+        The bridge marks the last message of the *stable* rendered history
+        (`ChatMessage.cache_boundary`); everything after it is per-turn-fresh
+        (volatile context, trigger echo, identity anchor). Marking the
+        boundary — instead of only the request's last message — lets the NEXT
+        turn's re-rendered history match this turn's cached prefix, so
+        history is re-read at 0.1× instead of re-written at 1.25× every turn.
+
+        Consumes the transient ``_cache_boundary`` keys _coalesce_messages
+        threads through (they must never reach the API). Only the last
+        flagged message gets the marker, and never the final message — that
+        breakpoint belongs to _with_history_cache. Together with the tools +
+        system markers this uses exactly Anthropic's 4-breakpoint budget.
+        """
+        boundary_idx = None
+        for i, msg in enumerate(api_messages):
+            if msg.pop("_cache_boundary", None):
+                boundary_idx = i
+
+        if boundary_idx is None or boundary_idx == len(api_messages) - 1:
+            return api_messages
+
+        msg = api_messages[boundary_idx]
+        content = msg.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                msg["content"] = [
+                    {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+                ]
+        elif isinstance(content, list) and content:
+            last_block = content[-1]
+            if (
+                isinstance(last_block, dict)
+                and last_block.get("type") in cls._CACHEABLE_BLOCK_TYPES
+            ):
+                marked = dict(last_block)
+                marked["cache_control"] = {"type": "ephemeral"}
+                msg["content"] = content[:-1] + [marked]
+        return api_messages
+
+    @classmethod
     def _with_history_cache(cls, api_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Mark the last message's last content block with cache_control.
 
@@ -293,7 +336,9 @@ class AnthropicBackend(ModelBackend):
         progress events can be emitted to the live activity feed.
         """
         api_messages = self._with_history_cache(
-            _coalesce_messages(_translate_attachments(messages))
+            self._apply_cache_boundary(
+                _coalesce_messages(_translate_attachments(messages))
+            )
         )
         start = time.monotonic()
 
@@ -587,7 +632,9 @@ class AnthropicBackend(ModelBackend):
         compactor = ContextCompactor(
             compaction_config, self._context_window, self._max_tokens,
         )
-        api_messages = _coalesce_messages(_translate_attachments(messages))
+        api_messages = self._apply_cache_boundary(
+            _coalesce_messages(_translate_attachments(messages))
+        )
         all_tool_calls: list[ToolCall] = []
         total_usage = {
             "input_tokens": 0, "output_tokens": 0,
@@ -908,7 +955,10 @@ def _translate_attachments(messages: list[ChatMessage]) -> list[ChatMessage]:
             else:
                 new_blocks.append(block)
 
-        out.append(ChatMessage(role=msg.role, content=new_blocks))
+        out.append(ChatMessage(
+            role=msg.role, content=new_blocks,
+            cache_boundary=getattr(msg, "cache_boundary", False),
+        ))
 
     return out
 
@@ -948,6 +998,14 @@ def _coalesce_messages(messages: list[ChatMessage]) -> list[dict]:
     Handles both plain text messages (str content) and multimodal messages
     (list content with image/text blocks). Multimodal messages are never
     merged with adjacent messages to preserve image block integrity.
+
+    A message flagged `cache_boundary` (end of the stable history prefix)
+    threads through as a transient `_cache_boundary` dict key for
+    _apply_cache_boundary to consume. Nothing merges INTO a boundary
+    message — the per-turn-fresh content that follows must stay in its own
+    message, or it would land inside the cached prefix and bust it every
+    turn. (The API accepts consecutive same-role messages; multimodal
+    messages already rely on that.)
     """
     if not messages:
         return [{"role": "user", "content": "Hello"}]
@@ -955,15 +1013,24 @@ def _coalesce_messages(messages: list[ChatMessage]) -> list[dict]:
     result: list[dict] = []
     for msg in messages:
         is_multimodal = isinstance(msg.content, list)
+        boundary = getattr(msg, "cache_boundary", False)
 
         if is_multimodal:
             # Multimodal messages are never merged — keep as standalone
             result.append({"role": msg.role, "content": msg.content})
-        elif result and result[-1]["role"] == msg.role and isinstance(result[-1]["content"], str):
+        elif (
+            result
+            and result[-1]["role"] == msg.role
+            and isinstance(result[-1]["content"], str)
+            and not result[-1].get("_cache_boundary")
+        ):
             # Merge consecutive same-role text messages
             result[-1]["content"] += f"\n\n{msg.content}"
         else:
             result.append({"role": msg.role, "content": msg.content})
+
+        if boundary:
+            result[-1]["_cache_boundary"] = True
 
     # Anthropic requires the first message to be "user"
     if result and result[0]["role"] != "user":

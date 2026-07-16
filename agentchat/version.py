@@ -22,4 +22,10 @@ different things.
 # context, live presence, speaking order) moved out of promptDirectives
 # into directives.volatileContext, which the bridge appends to the USER
 # turn. A 2.3.x bridge on a 2.4 backend would silently lose those blocks.
-BRIDGE_VERSION = "2.4.0"
+# 2.4.1 — cross-turn history cache continuity: cache breakpoint pinned at
+# the stable-history boundary (per-turn tail — volatile context, trigger
+# echo, identity anchor — moved after it), anchored non-sliding history
+# window in _cached_get_messages, and trigger echo deduped when it already
+# rendered as the newest history message. Bridge-internal (no backend
+# payload change), but listed for fleet-roll tracking.
+BRIDGE_VERSION = "2.4.1"
