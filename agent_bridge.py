@@ -1012,21 +1012,37 @@ def _summarize_action_tool_calls(results: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+# Default cap on a tool result fed back to the model for follow-up — keeps
+# chatty list/search results from bloating the prompt. Read tools whose whole
+# point is returning a document (a file's contents) get a much larger budget:
+# clipping `get_file_content` to 3 KB meant an agent literally could not see a
+# 35 KB file it was asked to edit. The larger cap still bounds a pathological
+# multi-hundred-KB blob.
+TOOL_RESULT_MAX = 3000
+LARGE_READ_TOOLS = {"get_file_content"}
+LARGE_READ_RESULT_MAX = 60000
+
+
+def _tool_result_cap(name: str) -> int:
+    return LARGE_READ_RESULT_MAX if name in LARGE_READ_TOOLS else TOOL_RESULT_MAX
+
+
 def _format_tool_results_for_followup(results: list[dict[str, Any]]) -> str:
     """Format tool execution results for LLM follow-up summarization."""
     parts = []
     for tr in results:
         name = tr.get("name", "unknown")
+        cap = _tool_result_cap(name)
         if "error" in tr:
             parts.append(f"Tool `{name}` error: {tr['error']}")
         elif "result" in tr:
             r = tr["result"]
             if isinstance(r, str):
-                parts.append(f"Tool `{name}` result:\n{r[:3000]}")
+                parts.append(f"Tool `{name}` result:\n{r[:cap]}")
             else:
                 parts.append(
                     f"Tool `{name}` result:\n```json\n"
-                    f"{json.dumps(r, indent=2, default=str)[:3000]}\n```"
+                    f"{json.dumps(r, indent=2, default=str)[:cap]}\n```"
                 )
         else:
             parts.append(f"Tool `{name}` completed (no result data)")
