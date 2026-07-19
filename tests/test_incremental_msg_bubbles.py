@@ -57,6 +57,66 @@ class TestSplitReplyIntoBubbles:
     def test_blank_bubbles_skipped(self):
         assert _split_reply_into_bubbles("<msg></msg><msg>real</msg>") == ["real"]
 
+    def test_preamble_duplicating_first_bubble_dropped(self):
+        # Conv 0ce1f4b8 (bubbles 8260352d/6beff68a): the model answered in
+        # plain prose, then restated the same answer as its first <msg>. The
+        # restatement is a paraphrase, not a byte-copy — the guard must catch
+        # it on token overlap and deliver the tagged version only.
+        out = _split_reply_into_bubbles(
+            "Yes — ADIO has a full docs set at `docs/`, well-structured and "
+            "current. Nine reference docs plus a README hub.\n"
+            "<msg>Yes, solid docs. ADIO has a full `docs/` folder — 9 "
+            "reference docs plus a hub README with role-based reading "
+            "paths.</msg>"
+            "<msg>Put the details in a thread — open it for the full "
+            "writeup.</msg>"
+        )
+        assert len(out) == 2
+        assert out[0].startswith("Yes, solid docs.")
+
+    def test_second_observed_duplicate_shape_dropped(self):
+        # Same conversation, 20:09 burst — the other real-world instance.
+        out = _split_reply_into_bubbles(
+            "Ticket Creator is on it — filing the provisioning issue in "
+            "rickergmbh/ADIO now.\n"
+            "<msg>Dispatched to Ticket Creator — provisioning issue for the "
+            "agent-control-plane credentials is being filed in "
+            "rickergmbh/ADIO now.</msg>"
+            "<msg>I'll relay the issue number the moment it's filed.</msg>"
+        )
+        assert len(out) == 2
+        assert out[0].startswith("Dispatched")
+
+    def test_distinct_preamble_kept(self):
+        # A headline the burst does NOT restate stays (the 20:12 burst shape).
+        out = _split_reply_into_bubbles(
+            "#92 is filed — that's the last go-live blocker.\n"
+            "<msg>Ticket Creator caught two things I had wrong in the brief, "
+            "verified against deployed code.</msg>"
+        )
+        assert out[0].startswith("#92 is filed")
+        assert len(out) == 2
+
+    def test_short_intro_line_kept(self):
+        # Under 5 content tokens never qualifies — a legit short intro
+        # ("Quick update:") must not be eaten even if its words all appear
+        # in the first bubble.
+        out = _split_reply_into_bubbles(
+            "Quick update:\n<msg>Quick update on the deploy — it went out "
+            "clean, no errors in the logs.</msg>"
+        )
+        assert out[0] == "Quick update:"
+
+    def test_mid_reply_gap_not_deduped(self):
+        # Only the LEADING preamble is guarded; prose between tags is kept
+        # even when wordy, in source order.
+        out = _split_reply_into_bubbles(
+            "<msg>The deploy went out clean tonight, zero errors.</msg>"
+            "The deploy went out clean tonight, zero errors overall."
+            "<msg>Next up is the migration.</msg>"
+        )
+        assert len(out) == 3
+
 
 class TestReplyMentionsAgent:
     members = [

@@ -1241,13 +1241,38 @@ _DM_ATTR_RE = re.compile(r'(\w+)\s*=\s*(?:"(?P<dq>[^"]*)"|\'(?P<sq>[^\']*)\')')
 _MSG_BLOCK_RE = re.compile(r"<msg>(.*?)</msg>", re.DOTALL | re.IGNORECASE)
 
 
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _preamble_duplicates_first_bubble(preamble: str, first_bubble: str) -> bool:
+    """True when an untagged preamble is a near-duplicate of the first <msg>.
+
+    The model under the human-like directive sometimes writes its headline
+    answer as plain prose, then switches into <msg> format and RESTATES it —
+    the user then sees the same answer twice, paraphrased (conv 0ce1f4b8,
+    bubbles 8260352d/6beff68a). The restatement is a paraphrase, never
+    byte-identical, so compare normalized token overlap against the smaller
+    of the two sets. Only substantial preambles qualify — a short legit
+    intro line ("Quick update:") must not be eaten.
+    """
+    pre_tokens = set(_WORD_RE.findall(preamble.lower()))
+    msg_tokens = set(_WORD_RE.findall(first_bubble.lower()))
+    if len(pre_tokens) < 5 or not msg_tokens:
+        return False
+    overlap = len(pre_tokens & msg_tokens) / min(len(pre_tokens), len(msg_tokens))
+    return overlap >= 0.55
+
+
 def _split_reply_into_bubbles(reply: str) -> list[str]:
     """Split a completed reply into ordered chat bubbles.
 
     Prefers explicit ``<msg>…</msg>`` markers the model emits under the
     human-like directive. Any prose outside the tags (before/between/after) is
-    kept as its own bubble in source order so nothing is dropped. When there
-    are no ``<msg>`` tags, the whole reply is a single bubble (normal reply).
+    kept as its own bubble in source order so nothing is dropped — EXCEPT an
+    untagged preamble that near-duplicates the first tagged bubble (the model
+    answered in prose, then restated it in <msg> form; delivering both reads
+    as the agent repeating itself). When there are no ``<msg>`` tags, the
+    whole reply is a single bubble (normal reply).
     """
     if not reply or not reply.strip():
         return []
@@ -1256,11 +1281,14 @@ def _split_reply_into_bubbles(reply: str) -> list[str]:
         return [reply.strip()]
 
     bubbles: list[str] = []
+    first_gap_index: int | None = None
     cursor = 0
     for match in _MSG_BLOCK_RE.finditer(reply):
         gap = reply[cursor:match.start()]
         gap_clean = re.sub(r"</?msg>", "", gap, flags=re.IGNORECASE).strip()
         if gap_clean:
+            if cursor == 0:
+                first_gap_index = len(bubbles)
             bubbles.append(gap_clean)
         inner = (match.group(1) or "").strip()
         if inner:
@@ -1270,6 +1298,19 @@ def _split_reply_into_bubbles(reply: str) -> list[str]:
     tail = re.sub(r"</?msg>", "", reply[cursor:], flags=re.IGNORECASE).strip()
     if tail:
         bubbles.append(tail)
+
+    if (
+        first_gap_index is not None
+        and len(bubbles) > first_gap_index + 1
+        and _preamble_duplicates_first_bubble(
+            bubbles[first_gap_index], bubbles[first_gap_index + 1]
+        )
+    ):
+        logger.info(
+            "[humanlike] dropped untagged preamble duplicating first bubble (%d chars)",
+            len(bubbles[first_gap_index]),
+        )
+        del bubbles[first_gap_index]
 
     return bubbles
 
