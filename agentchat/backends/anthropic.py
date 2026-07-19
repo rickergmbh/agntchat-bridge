@@ -648,11 +648,16 @@ class AnthropicBackend(ModelBackend):
 
             # Preflight: compact context if it's approaching the window. Done
             # before the API call so the request itself stays under budget.
+            # Below the hard trigger, the cheaper TTL-gated soft-trim runs
+            # instead — only when the prompt cache is already cold, so a warm
+            # prefix is never invalidated for a nice-to-have trim.
             if compactor.should_compact(api_messages):
                 api_messages = await compactor.compact(
                     api_messages,
                     lambda sys_p, user_c: self._summarize(sys_p, user_c, compactor),
                 )
+            elif compactor.should_early_prune(api_messages):
+                api_messages = compactor.early_prune(api_messages)
 
             # Report thinking progress at the start of each iteration
             if on_progress:
@@ -665,6 +670,7 @@ class AnthropicBackend(ModelBackend):
                 response = await self._tool_iteration(
                     system_prompt, api_messages, tools, on_progress,
                 )
+                compactor.note_request()
             except self._anthropic.APITimeoutError:
                 elapsed = time.monotonic() - start
                 raise TimeoutError(

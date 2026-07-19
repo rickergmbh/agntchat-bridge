@@ -144,3 +144,82 @@ async def test_compact_falls_back_to_prune_when_summary_unavailable():
         if isinstance(b, dict) and b.get("type") == "tool_result" and "digested" in str(b.get("content"))
     ]
     assert digested
+
+
+# ---- early tier (TTL-gated soft-trim) -------------------------------------
+
+
+def _early_compactor(**overrides):
+    cfg = {
+        "enabled": True,
+        "earlyPruneRatio": 0.01,
+        "cacheTtlSeconds": 0.05,
+        "softTrimOver": 1_000,
+        "softTrimHeadChars": 100,
+        "softTrimTailChars": 50,
+        "minTailMessages": 1,
+        "tailTokenBudget": 10,
+    }
+    cfg.update(overrides)
+    return ContextCompactor(cfg, context_window=200_000, max_output_tokens=4_096)
+
+
+def _bulky_history():
+    return [
+        _user("do the thing"),
+        _assistant_tool_use("read", "t1"),
+        _tool_result("t1", "A" * 5_000 + "TAIL-A"),
+        _assistant_tool_use("read", "t2"),
+        _tool_result("t2", "B" * 5_000),
+    ]
+
+
+def test_early_prune_gated_on_cold_cache():
+    import time as _time
+
+    c = _early_compactor()
+    msgs = _bulky_history()
+
+    # No request recorded yet → warm-or-unknown → never prune.
+    assert c.should_early_prune(msgs) is False
+
+    c.note_request()
+    # Immediately after a request the cache is warm → still no prune.
+    assert c.should_early_prune(msgs) is False
+
+    _time.sleep(0.06)
+    # TTL elapsed → cold → prune fires.
+    assert c.should_early_prune(msgs) is True
+
+
+def test_early_prune_soft_trims_old_results_keeping_head_and_tail():
+    c = _early_compactor()
+    msgs = _bulky_history()
+
+    out = c.early_prune(msgs)
+
+    trimmed = out[2]["content"][0]["content"]
+    assert trimmed.startswith("A" * 100)
+    assert "chars trimmed" in trimmed
+    assert trimmed.endswith("TAIL-A")
+    assert len(trimmed) < 1_000
+
+
+def test_early_prune_protects_the_tail():
+    c = _early_compactor(tailTokenBudget=50_000, minTailMessages=4)
+    msgs = _bulky_history()
+
+    out = c.early_prune(msgs)
+
+    # With a huge tail budget everything is protected — nothing trimmed.
+    assert out[2]["content"][0]["content"] == msgs[2]["content"][0]["content"]
+    assert out[4]["content"][0]["content"] == msgs[4]["content"][0]["content"]
+
+
+def test_early_prune_never_fires_when_disabled():
+    c = _early_compactor(enabled=False)
+    c.note_request()
+    import time as _time
+
+    _time.sleep(0.06)
+    assert c.should_early_prune(_bulky_history()) is False

@@ -13,6 +13,17 @@ Three passes (Hermes-style):
   3. summarize — fold the middle into one summary message (iteratively updated
      across repeated compactions)
 
+There is also an EARLY tier below the full-compaction trigger: a TTL-gated
+soft-trim of old tool_result payloads (keep a head/tail excerpt, elide the
+middle). Any byte changed in the message list invalidates the provider's
+cached prefix from that point on, so the early tier only fires when the
+prompt cache has already gone cold — i.e. the gap since the previous API
+call in this loop exceeds ``cacheTtlSeconds`` (a tool that ran longer than
+the TTL: computer use, long execs). While the cache is warm, trimming would
+cost a full prefix re-read to save a few KB — never worth it. The full
+compactor at ``triggerRatio`` stays unconditional: at that point the
+context window itself is at risk, which beats any cache economics.
+
 The summary TEMPLATE and anti-re-answer PREFIX come from the server config; the
 bridge only decides *mechanics* (what fits the token budget), never *wording*.
 """
@@ -20,6 +31,7 @@ bridge only decides *mechanics* (what fits the token budget), never *wording*.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger("agentchat.context.compactor")
@@ -35,6 +47,14 @@ _DEFAULTS: dict[str, Any] = {
     "tailTokenBudget": 20_000,
     "minTailMessages": 4,
     "maxSummaryTokens": 2_000,
+    # Early tier (TTL-gated soft-trim). earlyPruneRatio is a fraction of the
+    # input budget, below triggerRatio; cacheTtlSeconds matches Anthropic's
+    # default 5m cache TTL (server config overrides for 1h-TTL models).
+    "earlyPruneRatio": 0.3,
+    "cacheTtlSeconds": 300,
+    "softTrimOver": 4_000,
+    "softTrimHeadChars": 1_200,
+    "softTrimTailChars": 300,
     "summaryPrefix": "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted below; respond only to messages after this summary.",
     "summaryPrompt": "Summarize the conversation so far as a structured checkpoint.",
     "summaryUpdatePrompt": "Update the existing summary with the new turns, preserving still-relevant detail.",
@@ -100,13 +120,82 @@ class ContextCompactor:
         # Reserve output space; the input budget is what's left.
         self._input_budget = max(1, context_window - max(0, max_output_tokens))
         self._trigger_tokens = int(self._input_budget * float(cfg.get("triggerRatio", 0.5)))
+        self._early_tokens = int(self._input_budget * float(cfg.get("earlyPruneRatio", 0.3)))
         # The running summary, carried across repeated compactions this turn.
         self._previous_summary: str | None = None
+        # Monotonic timestamp of the loop's most recent API call — the
+        # TTL gate for the early tier. None until the first call completes.
+        self._last_request_at: float | None = None
 
     def should_compact(self, messages: list[dict[str, Any]]) -> bool:
         if not self._enabled:
             return False
         return estimate_tokens(messages) >= self._trigger_tokens
+
+    # ---- early tier (TTL-gated soft-trim) --------------------------------
+
+    def note_request(self) -> None:
+        """Record that an API call just went out (resets the TTL clock)."""
+        self._last_request_at = time.monotonic()
+
+    def _cache_cold(self) -> bool:
+        if self._last_request_at is None:
+            # First iteration: the previous turn's prefix may still be warm
+            # and we can't tell — don't risk busting it.
+            return False
+        ttl = float(self._cfg.get("cacheTtlSeconds", 300))
+        return (time.monotonic() - self._last_request_at) >= ttl
+
+    def should_early_prune(self, messages: list[dict[str, Any]]) -> bool:
+        """True when the context has real bulk AND the cache is already cold,
+        so trimming is free (the next call re-reads the prefix either way)."""
+        if not self._enabled or not self._cache_cold():
+            return False
+        return estimate_tokens(messages) >= self._early_tokens
+
+    def early_prune(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Soft-trim bulky tool_result payloads outside the protected tail:
+        keep a head/tail excerpt, elide the middle. Gentler than the full
+        compactor's 1-line digest — recent-ish detail stays usable."""
+        over = int(self._cfg.get("softTrimOver", 4_000))
+        head_chars = int(self._cfg.get("softTrimHeadChars", 1_200))
+        tail_chars = int(self._cfg.get("softTrimTailChars", 300))
+
+        _, tail_start = self._partition(messages)
+        out: list[dict[str, Any]] = []
+        trimmed = 0
+        for idx, msg in enumerate(messages):
+            if idx >= tail_start or not isinstance(msg.get("content"), list):
+                out.append(msg)
+                continue
+            new_content = []
+            for block in msg["content"]:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_result"
+                    and isinstance(block.get("content"), str)
+                    and len(block["content"]) > over
+                ):
+                    body = block["content"]
+                    elided = len(body) - head_chars - tail_chars
+                    new_block = dict(block)
+                    new_block["content"] = (
+                        body[:head_chars]
+                        + f"\n…[{elided} chars trimmed]…\n"
+                        + body[-tail_chars:]
+                    )
+                    new_content.append(new_block)
+                    trimmed += 1
+                else:
+                    new_content.append(block)
+            out.append({**msg, "content": new_content})
+
+        if trimmed:
+            logger.info(
+                "Early-pruned %d tool result(s) (~%d→%d tokens, cache cold)",
+                trimmed, estimate_tokens(messages), estimate_tokens(out),
+            )
+        return out
 
     async def compact(
         self,

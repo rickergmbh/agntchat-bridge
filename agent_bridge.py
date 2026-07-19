@@ -3843,6 +3843,32 @@ def run_single_agent(
         # Telemetry is non-critical — never let wrapping break the executor.
         logger.debug("[%s] Could not wrap backend for usage reporting: %s", executor_key, e)
 
+    # Backend-dispatched web tools: the web_search/web_fetch catalog rows
+    # are Anthropic-native server tools, but the backend also carries
+    # ToolRegistry handlers under the same names (MCP.Tools.Web). On
+    # backends that can't attach the native versions — anything except
+    # anthropic (native server tools) and claude_cli (Claude Code's own
+    # WebSearch/WebFetch) — re-present them as ordinary dispatchable
+    # tools so web access doesn't depend on which provider runs the
+    # agent. Requires the row to carry a real input schema (migration
+    # 299); code_execution stays native-only.
+    if sync_backend_name not in ("anthropic", "claude_cli"):
+        _dispatchable_web = [
+            t for t in server_tools
+            if t.get("name") in ("web_search", "web_fetch")
+            and (t.get("inputSchema") or {}).get("properties")
+        ]
+        if _dispatchable_web:
+            resolved_tools = resolved_tools + [
+                {**t, "category": "integration"} for t in _dispatchable_web
+            ]
+            logger.info(
+                "[%s] Presenting %s as backend-dispatched tools (backend=%s)",
+                executor_key,
+                ", ".join(t["name"] for t in _dispatchable_web),
+                sync_backend_name,
+            )
+
     # --- Tool-use mode setup ---
     # Tool definitions come from the backend via skills (resolvedTools).
     # No hardcoded tool catalog — skills are the single source of truth.
