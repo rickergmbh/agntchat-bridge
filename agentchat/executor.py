@@ -2739,13 +2739,26 @@ class ExecutorClient:
             )
             logger.info("[MSG-HANDLE] Handler returned for %s: reply_type=%s", msg.id, type(reply).__name__)
 
-            # Acknowledge receipt
+            # Acknowledge receipt — guarded on its own: an ack failure after a
+            # successful handler must NOT fall through to the handler-crash
+            # path below. The classic case is 403 executor_not_owned when a
+            # host shutdown deregistered this executor mid-turn (observed conv
+            # 0ce1f4b8: the handler had already created the delegated task,
+            # the ack 403'd, and the user got a spurious "I hit an error"
+            # bubble). Redelivery of an un-acked message is the gateway's
+            # concern, not a user-facing error.
             logger.info("[MSG-HANDLE] Sending ack for %s (executor=%s)", msg.id, self._executor_id)
-            await self._post(
-                f"/api/gateway/messages/{msg.id}/ack",
-                json={"executor_id": self._executor_id},
-            )
-            logger.info("[MSG-HANDLE] Ack succeeded for %s", msg.id)
+            try:
+                await self._post(
+                    f"/api/gateway/messages/{msg.id}/ack",
+                    json={"executor_id": self._executor_id},
+                )
+                logger.info("[MSG-HANDLE] Ack succeeded for %s", msg.id)
+            except Exception:
+                logger.exception(
+                    "[MSG-HANDLE] Ack failed for %s after successful handler; continuing without error notice",
+                    msg.id,
+                )
 
             # Send reply if handler returned one
             # Handlers can return a str or a dict with "content" and optional "metadata"
@@ -2785,7 +2798,7 @@ class ExecutorClient:
                         )
 
         except BaseException as e:
-            logger.exception("[MSG-HANDLE] Handler/ack failed for %s (%s): %s", msg.id, type(e).__name__, e)
+            logger.exception("[MSG-HANDLE] Handler/reply failed for %s (%s): %s", msg.id, type(e).__name__, e)
             # Acknowledge FIRST so the message can't be redelivered — before
             # the (slower, network-bound) notice POST below runs.
             try:

@@ -184,6 +184,80 @@ async def test_handler_exception_posts_visible_notice_and_acks(executor):
 
 
 @pytest.mark.asyncio
+async def test_ack_failure_after_successful_handler_posts_no_notice(executor):
+    """An ack failure AFTER the handler succeeded must not surface as an
+    agent error.
+
+    Regression (conv 0ce1f4b8, 2026-07-19): a host restart deregistered the
+    executor while a handler was in flight. The handler completed fine (it
+    had already created the delegated task), but the post-handler ack got
+    403 executor_not_owned — and the except path misread that as a handler
+    crash, posting a spurious "⚠️ I hit an error" ErrorReport to the user.
+    """
+    from agentchat.errors import AgentChatError
+
+    @executor.on_message
+    async def handler(_msg):
+        return None  # e.g. fast-path task creation — nothing to reply
+
+    msg = GatewayMessage(
+        id="queue-ack-403",
+        message_id="trigger-ack-403",
+        conversation_id="conv-1",
+        content="update your soul",
+    )
+
+    ack_error = AgentChatError(
+        "API error 403: {'error': 'executor_not_owned'}", status_code=403
+    )
+
+    with (
+        patch.object(executor, "_post", new=AsyncMock(side_effect=ack_error)) as post,
+        patch.object(executor, "send_message", new=AsyncMock(return_value={})) as send,
+    ):
+        await executor._handle_message(msg)
+
+    # Ack was attempted exactly once — no retry loop, no crash-path re-ack.
+    post.assert_awaited_once_with(
+        "/api/gateway/messages/queue-ack-403/ack",
+        json={"executor_id": "executor-1"},
+    )
+    # No user-visible ErrorReport for a bookkeeping failure.
+    send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ack_failure_still_sends_returned_reply(executor):
+    """send_message is agent-authenticated, not executor-scoped — a failed
+    ack must not swallow a reply the handler already produced."""
+    from agentchat.errors import AgentChatError
+
+    @executor.on_message
+    async def handler(_msg):
+        return "the actual answer"
+
+    msg = GatewayMessage(
+        id="queue-ack-403-reply",
+        message_id="trigger-ack-403-reply",
+        conversation_id="conv-1",
+        content="question",
+    )
+
+    ack_error = AgentChatError(
+        "API error 403: {'error': 'executor_not_owned'}", status_code=403
+    )
+
+    with (
+        patch.object(executor, "_post", new=AsyncMock(side_effect=ack_error)),
+        patch.object(executor, "send_message", new=AsyncMock(return_value={})) as send,
+    ):
+        await executor._handle_message(msg)
+
+    send.assert_awaited_once()
+    assert send.await_args.args[:2] == ("conv-1", "the actual answer")
+
+
+@pytest.mark.asyncio
 async def test_cancelled_handler_stays_silent(executor):
     """A CancelledError (user hit stop / stop_generation) must NOT post a
     notice — that's a deliberate stop, not a failure."""
