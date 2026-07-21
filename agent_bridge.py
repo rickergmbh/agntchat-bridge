@@ -1238,170 +1238,11 @@ _DM_BLOCK_RE = re.compile(
 _DM_ATTR_RE = re.compile(r'(\w+)\s*=\s*(?:"(?P<dq>[^"]*)"|\'(?P<sq>[^\']*)\')')
 
 
-_MSG_BLOCK_RE = re.compile(r"<msg>(.*?)</msg>", re.DOTALL | re.IGNORECASE)
-
-
-_WORD_RE = re.compile(r"[a-z0-9]+")
-
-
-def _preamble_duplicates_first_bubble(preamble: str, first_bubble: str) -> bool:
-    """True when an untagged preamble is a near-duplicate of the first <msg>.
-
-    The model under the human-like directive sometimes writes its headline
-    answer as plain prose, then switches into <msg> format and RESTATES it —
-    the user then sees the same answer twice, paraphrased (conv 0ce1f4b8,
-    bubbles 8260352d/6beff68a). The restatement is a paraphrase, never
-    byte-identical, so compare normalized token overlap against the smaller
-    of the two sets. Only substantial preambles qualify — a short legit
-    intro line ("Quick update:") must not be eaten.
-    """
-    pre_tokens = set(_WORD_RE.findall(preamble.lower()))
-    msg_tokens = set(_WORD_RE.findall(first_bubble.lower()))
-    if len(pre_tokens) < 5 or not msg_tokens:
-        return False
-    overlap = len(pre_tokens & msg_tokens) / min(len(pre_tokens), len(msg_tokens))
-    return overlap >= 0.55
-
-
-def _split_reply_into_bubbles(reply: str) -> list[str]:
-    """Split a completed reply into ordered chat bubbles.
-
-    Prefers explicit ``<msg>…</msg>`` markers the model emits under the
-    human-like directive. Any prose outside the tags (before/between/after) is
-    kept as its own bubble in source order so nothing is dropped — EXCEPT an
-    untagged preamble that near-duplicates the first tagged bubble (the model
-    answered in prose, then restated it in <msg> form; delivering both reads
-    as the agent repeating itself). When there are no ``<msg>`` tags, the
-    whole reply is a single bubble (normal reply).
-    """
-    if not reply or not reply.strip():
-        return []
-
-    if not _MSG_BLOCK_RE.search(reply):
-        return [reply.strip()]
-
-    bubbles: list[str] = []
-    first_gap_index: int | None = None
-    cursor = 0
-    for match in _MSG_BLOCK_RE.finditer(reply):
-        gap = reply[cursor:match.start()]
-        gap_clean = re.sub(r"</?msg>", "", gap, flags=re.IGNORECASE).strip()
-        if gap_clean:
-            if cursor == 0:
-                first_gap_index = len(bubbles)
-            bubbles.append(gap_clean)
-        inner = (match.group(1) or "").strip()
-        if inner:
-            bubbles.append(inner)
-        cursor = match.end()
-
-    tail = re.sub(r"</?msg>", "", reply[cursor:], flags=re.IGNORECASE).strip()
-    if tail:
-        bubbles.append(tail)
-
-    if (
-        first_gap_index is not None
-        and len(bubbles) > first_gap_index + 1
-        and _preamble_duplicates_first_bubble(
-            bubbles[first_gap_index], bubbles[first_gap_index + 1]
-        )
-    ):
-        logger.info(
-            "[humanlike] dropped untagged preamble duplicating first bubble (%d chars)",
-            len(bubbles[first_gap_index]),
-        )
-        del bubbles[first_gap_index]
-
-    return bubbles
-
-
-# Human-like pacing for posting bubbles. A burst of texts from a real person
-# has TWO distinct beats between consecutive bubbles:
-#
-#   1. READING pause — after a bubble lands, the reader needs a moment to take
-#      it in BEFORE the next one shows up. This gap is silent (no typing cue):
-#      the bubble is sitting there to be read. Sized to the bubble that JUST
-#      landed (longer message → longer read).
-#   2. WRITING pause — then the sender starts composing the next bubble. We
-#      show the "… is writing" typing indicator for this beat, sized to the
-#      NEXT bubble (longer next message → they "type" longer). Then it lands.
-#
-# Splitting the old single gap into read-then-write is what makes it feel like
-# someone actually writing rather than "posting posting posting": the user
-# finishes reading, SEES the agent typing, then the next text arrives.
-#
-# The actual numbers are SERVER-OWNED — `behavioralConfig.humanlikePacing`
-# (see BehavioralDirectives.build_behavioral_config). These constants are only
-# fallback defaults for when the directive is absent (offline/legacy paths).
-# Closing a writing beat is best-effort, but for an INTERRUPTED burst
-# (StaleContextError) or a failed bubble post there's no landed message for the
-# backend to self-close on — this explicit terminal frame is then the ONLY
-# thing that clears the "Writing…" activity before the 60s stale-sweep. So a
-# single transient failure is retried instead of silently swallowed.
-_WRITING_BEAT_CLOSE_ATTEMPTS = 3
-_WRITING_BEAT_CLOSE_RETRY_S = 0.2
-
-_PACING_DEFAULTS = {
-    "readBaseMs": 500,
-    "readPerCharMs": 18,
-    "readMaxMs": 4_000,
-    "writeBaseMs": 800,
-    "writePerCharMs": 28,
-    "writeMaxMs": 5_000,
-}
-
-
-def _pacing(behavioral_config: dict[str, Any] | None, key: str) -> float:
-    cfg = (behavioral_config or {}).get("humanlikePacing") or {}
-    raw = cfg.get(key, _PACING_DEFAULTS[key])
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return float(_PACING_DEFAULTS[key])
-
-
-def _bubble_read_pause_s(landed_bubble: str, behavioral_config: dict[str, Any] | None = None) -> float:
-    """Quiet beat to READ the bubble that just landed (sized to its length).
-    Numbers come from `behavioralConfig.humanlikePacing` (server-owned)."""
-    base = _pacing(behavioral_config, "readBaseMs")
-    per_char = _pacing(behavioral_config, "readPerCharMs")
-    cap = _pacing(behavioral_config, "readMaxMs")
-    return min(base + len(landed_bubble or "") * per_char, cap) / 1000.0
-
-
-def _bubble_write_pause_s(next_bubble: str, behavioral_config: dict[str, Any] | None = None) -> float:
-    """"Writing" beat before the NEXT bubble lands (sized to ITS length).
-    Numbers come from `behavioralConfig.humanlikePacing` (server-owned)."""
-    base = _pacing(behavioral_config, "writeBaseMs")
-    per_char = _pacing(behavioral_config, "writePerCharMs")
-    cap = _pacing(behavioral_config, "writeMaxMs")
-    return min(base + len(next_bubble or "") * per_char, cap) / 1000.0
-
-
-async def _writing_beat(
-    executor: ExecutorClient,
-    conversation_id: str,
-    stream_id: str,
-    seconds: float,
-) -> None:
-    """Hold a "writing" beat that renders the SAME live writing bubble the first
-    message gets — not the lesser "is processing" text indicator.
-
-    Emits a synthetic ``message_streaming`` "writing" event (via
-    ``send_stream_update``, phase="writing", no content) so the client shows the
-    StreamingBubble, waits ``seconds``, then leaves the bubble up: the following
-    bubble carries this ``stream_id`` in its metadata and clears it on arrival
-    (mirrors how the first message's real stream completes when it lands). The
-    backend's StaggeredBubbleWorker uses the identical contract for the
-    server-split fallback path. Best-effort: stream failures never break pacing.
-    """
-    try:
-        await executor.send_stream_update(
-            conversation_id, stream_id, status="started", phase="writing"
-        )
-    except Exception:  # noqa: BLE001
-        pass  # streaming is best-effort; never let it break pacing
-    await asyncio.sleep(max(0.0, seconds))
+# NOTE: humanlike bubble splitting, pacing, humanlike_bubble metadata, and
+# peer-wake routing moved SERVER-SIDE (Agentchat.Agents.HumanlikeDelivery +
+# StaggeredBubbleWorker at the insert_message chokepoint, audit Theme 5.3).
+# The bridge posts its raw <msg>-tagged reply once; the backend owns the rest,
+# so bridge and WS/SDK agents get identical semantics.
 
 
 def _parse_dm_blocks(reply: str) -> tuple[str, list[dict[str, str]]]:
@@ -1497,55 +1338,9 @@ def _find_member_by_name(
     return None
 
 
-_MENTION_RE = re.compile(r"@\[([^\]]+)\]|@([^\s,.:;!?@]+)")
-
-
-def _reply_mentions_agent(
-    text: str, members: list[dict[str, Any]], sender_name: str | None = None
-) -> bool:
-    """True if the reply addresses an AGENT member — by ``@mention`` OR by bare
-    display name (e.g. "Trtiw, want to take it from here?").
-
-    Used to disable incremental <msg> bubble emission: a reply that addresses a
-    peer agent must be delivered WHOLE (one message) so the address + full
-    context reach the peer together and wake it. If split, the bubble that
-    actually hands off (often a later bubble) posts as a continuation that
-    wakes nobody, and the handoff is lost — the agent-to-agent flow collapses.
-
-    Bare-name matching mirrors the backend's `detect_implicit_name_mentions`
-    (`\\bName\\b`), so the bridge's "don't split" decision and the backend's
-    "wake the named peer" decision agree. Mechanical text matching only; the
-    backend still owns what happens with the mention.
-    """
-    if not text or not members:
-        return False
-
-    self_name = (sender_name or "").strip().lower()
-    agent_names = {
-        (m.get("displayName") or "").lower()
-        for m in members
-        if m.get("type") == "agent"
-        and m.get("displayName")
-        and (m.get("displayName") or "").lower() != self_name
-    }
-    if not agent_names:
-        return False
-
-    # @mention form.
-    for match in _MENTION_RE.finditer(text):
-        name = (match.group(1) or match.group(2) or "").strip().rstrip(",.:;!?").lower()
-        if name in agent_names:
-            return True
-
-    # Bare display-name form (word-boundary, case-insensitive) — matches the
-    # backend's implicit-name-mention detection. Names <2 chars are skipped to
-    # avoid false positives (same guard the backend uses).
-    lowered = text.lower()
-    for name in agent_names:
-        if len(name) >= 2 and re.search(r"\b" + re.escape(name) + r"\b", lowered):
-            return True
-
-    return False
+# NOTE: peer-address detection for the "deliver whole vs split" decision is
+# server-owned (HumanlikeDelivery skips splitting for replies that @mention or
+# bare-name a peer agent — audit Theme 5.3).
 
 
 async def _route_dm_blocks(
@@ -2629,145 +2424,6 @@ def make_progress_callback(
 
     on_progress.flush = flush_pending  # type: ignore[attr-defined]
     return on_progress
-
-
-async def _post_paced_bubbles(
-    executor: ExecutorClient,
-    conversation_id: str,
-    reply: str,
-    *,
-    base_metadata: dict[str, Any],
-    members: list[dict[str, Any]],
-    sender_name: str | None,
-    last_seen_message_id: str | None = None,
-    behavioral_config: dict[str, Any] | None = None,
-) -> bool:
-    """Post a completed reply as human-paced chat bubbles.
-
-    Splits ``reply`` into bubbles (``<msg>`` markers or whole reply), then posts
-    each with a short human-like pause between (proportional to the previous
-    bubble's length) so it reads like someone firing off several texts — NOT a
-    23ms dump.
-
-    Routing per bubble:
-      - The FIRST bubble drives the turn (normal send path).
-      - A later bubble that ADDRESSES A PEER agent (``@mention`` or bare name)
-        ALSO goes through the full send path (no ``humanlike_bubble`` flag) so
-        the backend adds + wakes that peer — this is how a handoff reaches the
-        peer. Without it the handoff lands in a wake-less continuation bubble
-        and the agent-to-agent flow stalls.
-      - Other later bubbles carry ``humanlike_bubble=true`` (continuation: reach
-        humans, no turn/gateway/wake), keeping the burst one logical turn.
-
-    Returns True if it posted bubbles (caller must NOT also single-post), False
-    if there was nothing to post.
-    """
-    bubbles = _split_reply_into_bubbles(reply)
-    if not bubbles:
-        return False
-
-    # A burst may address the SAME peer in more than one bubble (e.g. "watch,
-    # I'll tag in @Pip" then "@Pip — say hi"). Each full-path bubble wakes the
-    # peer, so without this the peer gets woken N times and replies N times
-    # (Pip's double "Hi" in conv abb0937f). Route only the FIRST peer-addressing
-    # bubble full-path; later peer-addressing bubbles deliver as continuations
-    # (reach humans, no re-wake) — one wake per logical turn.
-    peer_wake_routed = False
-
-    for idx, bubble in enumerate(bubbles):
-        is_first = idx == 0
-        beat_stream_id: str | None = None
-
-        if idx > 0:
-            # Read-then-write rhythm between bubbles: a silent beat to read the
-            # bubble that just landed, then a "writing" beat sized to the bubble
-            # about to land. The writing beat renders the SAME live writing
-            # bubble the first message gets (synthetic message_streaming event),
-            # not the lesser "is processing" text indicator. See the pacing
-            # constants for the why.
-            await asyncio.sleep(_bubble_read_pause_s(bubbles[idx - 1], behavioral_config))
-            beat_stream_id = f"continuation:{uuid.uuid4()}"
-            await _writing_beat(
-                executor, conversation_id, beat_stream_id,
-                _bubble_write_pause_s(bubble, behavioral_config),
-            )
-
-        # Only the FIRST peer-addressing bubble drives the wake; a repeat
-        # mention later in the same burst must NOT re-wake the peer.
-        addresses_peer = _reply_mentions_agent(bubble, members, sender_name) and not peer_wake_routed
-        if addresses_peer:
-            peer_wake_routed = True
-
-        metadata = dict(base_metadata)
-        # Continuation flag ONLY for non-first bubbles that don't drive a peer
-        # wake. First bubble and the (single) peer-waking bubble take the full
-        # send path (turn/mention/wake) so the handoff reaches the peer once.
-        if not is_first and not addresses_peer:
-            metadata["humanlike_bubble"] = True
-        # Tag the bubble with its writing-beat stream so the client clears that
-        # writing bubble exactly as the message lands (same as the first msg).
-        if beat_stream_id:
-            metadata["stream_id"] = beat_stream_id
-
-        try:
-            await executor.send_message(
-                conversation_id, bubble,
-                metadata=metadata,
-                last_seen_message_id=last_seen_message_id if is_first else None,
-            )
-        except StaleContextError:
-            # A human interjected between bubbles — stop firing pre-written
-            # follow-ups into a changed context. (`finally` still closes the
-            # writing beat below.)
-            logger.info("[humanlike] stale context mid-burst in %s — stopping", conversation_id)
-            break
-        except Exception as e:  # noqa: BLE001
-            logger.warning("[humanlike] bubble post failed in %s: %s", conversation_id, e)
-        finally:
-            # ALWAYS close the synthetic writing stream once the bubble lands
-            # (or failed). The bubble's metadata.stream_id clears the CLIENT
-            # bubble, but the backend AgentActivity tracker only drops the
-            # stream key on an explicit complete/cancelled — without this the
-            # "writing" activity lingers up to the 60s stale sweep, leaving a
-            # stuck writing bubble below the agent's last message.
-            await _close_writing_beat(executor, conversation_id, beat_stream_id)
-
-    return True
-
-
-async def _close_writing_beat(
-    executor: ExecutorClient, conversation_id: str, beat_stream_id: str | None
-) -> None:
-    """Send a terminal `complete` for a writing-beat stream so the backend
-    AgentActivity tracker drops it immediately. No-op when there was no beat
-    (the first bubble).
-
-    A LANDED bubble is self-closing on the backend — it carries the beat's
-    `metadata.stream_id`, and `AgentActivity` drops that key on message-arrival.
-    But an INTERRUPTED burst (StaleContextError) or a failed bubble post has no
-    landed message, so this explicit terminal frame is the ONLY thing that
-    clears the "Writing…" activity before the 60s stale-sweep. Don't silently
-    swallow a single transient failure — retry briefly, then log if it still
-    fails (never raise: streaming must not break the burst)."""
-    if not beat_stream_id:
-        return
-    for attempt in range(_WRITING_BEAT_CLOSE_ATTEMPTS):
-        try:
-            await executor.send_stream_update(
-                conversation_id, beat_stream_id, status="complete"
-            )
-            return
-        except Exception as e:  # noqa: BLE001
-            if attempt + 1 >= _WRITING_BEAT_CLOSE_ATTEMPTS:
-                # Exhausted retries. The backend message-arrival drop covers
-                # landed bubbles; only an interrupted burst whose close also
-                # keeps failing falls back to the 60s sweep. Log, don't raise.
-                logger.warning(
-                    "[humanlike] failed to close writing beat %s in %s after %d attempts: %s",
-                    beat_stream_id, conversation_id, _WRITING_BEAT_CLOSE_ATTEMPTS, e,
-                )
-                return
-            await asyncio.sleep(_WRITING_BEAT_CLOSE_RETRY_S)
 
 
 def make_stream_callback(
@@ -5082,13 +4738,15 @@ def run_single_agent(
             reply_post_failed = False
             if reply:
                 try:
-                    await _post_paced_bubbles(
-                        executor, msg.conversation_id, reply,
-                        base_metadata=msg_meta_out,
-                        members=getattr(msg, "conversation_members", None) or [],
-                        sender_name=agent_name,
+                    # Post the raw tagged reply ONCE. Splitting, pacing,
+                    # humanlike_bubble metadata, and peer-wake routing are
+                    # server-owned (HumanlikeDelivery + StaggeredBubbleWorker
+                    # at the insert_message chokepoint) so bridge and WS/SDK
+                    # agents get identical semantics (audit Theme 5.3).
+                    await executor.send_message(
+                        msg.conversation_id, reply,
+                        metadata=msg_meta_out,
                         last_seen_message_id=msg.latest_seen_message_id or msg.message_id or None,
-                        behavioral_config=behavioral_config,
                     )
                     await _stream_cb.complete()
                 except StaleContextError as sce:
@@ -5327,15 +4985,16 @@ def run_single_agent(
                 msg_meta_out["backend"] = effective_backend
             msg_meta_out["stream_id"] = _msg_stream_id
 
-            # Send reply explicitly so we can create tasks AFTER it appears in the timeline
+            # Send reply explicitly so we can create tasks AFTER it appears in the timeline.
+            # Posted RAW and ONCE: splitting, pacing, humanlike_bubble metadata,
+            # and peer-wake routing are server-owned (HumanlikeDelivery +
+            # StaggeredBubbleWorker at the insert_message chokepoint) so bridge
+            # and WS/SDK agents get identical semantics (audit Theme 5.3).
             try:
-                await _post_paced_bubbles(
-                    executor, msg.conversation_id, reply,
-                    base_metadata=msg_meta_out,
-                    members=getattr(msg, "conversation_members", None) or [],
-                    sender_name=agent_name,
+                await executor.send_message(
+                    msg.conversation_id, reply,
+                    metadata=msg_meta_out,
                     last_seen_message_id=msg.latest_seen_message_id or msg.message_id or None,
-                    behavioral_config=behavioral_config,
                 )
                 await _stream_cb.complete()
             except StaleContextError as sce:

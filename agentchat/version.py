@@ -34,4 +34,12 @@ different things.
 # MODEL_OVERRIDE contextvar; backends resolve it at request time
 # (_request_model). Older bridges silently ran pulses on the agent's
 # static model.
-BRIDGE_VERSION = "2.5.0"
+# 2.6.0 — humanlike bubble delivery moved fully server-side (audit
+# Theme 5.3): the bridge posts its raw <msg>-tagged reply ONCE; the
+# backend (HumanlikeDelivery + StaggeredBubbleWorker) owns splitting,
+# pacing, humanlike_bubble metadata, and peer-wake routing. Older
+# bridges split client-side and make their own peer-wake routing
+# decision, so WS/SDK agents and bridge agents diverge; the
+# behavioralConfig.humanlikePacing key they read is gone (they fall
+# back to local defaults, harmless during the roll).
+BRIDGE_VERSION = "2.6.0"
