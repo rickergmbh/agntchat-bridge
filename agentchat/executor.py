@@ -55,6 +55,13 @@ CURRENT_TASK_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "agentgram_current_task_id", default=None
 )
 
+# Backend contract: MCP complete_task's open-subtask rejection starts with
+# this marker (subtasks_still_open_message/1 in the backend's
+# mcp/tools/tasks.ex, locked by test there). It means "wait for the
+# sub-task-completion wake", not "the task failed" — _handle_task leaves the
+# task open when it sees it instead of routing through fail_task.
+OPEN_SUBTASKS_MARKER = "[open_subtasks]"
+
 
 def device_name() -> str:
     """Human-readable name of the machine this bridge runs on.
@@ -987,13 +994,31 @@ class ExecutorClient:
                         "silently complete a non-pulse task."
                     )
 
-            await self._invoke_complete_task(
-                real_task_id,
-                response_text=response_text,
-                summary=summary,
-                silent=silent,
-                result_data=extra,
-            )
+            try:
+                await self._invoke_complete_task(
+                    real_task_id,
+                    response_text=response_text,
+                    summary=summary,
+                    silent=silent,
+                    result_data=extra,
+                )
+            except AgentChatError as e:
+                # The backend's open-subtask guard rejects completion while
+                # sub-tasks in the work conversation are still open. That is
+                # a wait signal, not a failure: the agent gets woken when the
+                # sub-tasks complete and delivers the final response then.
+                # Failing the task here would kill the routine and strand the
+                # sub-tasks' output (observed live: Morning Brief 2026-08-12).
+                # The marker is a backend contract — see
+                # subtasks_still_open_message/1 in mcp/tools/tasks.ex.
+                if OPEN_SUBTASKS_MARKER in str(e):
+                    logger.info(
+                        "Task %s completion deferred — sub-tasks still open; "
+                        "leaving the task open for the sub-task-completion wake",
+                        real_task_id,
+                    )
+                    return
+                raise
             logger.info("Task %s completed", real_task_id)
 
         except Exception as e:

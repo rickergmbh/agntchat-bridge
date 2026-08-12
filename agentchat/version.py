@@ -42,4 +42,11 @@ different things.
 # decision, so WS/SDK agents and bridge agents diverge; the
 # behavioralConfig.humanlikePacing key they read is gone (they fall
 # back to local defaults, harmless during the roll).
-BRIDGE_VERSION = "2.6.0"
+# 2.6.1 — open-subtask completion rejection treated as a wait signal:
+# when the backend's complete_task guard answers with the
+# "[open_subtasks]" marker, _handle_task leaves the task open for the
+# sub-task-completion wake instead of failing the task. Older bridges
+# fail the root task and strand the sub-tasks' output (Morning Brief
+# 2026-08-12). Backend marker ships in the same change; safe either
+# order — without the marker the old failure mode simply persists.
+BRIDGE_VERSION = "2.6.1"
