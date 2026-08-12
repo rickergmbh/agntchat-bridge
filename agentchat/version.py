@@ -60,4 +60,12 @@ different things.
 # loss (or recovery) surfaces within one heartbeat. Older bridges simply
 # don't report health — they're treated as healthy on the version check
 # alone, so the roll is safe in either order.
-BRIDGE_VERSION = "2.7.0"
+# 2.7.1 — preflight probes the Bedrock/Vertex credential chain instead of
+# assuming it's configured. The exemption meant a cloud-connection agent on
+# a machine with no AWS/GCP chain reported `ok` forever: every turn died on
+# "Could not load credentials from any providers", and every restart re-ran
+# preflight and laundered the dead state back to green, so it kept reading
+# online and kept getting handed tasks. Structural probe only (no network,
+# so an instance-role-only machine now reads unauthenticated — the safe
+# direction). Not gated on by the server; the roll is safe in either order.
+BRIDGE_VERSION = "2.7.1"

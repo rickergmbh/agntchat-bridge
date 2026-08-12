@@ -104,6 +104,50 @@ def _is_auth_failure(text: str | None) -> bool:
     return bool(text) and bool(_AUTH_FAILURE_RE.search(text))
 
 
+def _has_aws_credentials() -> bool:
+    """Is there any source the AWS SDK could resolve credentials from?
+
+    Mirrors the SDK's own chain, minus IMDS — detecting an instance role
+    needs a network call, and preflight must stay structural. A machine that
+    has ONLY an instance role therefore reads as unauthenticated here; that
+    is the safe direction to be wrong in, and the detail string says exactly
+    what we looked for. Never reads or validates the credentials themselves.
+    """
+    if os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY"):
+        return True
+    # ECS/EKS task roles and web-identity federation hand the SDK a source
+    # without any key material in env.
+    if any(
+        os.environ.get(var)
+        for var in (
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+        )
+    ):
+        return True
+    aws_config = os.environ.get("AWS_CONFIG_FILE") or os.path.join(
+        os.path.expanduser("~"), ".aws", "config"
+    )
+    aws_dir = os.path.dirname(aws_config)
+    return os.path.isfile(os.path.join(aws_dir, "credentials")) or os.path.isfile(aws_config)
+
+
+def _has_gcp_credentials() -> bool:
+    """Is there any source google-auth could resolve ADC from?"""
+    explicit = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if explicit and os.path.isfile(explicit):
+        return True
+    return os.path.isfile(
+        os.path.join(
+            os.path.expanduser("~"),
+            ".config",
+            "gcloud",
+            "application_default_credentials.json",
+        )
+    )
+
+
 def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
     """Best-effort SIGKILL of a subprocess and its entire process group.
 
@@ -965,10 +1009,35 @@ class ClaudeCliBackend(ModelBackend):
         connection = self._cli_connection or "subscription"
 
         # Bedrock/Vertex authenticate through the cloud provider's own chain
-        # (~/.aws, SSO, ADC, instance roles), which we can't probe cheaply
-        # or reliably. Assume configured; a real failure surfaces on turn 1.
-        if connection in ("bedrock", "vertex"):
-            self._mark_healthy()
+        # (~/.aws, SSO, ADC, instance roles). We used to assume those were
+        # configured and mark healthy, on the grounds that a real failure
+        # surfaces on turn 1 — but "surfaces on turn 1" is not the same as
+        # "stays reported". A bedrock agent on a machine with no AWS chain
+        # fails every turn, and each restart re-ran this preflight and
+        # laundered the known-dead state straight back to `ok`, so the agent
+        # kept reading green and kept getting handed tasks. Probe the
+        # credential *source* structurally, exactly as we do for a seat.
+        if connection == "bedrock":
+            if _has_aws_credentials():
+                self._mark_healthy()
+            else:
+                self._mark_health(
+                    "unauthenticated",
+                    "cli_connection is bedrock but this machine has no AWS "
+                    "credential source (env keys, ~/.aws, container or "
+                    "web-identity role)",
+                )
+            return self._health
+
+        if connection == "vertex":
+            if _has_gcp_credentials():
+                self._mark_healthy()
+            else:
+                self._mark_health(
+                    "unauthenticated",
+                    "cli_connection is vertex but this machine has no Google "
+                    "application-default credentials",
+                )
             return self._health
 
         if self._has_subscription_credential():
