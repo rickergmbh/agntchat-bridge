@@ -199,6 +199,41 @@ class TestSourceIdAndTail:
         # No identity anchor inside the rendered history anymore
         assert not any("SYSTEM REMINDER" in str(m.content) for m in history)
 
+    @pytest.mark.asyncio
+    async def test_ride_along_attachment_hint_surfaces_from_readable_text(self):
+        # A paste-to-attachment text message: `content` is just the typed
+        # body, but the backend's `readableText` appends a read_attachment
+        # hint for the ride-along .txt attachment. The bridge must render
+        # that hint, not silently fall back to the bare `content`.
+        raw = [
+            {
+                "id": "m1",
+                "content": "check this out",
+                "readableText": (
+                    "check this out\n\n[Attached files — read with the "
+                    "read_attachment tool:\n  - pasted-text.txt "
+                    "(attachment_id: att-123)\n]"
+                ),
+                "contentType": "text",
+                "senderId": "human-1",
+                "senderName": "Tom",
+                "senderType": "human",
+            },
+        ]
+        history = await messages_to_chat_history(raw, "agent-1")
+        assert len(history) == 1
+        assert "read_attachment" in history[0].content
+        assert "att-123" in history[0].content
+
+    @pytest.mark.asyncio
+    async def test_text_message_without_readable_text_falls_back_to_content(self):
+        raw = [
+            {"id": "m1", "content": "hello", "contentType": "text",
+             "senderId": "human-1", "senderName": "Tom", "senderType": "human"},
+        ]
+        history = await messages_to_chat_history(raw, "agent-1")
+        assert "hello" in history[0].content
+
     def test_per_turn_tail_joins_parts_and_anchor(self):
         tail = _per_turn_tail(["Current time: 9 AM", "", "  ", "[Human: Tom]: hi"], "Ada")
         assert tail.startswith("Current time: 9 AM")

@@ -2024,8 +2024,16 @@ async def messages_to_chat_history(
                 history.append(ChatMessage(role=role, content=f"{ts_prefix}{text}", source_id=msg.get("id")))
             continue
 
-        # Regular text message
-        content = msg.get("content", "")
+        # Regular text message. Prefer the server-rendered `readableText`
+        # over the raw `content` column: for a text message carrying
+        # ride-along attachments (e.g. a paste-to-attachment bubble),
+        # `readableText` appends a "read with the read_attachment tool"
+        # hint that `content` alone doesn't have (see
+        # `MessageEnvelope.render_readable_text/1`). Without this, the
+        # agent never learns the attachment exists unless a human pastes
+        # the link manually.
+        readable = msg.get("readableText") or msg.get("readable_text")
+        content = readable if isinstance(readable, str) and readable.strip() else msg.get("content", "")
         if not content:
             continue
         if role == "user":
