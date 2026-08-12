@@ -111,8 +111,73 @@ class ModelResult:
     stop_reason: str = "end_turn"
 
 
+@dataclass
+class BackendHealth:
+    """Whether this backend can actually run a turn right now.
+
+    Reported to the server at executor registration and on every heartbeat,
+    where it gates the agent's presence (see
+    ``Agentchat.Agents.Runnability`` on the backend). Before this existed,
+    a bridge with a logged-out Claude CLI registered as a perfectly healthy
+    executor: the agent showed online, the user got a "thinking..." bubble,
+    and the real error ("Please run /login") never left the local log file.
+
+    ``status`` mirrors the server's accepted values exactly — anything else
+    is coerced to "error" server-side.
+    """
+
+    status: str = "ok"  # ok | unauthenticated | missing_cli | error
+    detail: Union[str, None] = None
+
+    def as_payload(self) -> dict[str, Any]:
+        return {"status": self.status, "detail": self.detail}
+
+
+class BackendAuthError(RuntimeError):
+    """The backend rejected the call for credential reasons.
+
+    Distinct from a generic RuntimeError so the executor can (a) flip the
+    reported health to "unauthenticated" instead of guessing, and (b) let
+    the server explain the real problem to the user rather than posting the
+    generic "I ran into an issue processing that request."
+    """
+
+
 class ModelBackend(ABC):
     """Abstract base class for model backends."""
+
+    # Current self-assessed health. Backends that can fail on credentials
+    # override preflight() and update this from their error paths.
+    _health: BackendHealth = BackendHealth()
+
+    def preflight(self) -> BackendHealth:
+        """Check whether this backend can run a turn, before going online.
+
+        Called once at startup, BEFORE the executor registers, so a broken
+        machine advertises itself as broken instead of silently accepting
+        work it cannot do. Must be cheap and must not call the model.
+
+        Default: assume healthy. Backends whose credentials live outside the
+        process (CLI logins, ambient API keys) override this.
+        """
+        return self._health
+
+    @property
+    def health(self) -> BackendHealth:
+        """Latest known health — preflight result, updated by turn outcomes."""
+        return self._health
+
+    def _mark_health(self, status: str, detail: Union[str, None] = None) -> None:
+        self._health = BackendHealth(status=status, detail=detail)
+
+    def _mark_healthy(self) -> None:
+        """A turn succeeded — clear any previously reported problem.
+
+        Recovery matters as much as detection: signing the CLI back in must
+        bring the agent green again without restarting the bridge.
+        """
+        if self._health.status != "ok":
+            self._health = BackendHealth()
 
     @property
     @abstractmethod
@@ -313,6 +378,8 @@ def create_backend(name: str | None = None, **kwargs: Any) -> ModelBackend:
 
 
 __all__ = [
+    "BackendAuthError",
+    "BackendHealth",
     "ChatMessage",
     "ModelBackend",
     "ModelResult",

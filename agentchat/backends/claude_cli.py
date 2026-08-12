@@ -25,14 +25,24 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import signal
+import subprocess
 import sys
 import time
 from typing import Any
 
 import logging
 
-from . import ChatMessage, ModelBackend, ModelResult, ProgressCallback, ToolCall
+from . import (
+    BackendAuthError,
+    BackendHealth,
+    ChatMessage,
+    ModelBackend,
+    ModelResult,
+    ProgressCallback,
+    ToolCall,
+)
 from ._cli_utils import (
     ANSI_ESCAPE_RE,
     cleanup_temp_files,
@@ -63,6 +73,35 @@ _DEFAULT_CLI_PATH = "claude"
 _DEFAULT_TIMEOUT = 900  # 15 minutes — complex tasks need time
 _COMPUTER_USE_TIMEOUT = 1800  # 30 minutes — computer use chains many slow driver calls
 _STREAM_LIMIT = 10 * 1024 * 1024  # 10 MB — CLI can emit large JSON lines
+
+# Failure text that means "this machine has no usable Claude credential",
+# as opposed to any other CLI error. Matching these is what lets the server
+# tell the user "sign in on that machine" instead of the generic "I ran into
+# an issue processing that request" — the message that made a completely
+# diagnosable setup problem look like a mystery.
+#
+# Deliberately broad: a false positive costs a slightly-wrong explanation,
+# while a false negative costs total silence, which is the bug being fixed.
+_AUTH_FAILURE_RE = re.compile(
+    r"(invalid[\s_-]*api[\s_-]*key"
+    r"|please\s+run\s+/login"
+    r"|run\s+`?claude\s+login"
+    r"|not\s+logged\s+in"
+    r"|no\s+credentials?\s+found"
+    r"|could\s+not\s+load\s+credentials"
+    r"|authentication[\s_-]*(failed|error|required)"
+    r"|unauthorized"
+    r"|oauth[\s_-]*token[\s_-]*(expired|invalid|revoked)"
+    r"|credit\s+balance\s+is\s+too\s+low"
+    r"|subscription\s+(expired|required|inactive)"
+    r"|awsauthrefresh"
+    r"|\b401\b)",
+    re.IGNORECASE,
+)
+
+
+def _is_auth_failure(text: str | None) -> bool:
+    return bool(text) and bool(_AUTH_FAILURE_RE.search(text))
 
 
 def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
@@ -900,6 +939,112 @@ class ClaudeCliBackend(ModelBackend):
 
         return env
 
+    # ------------------------------------------------------------------
+    # Health
+    # ------------------------------------------------------------------
+
+    def preflight(self) -> BackendHealth:
+        """Verify the CLI exists and has something to authenticate with.
+
+        Runs before the executor registers. Deliberately structural (no model
+        call): checking that a credential *source* exists catches the common
+        "we brought an agent online on a fresh machine and never ran
+        `claude login`" case for free, and anything subtler (expired seat,
+        exhausted credit) gets caught at first turn by ``_classify_failure``
+        and reported on the next heartbeat.
+        """
+        # resolve_cli_path falls back to the bare name when the binary isn't
+        # on PATH, so "did which() find it" is the real test.
+        if shutil.which(self._cli_path) is None and not os.path.isfile(self._cli_path):
+            self._mark_health(
+                "missing_cli",
+                f"the `{_DEFAULT_CLI_PATH}` CLI isn't installed on this machine",
+            )
+            return self._health
+
+        connection = self._cli_connection or "subscription"
+
+        # Bedrock/Vertex authenticate through the cloud provider's own chain
+        # (~/.aws, SSO, ADC, instance roles), which we can't probe cheaply
+        # or reliably. Assume configured; a real failure surfaces on turn 1.
+        if connection in ("bedrock", "vertex"):
+            self._mark_healthy()
+            return self._health
+
+        if self._has_subscription_credential():
+            self._mark_healthy()
+        else:
+            self._mark_health(
+                "unauthenticated",
+                "no signed-in Claude account on this machine",
+            )
+
+        return self._health
+
+    def _has_subscription_credential(self) -> bool:
+        """Is there any credential the CLI could use in subscription mode?
+
+        Either an ambient API key, or the CLI's own stored login. The
+        credential file location differs by platform and CLI version, so
+        check the known spellings rather than one hardcoded path — and treat
+        the presence of the config dir's credential file as sufficient
+        without reading it (we never want this process touching the token).
+        """
+        if os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN"):
+            return True
+
+        config_dir = os.getenv("CLAUDE_CONFIG_DIR") or os.path.join(
+            os.path.expanduser("~"), ".claude"
+        )
+        candidates = [
+            os.path.join(config_dir, ".credentials.json"),
+            os.path.join(config_dir, "credentials.json"),
+            # Older CLI versions kept the login in the top-level config file.
+            os.path.join(os.path.expanduser("~"), ".claude.json"),
+        ]
+        if any(os.path.isfile(p) for p in candidates):
+            return True
+
+        # macOS keeps the subscription token in the Keychain rather than on
+        # disk. We can't read it (and shouldn't), so a Keychain entry check
+        # is the closest safe probe; if the lookup itself fails, assume
+        # configured rather than blocking a working agent.
+        if sys.platform == "darwin":
+            return self._keychain_login_present()
+
+        return False
+
+    @staticmethod
+    def _keychain_login_present() -> bool:
+        try:
+            proc = subprocess.run(
+                ["security", "find-generic-password", "-s", "Claude Code-credentials"],
+                capture_output=True,
+                timeout=5,
+            )
+            return proc.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            # Fail open — never mark a working agent broken because a probe
+            # we invented couldn't run.
+            return True
+
+    def _classify_failure(self, detail: str, returncode: int) -> RuntimeError:
+        """Turn a CLI failure into the right exception, and record health.
+
+        Auth failures become ``BackendAuthError`` so the executor reports
+        "unauthenticated" upstream and the server can explain the actual
+        problem. Everything else stays a plain RuntimeError and leaves
+        health alone — a single bad turn is not evidence the backend is
+        unusable.
+        """
+        message = f"Claude CLI exited with code {returncode}: {detail}"
+
+        if _is_auth_failure(detail):
+            self._mark_health("unauthenticated", detail[:300])
+            return BackendAuthError(message)
+
+        return RuntimeError(message)
+
     def outer_timeout(self) -> int:
         # Backstop above self._timeout (the per-readline / batch cap). The
         # MCP/streaming path enforces no global total budget, so this is a
@@ -943,12 +1088,14 @@ class ClaudeCliBackend(ModelBackend):
             # CLI sometimes writes errors to stdout (especially flag errors)
             out_msg = stdout.decode().strip() if stdout else ""
             detail = err_msg or out_msg or "unknown error"
-            raise RuntimeError(
-                f"Claude CLI exited with code {proc.returncode}: {detail}"
-            )
+            raise self._classify_failure(detail, proc.returncode)
 
         text = stdout.decode().strip() if stdout else ""
         text = ANSI_ESCAPE_RE.sub("", text)
+
+        # A completed turn is the strongest possible proof of a working
+        # credential — clears any earlier "unauthenticated" without a restart.
+        self._mark_healthy()
 
         return ModelResult(
             text=text,
@@ -1224,12 +1371,20 @@ class ClaudeCliBackend(ModelBackend):
                     proc.returncode, detail, err_msg[:200] if err_msg else "(empty)",
                     len(partial), partial[-500:] if partial else "(empty)",
                 )
-                raise RuntimeError(
-                    f"Claude CLI exited with code {proc.returncode}: {detail}"
-                )
+                raise self._classify_failure(detail, proc.returncode)
+
+        elif _result_is_error and _is_auth_failure(result_text):
+            # Exit 0 but the result event is flagged errored with auth text.
+            # The error branch above never runs, so without this the CLI's
+            # "Invalid API key · Please run /login" was returned as the
+            # agent's reply and posted verbatim into the user's chat.
+            raise self._classify_failure(result_text, 0)
 
         clean_text = result_text.strip() if result_text else ""
         clean_text = ANSI_ESCAPE_RE.sub("", clean_text)
+
+        # See _generate_batch: a completed turn clears a stale auth flag.
+        self._mark_healthy()
 
         return ModelResult(
             text=clean_text,

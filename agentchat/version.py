@@ -49,4 +49,15 @@ different things.
 # fail the root task and strand the sub-tasks' output (Morning Brief
 # 2026-08-12). Backend marker ships in the same change; safe either
 # order — without the marker the old failure mode simply persists.
-BRIDGE_VERSION = "2.6.1"
+# 2.7.0 — runnability reporting: the bridge preflights its model backend
+# before registering and sends `backend_health` {status, detail} on both
+# the register and heartbeat payloads, plus `bridge_version` on heartbeat.
+# The server (Agentchat.Agents.Runnability) gates agent presence on it, so
+# a machine with no `claude login` now reads offline-with-a-reason and gets
+# an in-chat explanation instead of a green dot and permanent silence.
+# claude_cli additionally classifies auth-shaped CLI failures as
+# BackendAuthError and flips its own health, so a mid-session credential
+# loss (or recovery) surfaces within one heartbeat. Older bridges simply
+# don't report health — they're treated as healthy on the version check
+# alone, so the roll is safe in either order.
+BRIDGE_VERSION = "2.7.0"

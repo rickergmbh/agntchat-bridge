@@ -3357,6 +3357,30 @@ def run_single_agent(
 
     backend = create_backend(effective_backend, **backend_kwargs)
 
+    # Runnability preflight. Nothing used to check that the backend could
+    # actually run a turn before this process advertised itself as a healthy
+    # executor — so a machine that had never run `claude login` came online,
+    # showed a green dot, and answered every message with the generic
+    # "I ran into an issue processing that request", with the real cause
+    # ("Please run /login") stranded in this log file. The result rides the
+    # register + heartbeat payloads; the server turns it into an offline dot
+    # plus an in-chat explanation.
+    try:
+        _health = backend.preflight()
+        if _health.status != "ok":
+            logger.error(
+                "[%s] Backend preflight FAILED: %s — %s. The agent will register "
+                "as unable to answer until this is fixed.",
+                executor_key,
+                _health.status,
+                _health.detail,
+            )
+        else:
+            logger.info("[%s] Backend preflight ok (%s)", executor_key, effective_backend)
+    except Exception:
+        # Never let a health probe stop a bridge that might work fine.
+        logger.warning("[%s] Backend preflight raised; continuing", executor_key, exc_info=True)
+
     # Model config sync — one-way, startup-only. The server's model_config is
     # the user's explicit selection and the server is its source of truth: the
     # bridge NEVER writes a model back over a profile-provided one. (It used to
@@ -3510,6 +3534,7 @@ def run_single_agent(
         max_concurrent=max_concurrent,
         message_timeout=_executor_timeout,
         task_timeout=_executor_timeout,
+        backend=backend,
     )
 
     # Report LLM token usage after every turn. All LLM calls funnel through

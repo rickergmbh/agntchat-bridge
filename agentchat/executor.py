@@ -269,8 +269,15 @@ class ExecutorClient:
         # across the registry, cleanup worker, and HeartbeatExecutionWorker.
         # Anything ≥180s makes the executor flap online/offline between beats.
         heartbeat_interval: int = 60,
+        # The model backend this executor runs turns on. Optional so SDK
+        # users embedding ExecutorClient directly aren't forced to supply
+        # one; when present, its self-reported health is forwarded to the
+        # server at register + heartbeat so an agent that cannot actually
+        # answer stops advertising itself as online.
+        backend: Any | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
+        self._backend = backend
         self._agent_id = agent_id
         self._token_manager = TokenManager(base_url, agent_id, api_key)
         self._executor_key = executor_key
@@ -766,9 +773,17 @@ class ExecutorClient:
                     # Remove None values
                     metrics = {k: v for k, v in metrics.items() if v is not None}
 
+                    # Health rides every heartbeat so a mid-session credential
+                    # loss (or recovery) shows up within one beat. The server
+                    # only writes when the derived state actually changes, so
+                    # this stays a read on the hot path.
                     resp_data = await self._post(
                         f"/api/gateway/executors/{self._executor_id}/heartbeat",
-                        json={"metrics": metrics},
+                        json={
+                            "metrics": metrics,
+                            "bridge_version": BRIDGE_VERSION,
+                            "backend_health": self._backend_health_payload(),
+                        },
                     )
                     logger.debug("Heartbeat sent for executor %s", self._executor_id)
 
@@ -862,8 +877,34 @@ class ExecutorClient:
     # Internal
     # ------------------------------------------------------------------
 
+    def _backend_health_payload(self) -> dict:
+        """This bridge's self-assessed ability to actually run a turn.
+
+        Sent at registration and on every heartbeat. The server gates the
+        agent's presence on it (``Agentchat.Agents.Runnability``), so a
+        machine with no Claude login reads offline-with-a-reason instead of
+        online-and-mute. Never let a health probe break the connection —
+        an unknown state is better reported as healthy than not at all.
+        """
+        backend = getattr(self, "_backend", None)
+        if backend is None:
+            return {"status": "ok", "detail": None}
+        try:
+            return backend.health.as_payload()
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("Backend health probe failed", exc_info=True)
+            return {"status": "ok", "detail": None}
+
     async def _register(self) -> None:
         """Register or re-register the executor with the gateway."""
+        health = self._backend_health_payload()
+        if health.get("status") != "ok":
+            logger.warning(
+                "Registering with degraded backend health: %s (%s)",
+                health.get("status"),
+                health.get("detail"),
+            )
+
         data = await self._post(
             "/api/gateway/executors",
             json={
@@ -872,6 +913,7 @@ class ExecutorClient:
                 "capabilities": self._capabilities,
                 "connection_type": "long_poll",
                 "max_concurrent": self._max_concurrent,
+                "backend_health": health,
                 "metadata": {
                     "device_name": device_name(),
                     "bridge_version": BRIDGE_VERSION,
