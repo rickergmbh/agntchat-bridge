@@ -89,7 +89,6 @@ from agentchat.results import (  # noqa: E402
     EventItem, ProductItem, GenericItem, Price, CTA, CTABlock, Citation,
     Location, HotelDetails,
 )
-from google_places import enrich_presentation_photos  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # CLI argument parsing
@@ -1173,8 +1172,6 @@ async def send_parsed_presentations(
     conversation_id: str,
     presentations: list[dict[str, Any]],
     correlation_id: str | None = None,
-    owner_lat: float | None = None,
-    owner_lng: float | None = None,
     last_seen_message_id: str | None = None,
 ) -> int:
     """Send parsed result presentation dicts via the executor.
@@ -1185,15 +1182,9 @@ async def send_parsed_presentations(
     dataclasses only know the old built-in result types. Coercing through that
     static validator drops dynamic template cards on inline replies; the
     backend already validates, normalizes, and hydrates detail templates.
+    Photo enrichment happens server-side in the message pipeline
+    (Agentchat.Messaging.PhotoEnrichment) — the bridge sends payloads as-is.
     """
-    try:
-        await asyncio.gather(
-            *(enrich_presentation_photos(data, default_lat=owner_lat, default_lng=owner_lng)
-              for data in presentations)
-        )
-    except Exception as e:
-        logger.warning("Photo enrichment failed (sending without photos): %s", e)
-
     sent = 0
     for data in presentations:
         title = data.get("title") or data.get("result_type") or "results"
@@ -3468,7 +3459,7 @@ def run_single_agent(
         agent_name = None
 
     # Helper: fetch live location (reuses executor's persistent client + token)
-    async def _get_live_location_context() -> tuple[str, float | None, float | None]:
+    async def _get_live_location_context() -> str:
         try:
             loc = await _fetch_owner_location(AGENTGRAM_API_URL, agent_id, api_key, executor=executor)
             if loc.get("latitude") is not None and loc.get("longitude") is not None:
@@ -3479,10 +3470,10 @@ def run_single_agent(
                     ctx += f", accuracy={loc['accuracy']}m"
                 if loc.get("timestamp"):
                     ctx += f", updated={loc['timestamp']}"
-                return ctx, lat, lng
+                return ctx
         except Exception:
             pass
-        return "", None, None
+        return ""
 
     # Per-conversation directive cache. Keyed by conversation_id.
     # Seeded at startup by warm-up, updated from each server response.
@@ -3909,7 +3900,7 @@ def run_single_agent(
         # Always fetch live location for task context. Injected into the user
         # message (below) — NOT the system prompt — to keep the system prompt
         # stable for Anthropic prompt caching.
-        live_loc_ctx, owner_lat, owner_lng = await _get_live_location_context()
+        live_loc_ctx = await _get_live_location_context()
         if live_loc_ctx:
             logger.info("[%s] Live owner location injected", executor_key)
 
@@ -4067,7 +4058,6 @@ def run_single_agent(
                     sent = await send_parsed_presentations(
                         executor, reply_conv, presentations,
                         correlation_id=task.task_id,
-                        owner_lat=owner_lat, owner_lng=owner_lng,
                     )
                     logger.info("[%s] Sent %d ResultPresentation(s) for task (tool_use)", executor_key, sent)
 
@@ -4215,7 +4205,6 @@ def run_single_agent(
                     sent = await send_parsed_presentations(
                         executor, reply_conv, presentations,
                         correlation_id=task.task_id,
-                        owner_lat=owner_lat, owner_lng=owner_lng,
                     )
                     logger.info("[%s] Sent %d ResultPresentation(s) for task", executor_key, sent)
 
@@ -4500,7 +4489,7 @@ def run_single_agent(
         location_task = asyncio.create_task(_get_live_location_context())
 
         chat_messages = await history_task
-        live_loc_ctx, msg_owner_lat, msg_owner_lng = await location_task
+        live_loc_ctx = await location_task
 
         # Echo the trigger in the per-turn tail only when it isn't already the
         # newest RENDERED history message — it almost always is, and
@@ -4793,7 +4782,6 @@ def run_single_agent(
             if presentations and not reply_post_failed:
                 sent = await send_parsed_presentations(
                     executor, msg.conversation_id, presentations,
-                    owner_lat=msg_owner_lat, owner_lng=msg_owner_lng,
                     last_seen_message_id=msg.latest_seen_message_id or msg.message_id or None,
                 )
                 logger.info("[%s] Sent %d ResultPresentation(s) from tool_use", executor_key, sent)
@@ -5043,7 +5031,6 @@ def run_single_agent(
         if presentations and not reply_post_failed:
             sent = await send_parsed_presentations(
                 executor, msg.conversation_id, presentations,
-                owner_lat=msg_owner_lat, owner_lng=msg_owner_lng,
                 last_seen_message_id=msg.latest_seen_message_id or msg.message_id or None,
             )
             logger.info("[%s] Sent %d ResultPresentation(s)", executor_key, sent)
