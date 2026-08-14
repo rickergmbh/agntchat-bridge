@@ -1,7 +1,7 @@
 """Tests for bridge ResultPresentation parsing and delivery."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -91,14 +91,13 @@ async def test_send_parsed_presentations_preserves_dynamic_response_template_pay
         ],
     }
 
-    with patch("agent_bridge.enrich_presentation_photos", new=AsyncMock()):
-        sent = await send_parsed_presentations(
-            executor,
-            "conv-1",
-            [presentation],
-            correlation_id="corr-1",
-            last_seen_message_id="msg-1",
-        )
+    sent = await send_parsed_presentations(
+        executor,
+        "conv-1",
+        [presentation],
+        correlation_id="corr-1",
+        last_seen_message_id="msg-1",
+    )
 
     assert sent == 1
     executor.send_message.assert_awaited_once_with(

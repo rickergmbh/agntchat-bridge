@@ -3881,9 +3881,21 @@ def run_single_agent(
 
         logger.info("[%s] === Handling task: %s (id=%s) ===", executor_key, task.title, task.task_id)
 
+        task_source_message_id = task_meta.get("source_message_id") or task_meta.get("sourceMessageId") or ""
+
         # --- Compound task ---
         execution_plan = task_meta.get("execution_plan")
         if execution_plan and execution_plan.get("steps"):
+            # Compound steps run chat_with_tools; on CLI backends the MCP
+            # server reads its routing context from the last set_mcp_context
+            # call, which on a warm process still points at the PREVIOUS
+            # turn's conversation/task. Anchor it to this task before
+            # dispatching (a fresh process otherwise had no context at all).
+            _update_mcp_context(
+                task.work_conversation_id or task.conversation_id or "",
+                task.task_id or "",
+                task_source_message_id,
+            )
             # Build prompt from directives
             task_prompt = _compose_system_prompt(task_directives)
             return await _handle_compound_task(
@@ -3999,8 +4011,6 @@ def run_single_agent(
 
         logger.info("[%s] Calling %s for task (with %d context messages, mode=%s)",
                      executor_key, backend.model_name, len(chat_messages) - 1, execution_mode)
-
-        task_source_message_id = task_meta.get("source_message_id") or task_meta.get("sourceMessageId") or ""
 
         _update_mcp_context(
             task.work_conversation_id or task.conversation_id or "",

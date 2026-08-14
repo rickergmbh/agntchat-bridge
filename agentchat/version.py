@@ -75,4 +75,4 @@ different things.
 # the semaphore), the dead batch_complete_tasks stub was deleted, and
 # heartbeat/location failure paths now log. Bridge-internal; not gated on
 # by the server, safe to roll in either order.
-BRIDGE_VERSION = "2.7.2"
+BRIDGE_VERSION = "2.7.3"
