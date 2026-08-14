@@ -645,6 +645,18 @@ class ExecutorClient:
         """Transport-driven disconnect callback. Flips health flag; gateway loop reconnects."""
         self._ws_healthy = False
 
+    def _spawn_tracked(self, coro) -> None:
+        """Schedule a fire-and-forget handler with a strong reference held.
+
+        A bare ensure_future/create_task result with no reference can be
+        garbage-collected mid-await (e.g. while parked on
+        ``self._semaphore.acquire()``), silently dropping the event. Hold each
+        task in ``self._background_tasks`` until it completes.
+        """
+        t = asyncio.create_task(coro)
+        self._background_tasks.add(t)
+        t.add_done_callback(self._background_tasks.discard)
+
     def _ws_dispatch_event(self, topic: str, event: str, payload: dict) -> None:
         """Sync callback from PhoenixTransport. Schedules the async handler.
 
@@ -656,21 +668,21 @@ class ExecutorClient:
             return
 
         if event == "gateway_message":
-            # Signal-only payload ({} with no fields) is a legacy hint. Ignore it —
-            # if we bound executor_id we only expect full payloads here.
+            # Malformed payload (no id) — nothing dispatchable. The backend
+            # always sends full payloads; drop and ignore.
             if not payload or not payload.get("id"):
                 return
-            asyncio.ensure_future(self._handle_ws_message(payload))
+            self._spawn_tracked(self._handle_ws_message(payload))
 
         elif event == "gateway_task":
             if not payload or not payload.get("id"):
                 return
-            asyncio.ensure_future(self._handle_ws_task(payload))
+            self._spawn_tracked(self._handle_ws_task(payload))
 
         elif event == "gateway_scope_request":
             if not payload or not payload.get("id"):
                 return
-            asyncio.ensure_future(self._handle_ws_scope_request(payload))
+            self._spawn_tracked(self._handle_ws_scope_request(payload))
 
         elif event == "gateway_command":
             # Pending commands (shutdown, pause, etc.) used to be delivered
@@ -678,7 +690,7 @@ class ExecutorClient:
             # can be longer without delaying operator-issued commands.
             if not payload:
                 return
-            asyncio.ensure_future(self._handle_command(payload))
+            self._spawn_tracked(self._handle_command(payload))
 
     async def _handle_ws_message(self, payload: dict) -> None:
         try:
@@ -754,6 +766,7 @@ class ExecutorClient:
         import os
         import sys
 
+        consecutive_failures = 0
         while self._running:
             try:
                 await asyncio.sleep(self._heartbeat_interval)
@@ -786,13 +799,23 @@ class ExecutorClient:
                         },
                     )
                     logger.debug("Heartbeat sent for executor %s", self._executor_id)
+                    consecutive_failures = 0
 
                     # Check for pending commands (drained as a list)
                     if resp_data and isinstance(resp_data, dict):
                         for command in resp_data.get("commands") or []:
                             await self._handle_command(command)
-            except Exception:
-                logger.debug("Heartbeat failed, will retry next cycle")
+            except Exception as e:
+                consecutive_failures += 1
+                # A single blip is routine; a streak means the executor is
+                # about to be marked offline server-side — surface it.
+                if consecutive_failures >= 3:
+                    logger.warning(
+                        "Heartbeat failed %d times in a row (will retry next cycle): %s",
+                        consecutive_failures, e,
+                    )
+                else:
+                    logger.debug("Heartbeat failed, will retry next cycle: %s", e)
 
     async def _handle_command(self, command: dict) -> None:
         """Handle a command received from the backend."""
@@ -1000,9 +1023,10 @@ class ExecutorClient:
                     for k, v in result.items()
                     if k not in ("response", "summary", "silent")
                 }
-                # Tolerate the legacy shape: handlers that still return
-                # `{"summary": "..."}` get migrated to the new contract
-                # implicitly — that summary IS the response.
+                # Summary-only completions are a live handler contract, not a
+                # compat shim: compound-task and code_action results (and any
+                # turn whose remaining_text is empty) return {"summary": ...}
+                # with no "response" key — that summary IS the response.
                 if response_text is None and summary and not silent:
                     response_text = summary
             else:
@@ -2950,19 +2974,6 @@ class ExecutorClient:
     # ------------------------------------------------------------------
     # Batch Operations
     # ------------------------------------------------------------------
-
-    async def batch_complete_tasks(
-        self,
-        items: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        """Deprecated: batch task completion is no longer a gateway HTTP primitive.
-
-        Complete each task with `complete_task()` / MCP `complete_task` so the
-        response post and terminal status update stay atomic per task.
-        """
-        raise RuntimeError(
-            "batch_complete_tasks is deprecated; call complete_task/fail_task per task"
-        )
 
     async def batch_ack_messages(
         self,

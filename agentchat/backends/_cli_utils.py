@@ -188,26 +188,18 @@ def try_int(val: str | None) -> int | None:
 def find_sibling_script(filename: str) -> str | None:
     """Locate a script that ships alongside this package.
 
-    Checks the bridge install (`desktop/bridge/<filename>`), the repo's
-    top-level `scripts/` dir (for dev runs from a checkout), and CWD-relative
-    fallbacks (for `python -m` style invocations). Returns the realpath of
-    the first hit, or None if every candidate is missing.
+    The only canonical location is the bridge package root
+    (`<bridge>/<filename>`, i.e. two levels above this module). Returns the
+    realpath of the script, or None if it is missing.
 
     Callers that opt the user into a feature backed by a script MUST treat
     None as a hard error — silently no-op'ing the capability the user just
-    enabled is worse than failing fast with the candidate list logged.
+    enabled is worse than failing fast with the candidate path logged.
     """
     here = os.path.dirname(__file__)
-    candidates = [
-        os.path.join(here, "..", "..", filename),                                     # desktop/bridge/<file>
-        os.path.join(here, "..", "..", "..", "..", "scripts", filename),              # repo scripts/
-        os.path.join(os.getcwd(), "scripts", filename),
-        os.path.join(os.getcwd(), "..", "scripts", filename),
-    ]
-    for c in candidates:
-        p = os.path.realpath(c)
-        if os.path.isfile(p):
-            return p
+    p = os.path.realpath(os.path.join(here, "..", "..", filename))
+    if os.path.isfile(p):
+        return p
     return None
 
 

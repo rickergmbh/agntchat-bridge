@@ -287,20 +287,14 @@ class CodexCliBackend(ModelBackend):
 
     @staticmethod
     def _find_mcp_server() -> str | None:
-        """Locate the agentgram_mcp_server.py script (same lookup as claude_cli)."""
-        candidates = [
-            os.path.join(os.path.dirname(__file__), "..", "..", "agentgram_mcp_server.py"),
+        """Locate the canonical agentgram_mcp_server.py shipped in the bridge root."""
+        p = os.path.realpath(
             os.path.join(
-                os.path.dirname(__file__), "..", "..", "..", "..", "scripts",
-                "agentgram_mcp_server.py",
-            ),
-            os.path.join(os.getcwd(), "scripts", "agentgram_mcp_server.py"),
-            os.path.join(os.getcwd(), "..", "scripts", "agentgram_mcp_server.py"),
-        ]
-        for c in candidates:
-            p = os.path.realpath(c)
-            if os.path.isfile(p):
-                return p
+                os.path.dirname(__file__), "..", "..", "agentgram_mcp_server.py"
+            )
+        )
+        if os.path.isfile(p):
+            return p
         return None
 
     @property

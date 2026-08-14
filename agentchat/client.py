@@ -78,6 +78,7 @@ class AgentChatClient:
         self._heartbeat_task: asyncio.Task | None = None
         self._connected = False
         self._disconnect_event: asyncio.Event | None = None
+        self._background_tasks: set[asyncio.Task] = set()
 
         # Register transport callbacks once (idempotent, but only called here)
         self._transport.on_event(self._on_ws_event)
@@ -454,32 +455,43 @@ class AgentChatClient:
     # Internal: WebSocket event dispatch
     # ------------------------------------------------------------------
 
+    def _spawn_tracked(self, coro) -> None:
+        """Schedule a fire-and-forget handler with a strong reference held.
+
+        A bare ensure_future/create_task result with no reference can be
+        garbage-collected mid-await, silently dropping the event. Hold each
+        task in ``self._background_tasks`` until it completes.
+        """
+        t = asyncio.create_task(coro)
+        self._background_tasks.add(t)
+        t.add_done_callback(self._background_tasks.discard)
+
     def _on_ws_event(self, topic: str, event: str, payload: dict) -> None:
         """Synchronous callback from transport — schedule async handlers."""
         if event == "new_message" and topic.startswith("conversation:"):
             conv_id = topic.split(":", 1)[1]
-            asyncio.ensure_future(self._handle_message(conv_id, payload))
+            self._spawn_tracked(self._handle_message(conv_id, payload))
 
         elif event == "conversation_updated" and topic.startswith("user:"):
             conv_id = payload.get("conversationId")
             if conv_id:
-                asyncio.ensure_future(self._join_conv(conv_id))
+                self._spawn_tracked(self._join_conv(conv_id))
                 last_msg = payload.get("lastMessage")
                 if last_msg:
-                    asyncio.ensure_future(self._handle_message(conv_id, last_msg))
+                    self._spawn_tracked(self._handle_message(conv_id, last_msg))
 
         elif event == "new_conversation" and topic.startswith("user:"):
             conv = payload.get("conversation", {})
             conv_id = conv.get("id")
             if conv_id:
-                asyncio.ensure_future(self._join_conv(conv_id))
-                asyncio.ensure_future(self._dispatch_conversation(conv))
+                self._spawn_tracked(self._join_conv(conv_id))
+                self._spawn_tracked(self._dispatch_conversation(conv))
 
         elif event in ("task_assigned", "task_created", "task_updated", "task_completed") and topic.startswith("user:"):
-            asyncio.ensure_future(self._dispatch_task(payload))
+            self._spawn_tracked(self._dispatch_task(payload))
 
         elif event == "task_reminder" and topic.startswith("user:"):
-            asyncio.ensure_future(self._dispatch_task_reminder(payload))
+            self._spawn_tracked(self._dispatch_task_reminder(payload))
 
     def _on_transport_disconnect(self) -> None:
         """Called by transport when the WS connection drops — wake up reconnect loop."""

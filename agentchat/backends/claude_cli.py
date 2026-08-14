@@ -1500,10 +1500,22 @@ class ClaudeCliBackend(ModelBackend):
         turn guardrails cannot be enforced here; the server instead injects a
         "don't repeat failing/no-progress calls" directive into the system prompt.
 
-        Falls back to the legacy <tool_call> XML loop when MCP is not available;
-        guardrails ARE enforced on that path.
+        A missing agentgram_mcp_server.py is a hard error — tool use silently
+        degrading to the XML loop would hide a broken install (see
+        find_sibling_script's contract in _cli_utils.py). The XML loop below is
+        only reached when the script IS present but no MCP context was set for
+        this invocation (e.g. compound-task steps, which call chat_with_tools
+        without set_mcp_context); guardrails ARE enforced on that path.
         """
         from ..tools.guardrails import ToolCallGuardrail
+
+        if not self._mcp_server_script:
+            raise RuntimeError(
+                "agentgram_mcp_server.py not found in the bridge package root — "
+                "claude_cli tool use requires the MCP server script and must not "
+                "silently degrade to the legacy XML loop. Reinstall/update the "
+                "bridge so <bridge>/agentgram_mcp_server.py exists."
+            )
 
         guardrail = ToolCallGuardrail(guardrail_config)
         # --- MCP path: single invocation, CLI handles tool loop ---
@@ -1582,7 +1594,9 @@ class ClaudeCliBackend(ModelBackend):
                 stop_reason="end_turn",
             )
 
-        # --- Legacy path: iterative <tool_call> XML loop ---
+        # --- No-MCP-context path: iterative <tool_call> XML loop ---
+        # Reached only when set_mcp_context wasn't called for this invocation
+        # (compound-task steps); the script itself is guaranteed present above.
         tool_prompt = _build_tool_prompt(tools)
         full_system = (system_prompt + "\n" + tool_prompt) if tool_prompt else system_prompt
 

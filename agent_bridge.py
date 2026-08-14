@@ -2346,6 +2346,13 @@ def make_progress_callback(
                         _task_terminal = True
                         logger.debug("Heartbeat stopping — task %s is terminal", queued_task_id)
                         return
+                    # Non-terminal failures (timeouts, 5xx, network blips) are
+                    # retried next cycle — but leave a trace instead of
+                    # swallowing them silently.
+                    logger.debug(
+                        "Progress heartbeat for task %s failed (will retry): %s",
+                        queued_task_id, e,
+                    )
 
     def _ensure_heartbeat() -> None:
         nonlocal _heartbeat_task
@@ -3479,8 +3486,8 @@ def run_single_agent(
                 if loc.get("timestamp"):
                     ctx += f", updated={loc['timestamp']}"
                 return ctx
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Live location fetch failed (context omitted): %s", e)
         return ""
 
     # Per-conversation directive cache. Keyed by conversation_id.

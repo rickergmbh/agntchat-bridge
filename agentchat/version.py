@@ -68,4 +68,11 @@ different things.
 # online and kept getting handed tasks. Structural probe only (no network,
 # so an instance-role-only machine now reads unauthenticated — the safe
 # direction). Not gated on by the server; the roll is safe in either order.
-BRIDGE_VERSION = "2.7.1"
+# 2.7.2 — audit hardening: missing agentgram_mcp_server.py is a hard error
+# for claude_cli tool use (no silent XML-loop degrade), the stale repo
+# scripts/ fallback paths were removed from every script lookup, WS event
+# handlers hold strong task refs (GC could silently drop events parked on
+# the semaphore), the dead batch_complete_tasks stub was deleted, and
+# heartbeat/location failure paths now log. Bridge-internal; not gated on
+# by the server, safe to roll in either order.
+BRIDGE_VERSION = "2.7.2"
