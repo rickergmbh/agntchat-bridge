@@ -90,4 +90,9 @@ different things.
 # errorMessages.authFailure copy instead of the generic fallback. Pairs
 # with the backend adding that key; older backends fall back to a built-in
 # string, safe to roll in either order.
-BRIDGE_VERSION = "2.7.5"
+# 2.7.6 — authFailure replies carry metadata.errorKind="auth_failure" so
+# clients can render a one-click fix (the desktop's "Sign in to Claude"
+# button) under the error bubble instead of leaving the user to parse the
+# copy. Pure metadata addition; clients that don't know the key ignore it
+# and the server stores it as-is, safe to roll in either order.
+BRIDGE_VERSION = "2.7.6"

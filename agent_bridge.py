@@ -4621,6 +4621,7 @@ def run_single_agent(
             }
             tool_exec = ToolExecutor(executor, context=tool_context, resolved_tools=resolved_tools)
             _tu_failed = False
+            _auth_failed = False
             # True when the model deliberately ended its turn via the `end_turn`
             # tool. That is a CHOSEN silence (e.g. a peer owns the exchange and
             # this agent stepped back), not a blank failure — so it must NOT
@@ -4725,6 +4726,11 @@ def run_single_agent(
             if effective_backend:
                 msg_meta_out["backend"] = effective_backend
             msg_meta_out["stream_id"] = _msg_stream_id
+            if _tu_failed and _auth_failed:
+                # Marks the server-owned authFailure copy so clients can
+                # render a one-click fix (desktop's "Sign in to Claude"
+                # button) under the error bubble.
+                msg_meta_out["errorKind"] = "auth_failure"
 
             # --- DM routing (tool_use mode) ---
             # The model can emit <dm target="..." topic="...">…</dm> tags in
@@ -4852,6 +4858,7 @@ def run_single_agent(
 
         if execution_mode == "code_action":
             _ca_failed = False
+            _auth_failed = False
             try:
                 result = await backend.chat(msg_prompt, chat_messages)
             except BackendAuthError:
@@ -4894,10 +4901,13 @@ def run_single_agent(
                 msg_meta_out["model"] = result.model
             if effective_backend:
                 msg_meta_out["backend"] = effective_backend
+            if _ca_failed and _auth_failed:
+                msg_meta_out["errorKind"] = "auth_failure"
             return {"content": reply, "metadata": msg_meta_out} if msg_meta_out else reply
 
         # --- Single-shot mode ---
         _self_task_failed = False
+        _auth_failed = False
         try:
             result = await backend.chat(msg_prompt, chat_messages, on_progress=_stream_cb)
         except BackendAuthError:
@@ -5061,6 +5071,8 @@ def run_single_agent(
             if effective_backend:
                 msg_meta_out["backend"] = effective_backend
             msg_meta_out["stream_id"] = _msg_stream_id
+            if _self_task_failed and _auth_failed:
+                msg_meta_out["errorKind"] = "auth_failure"
 
             # Send reply explicitly so we can create tasks AFTER it appears in the timeline.
             # Posted RAW and ONCE: splitting, pacing, humanlike_bubble metadata,
