@@ -100,6 +100,20 @@ _AUTH_FAILURE_RE = re.compile(
     r"|credit\s+balance\s+is\s+too\s+low"
     r"|subscription\s+(expired|required|inactive)"
     r"|awsauthrefresh"
+    # Bedrock/Vertex route auth through the cloud provider's own SSO/ADC
+    # chain rather than `claude login` — a stale AWS SSO session or expired
+    # GCP application-default credentials surface here as the CLI's plain
+    # "API Error: Token is expired..." text, not any of the Anthropic-specific
+    # phrasings above. Missed entirely before this (Jarvis/Bedrock incident,
+    # Aug 2026): classified as a generic failure, health never flipped, and
+    # the user saw only "I ran into an issue" while the CLI's own error text
+    # — which already names the exact fix ("run 'aws sso login'...") — was
+    # discarded.
+    r"|token\s+is\s+expired"
+    r"|aws\s+sso\s+login"
+    r"|sso\s+session"
+    r"|gcloud\s+auth\s+(login|application-default)"
+    r"|application\s+default\s+credentials"
     r"|\b401\b)",
     re.IGNORECASE,
 )
@@ -1135,6 +1149,19 @@ class ClaudeCliBackend(ModelBackend):
             # Fail open — never mark a working agent broken because a probe
             # we invented couldn't run.
             return True
+
+    @property
+    def cli_connection(self) -> str:
+        """Which credential chain this backend authenticates through.
+
+        Mirrors the default applied throughout preflight/env setup
+        (``self._cli_connection or "subscription"``) so callers never see the
+        unset `None` case. Used by the executor to pick connection-appropriate
+        remedy copy for an auth failure — "sign in to Claude" is actively
+        wrong advice for a bedrock/vertex agent, whose fix is a cloud SSO/ADC
+        refresh instead.
+        """
+        return self._cli_connection or "subscription"
 
     def _classify_failure(self, detail: str, returncode: int) -> RuntimeError:
         """Turn a CLI failure into the right exception, and record health.

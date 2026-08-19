@@ -202,15 +202,37 @@ logging.basicConfig(
 logger = logging.getLogger("agent_bridge")
 
 
-def _model_failure_reply(error_msgs: dict, auth_failed: bool) -> str:
+def _model_failure_reply(
+    error_msgs: dict,
+    auth_failed: bool,
+    cli_connection: str | None = None,
+    auth_detail: str | None = None,
+) -> str:
     """User-facing text for a failed model turn — server copy first.
 
     Credential failures get their own message: they are the one turn failure
     the user can fix themselves, and hiding them behind the generic apology
     left users retrying forever while the real cause ("Failed to
     authenticate") sat in this log file.
+
+    `cli_connection` branches the remedy: "sign in to Claude" only applies to
+    the default subscription/API-key connection. A bedrock/vertex agent
+    authenticates through the cloud provider's own SSO/ADC chain instead, so
+    that copy is actively wrong for it — surface the CLI's own error text
+    instead (it already names the exact fix, e.g. "run 'aws sso login'
+    --profile ..."), rather than the generic apology or a misleading button.
+    Missed entirely on first contact (Jarvis/Bedrock, Aug 2026): the AWS SSO
+    expiry wasn't even classified as an auth failure, so this branch never
+    ran and the user saw only the generic apology.
     """
     if auth_failed:
+        if cli_connection in ("bedrock", "vertex"):
+            lead_in = error_msgs.get(
+                "authFailureCloud",
+                "🔒 I couldn't reach my model — the cloud credentials on the machine "
+                "running me need to be refreshed there, then send me another message.",
+            )
+            return f"{lead_in}\n\n{auth_detail}" if auth_detail else lead_in
         return error_msgs.get(
             "authFailure",
             "I couldn't reach my model — the Claude sign-in on the machine running me "
@@ -4622,6 +4644,7 @@ def run_single_agent(
             tool_exec = ToolExecutor(executor, context=tool_context, resolved_tools=resolved_tools)
             _tu_failed = False
             _auth_failed = False
+            _auth_detail = None
             # True when the model deliberately ended its turn via the `end_turn`
             # tool. That is a CHOSEN silence (e.g. a peer owns the exchange and
             # this agent stepped back), not a blank failure — so it must NOT
@@ -4637,10 +4660,11 @@ def run_single_agent(
                     guardrail_config=_guardrail_config,
                     compaction_config=_compaction_config,
                 )
-            except BackendAuthError:
+            except BackendAuthError as e:
                 logger.exception("[%s] Model call failed (tool_use): credential rejected", executor_key)
                 result = None
                 _auth_failed = True
+                _auth_detail = str(e)
                 await _stream_cb.cancel()
             except Exception:
                 logger.exception("[%s] Model call failed (tool_use)", executor_key)
@@ -4650,7 +4674,11 @@ def run_single_agent(
 
             if result is None:
                 _tu_failed = True
-                reply = _model_failure_reply(error_msgs, _auth_failed)
+                reply = _model_failure_reply(
+                    error_msgs, _auth_failed,
+                    cli_connection=getattr(backend, "cli_connection", None),
+                    auth_detail=_auth_detail,
+                )
             else:
                 _cli_internal = bool((result.metadata or {}).get("cli_internal_loop"))
                 _loop_label = "CLI-internal loop" if _cli_internal else "outer loop"
@@ -4859,12 +4887,14 @@ def run_single_agent(
         if execution_mode == "code_action":
             _ca_failed = False
             _auth_failed = False
+            _auth_detail = None
             try:
                 result = await backend.chat(msg_prompt, chat_messages)
-            except BackendAuthError:
+            except BackendAuthError as e:
                 logger.exception("[%s] Model call failed (code_action): credential rejected", executor_key)
                 result = None
                 _auth_failed = True
+                _auth_detail = str(e)
             except Exception:
                 logger.exception("[%s] Model call failed (code_action)", executor_key)
                 result = None
@@ -4872,7 +4902,11 @@ def run_single_agent(
 
             if result is None:
                 _ca_failed = True
-                reply = _model_failure_reply(error_msgs, _auth_failed)
+                reply = _model_failure_reply(
+                    error_msgs, _auth_failed,
+                    cli_connection=getattr(backend, "cli_connection", None),
+                    auth_detail=_auth_detail,
+                )
             else:
                 code = extract_python_code(result.text)
 
@@ -4908,12 +4942,14 @@ def run_single_agent(
         # --- Single-shot mode ---
         _self_task_failed = False
         _auth_failed = False
+        _auth_detail = None
         try:
             result = await backend.chat(msg_prompt, chat_messages, on_progress=_stream_cb)
-        except BackendAuthError:
+        except BackendAuthError as e:
             logger.exception("[%s] Model call failed: credential rejected", executor_key)
             result = None
             _auth_failed = True
+            _auth_detail = str(e)
             await _stream_cb.cancel()
         except Exception:
             logger.exception("[%s] Model call failed", executor_key)
@@ -4928,7 +4964,11 @@ def run_single_agent(
 
         if not reply and result is None:
             _self_task_failed = True
-            reply = _model_failure_reply(error_msgs, _auth_failed)
+            reply = _model_failure_reply(
+                error_msgs, _auth_failed,
+                cli_connection=getattr(backend, "cli_connection", None),
+                auth_detail=_auth_detail,
+            )
         elif not reply:
             if human_expects_reply:
                 # Sole agent in a 1-human conversation (or explicitly addressed)

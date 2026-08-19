@@ -191,6 +191,14 @@ def test_unparseable_config_file_fails_open(bare_machine, cli_present, no_claude
         "OAuth session expired",
         "OAuth token revoked",
         "Invalid API key · Please run /login",
+        # Bedrock/Vertex authenticate through the cloud provider's own
+        # SSO/ADC chain, not `claude login` — the CLI's plain-English error
+        # text for an expired session, verbatim from the Jarvis/Bedrock
+        # incident (Aug 2026) that slipped through as a generic failure.
+        "API Error: Token is expired. To refresh this SSO session run "
+        "'aws sso login' with the corresponding profile.",
+        "gcloud auth application-default login",
+        "Reauthentication is needed. Please run `gcloud auth login`",
     ],
 )
 def test_auth_shaped_failures_are_classified(text):
@@ -200,6 +208,11 @@ def test_auth_shaped_failures_are_classified(text):
 def test_ordinary_failures_are_not_auth():
     assert _is_auth_failure("Model overloaded, please retry") is False
     assert _is_auth_failure(None) is False
+
+
+def test_cli_connection_property_defaults_to_subscription():
+    assert ClaudeCliBackend(cli_connection=None).cli_connection == "subscription"
+    assert ClaudeCliBackend(cli_connection="bedrock").cli_connection == "bedrock"
 
 
 def test_credentials_file_still_counts(bare_machine, cli_present, no_claude_seat, monkeypatch):

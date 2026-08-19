@@ -95,4 +95,19 @@ different things.
 # button) under the error bubble instead of leaving the user to parse the
 # copy. Pure metadata addition; clients that don't know the key ignore it
 # and the server stores it as-is, safe to roll in either order.
-BRIDGE_VERSION = "2.7.6"
+# 2.7.7 — bedrock/vertex auth failures are no longer silent. Two bugs, one
+# incident (Jarvis/Bedrock, Aug 2026): an expired AWS SSO session's error
+# text ("Token is expired. To refresh this SSO session run 'aws sso login'
+# ...") didn't match _AUTH_FAILURE_RE at all, so it fell through to a plain
+# RuntimeError — health never flipped, and the turn eventually posted the
+# generic "I ran into an issue" apology ~3 minutes later (the CLI's own AWS
+# auth-refresh timeout) with zero indication of what actually broke. Even
+# once classified correctly, the existing authFailure copy ("sign in to
+# Claude") is wrong for a cloud-authenticated agent. Fixed: the regex learns
+# AWS SSO / GCP ADC phrasings, and _model_failure_reply now branches on the
+# backend's cli_connection — subscription keeps the existing copy+button,
+# bedrock/vertex get the new errorMessages.authFailureCloud copy with the
+# CLI's own (already-correct) remedy text appended verbatim. Pairs with the
+# backend adding that key; older backends fall back to a built-in string,
+# safe to roll in either order.
+BRIDGE_VERSION = "2.7.7"
