@@ -75,4 +75,11 @@ different things.
 # the semaphore), the dead batch_complete_tasks stub was deleted, and
 # heartbeat/location failure paths now log. Bridge-internal; not gated on
 # by the server, safe to roll in either order.
-BRIDGE_VERSION = "2.7.3"
+# 2.7.4 — subscription preflight no longer counts a bare ~/.claude.json as
+# a credential: it's the CLI's config file, written on any first launch,
+# so a fresh machine that never ran `claude login` read `ok` forever and
+# the first-run onboarding "greeting" step stalled with no warning. The
+# probe now looks for account markers (oauthAccount / primaryApiKey keys
+# only, never values) and recognises CLAUDE_CODE_OAUTH_TOKEN. Not gated on
+# by the server; safe to roll in either order.
+BRIDGE_VERSION = "2.7.4"

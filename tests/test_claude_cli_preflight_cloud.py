@@ -126,17 +126,61 @@ def test_vertex_with_adc_reports_ok(bare_machine, cli_present, monkeypatch):
     assert ClaudeCliBackend(cli_connection="vertex").preflight().status == "ok"
 
 
-def test_subscription_path_is_unchanged(bare_machine, cli_present, monkeypatch):
+@pytest.fixture
+def no_claude_seat(bare_machine, monkeypatch):
+    """Strip every subscription credential source preflight recognises."""
+    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(bare_machine / "empty-claude-dir"))
+    monkeypatch.setattr("agentchat.backends.claude_cli.sys.platform", "linux")
+
+
+def test_subscription_path_is_unchanged(bare_machine, cli_present, no_claude_seat):
     # A bare machine has no Claude seat either — the seat probe still owns
     # this branch and must keep reporting it.
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(bare_machine / "empty-claude-dir"))
-    monkeypatch.setattr(
-        "agentchat.backends.claude_cli.sys.platform", "linux"
-    )
-
     health = ClaudeCliBackend(cli_connection="subscription").preflight()
 
     assert health.status == "unauthenticated"
     assert "Claude account" in health.detail
+
+
+def test_config_file_without_login_markers_is_not_a_credential(
+    bare_machine, cli_present, no_claude_seat
+):
+    # ~/.claude.json exists on ANY machine that ever launched the CLI,
+    # logged in or not. THE first-run onboarding stall: fresh machine, no
+    # login, preflight read green off this file, agent never answered.
+    (bare_machine / ".claude.json").write_text('{"hasCompletedOnboarding": true}')
+
+    health = ClaudeCliBackend(cli_connection="subscription").preflight()
+
+    assert health.status == "unauthenticated"
+
+
+def test_oauth_account_marker_in_config_counts(bare_machine, cli_present, no_claude_seat):
+    (bare_machine / ".claude.json").write_text(
+        '{"oauthAccount": {"emailAddress": "u@example.com"}}'
+    )
+
+    assert ClaudeCliBackend(cli_connection="subscription").preflight().status == "ok"
+
+
+def test_stored_api_key_marker_in_config_counts(bare_machine, cli_present, no_claude_seat):
+    (bare_machine / ".claude.json").write_text('{"primaryApiKey": "sk-ant-..."}')
+
+    assert ClaudeCliBackend(cli_connection="subscription").preflight().status == "ok"
+
+
+def test_unparseable_config_file_fails_open(bare_machine, cli_present, no_claude_seat):
+    (bare_machine / ".claude.json").write_text("not json {{{")
+
+    assert ClaudeCliBackend(cli_connection="subscription").preflight().status == "ok"
+
+
+def test_credentials_file_still_counts(bare_machine, cli_present, no_claude_seat, monkeypatch):
+    claude_dir = bare_machine / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / ".credentials.json").write_text("{}")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_dir))
+
+    assert ClaudeCliBackend(cli_connection="subscription").preflight().status == "ok"

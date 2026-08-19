@@ -1059,7 +1059,11 @@ class ClaudeCliBackend(ModelBackend):
         the presence of the config dir's credential file as sufficient
         without reading it (we never want this process touching the token).
         """
-        if os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN"):
+        if (
+            os.getenv("ANTHROPIC_API_KEY")
+            or os.getenv("ANTHROPIC_AUTH_TOKEN")
+            or os.getenv("CLAUDE_CODE_OAUTH_TOKEN")
+        ):
             return True
 
         config_dir = os.getenv("CLAUDE_CONFIG_DIR") or os.path.join(
@@ -1068,10 +1072,17 @@ class ClaudeCliBackend(ModelBackend):
         candidates = [
             os.path.join(config_dir, ".credentials.json"),
             os.path.join(config_dir, "credentials.json"),
-            # Older CLI versions kept the login in the top-level config file.
-            os.path.join(os.path.expanduser("~"), ".claude.json"),
         ]
         if any(os.path.isfile(p) for p in candidates):
+            return True
+
+        # ~/.claude.json is the CLI's CONFIG file, written on any first run —
+        # logged in or not. Treating its mere existence as a credential made
+        # preflight green on exactly the machines this probe exists for (the
+        # first-run onboarding stall: fresh install, CLI launched once, never
+        # logged in). A signed-in account leaves markers in it; check the
+        # keys only, never the values.
+        if self._config_file_shows_login():
             return True
 
         # macOS keeps the subscription token in the Keychain rather than on
@@ -1082,6 +1093,29 @@ class ClaudeCliBackend(ModelBackend):
             return self._keychain_login_present()
 
         return False
+
+    @staticmethod
+    def _config_file_shows_login() -> bool:
+        """Does ~/.claude.json carry a signed-in account marker?
+
+        `oauthAccount` is the subscription login; `primaryApiKey` is a
+        stored API-key config (older CLIs kept the login here outright —
+        both spellings cover that era too). A file that exists but can't be
+        parsed is ambiguous: fail open, matching the keychain probe — never
+        mark a working agent broken because a probe we invented choked.
+        A missing file is not ambiguous and counts as no credential.
+        """
+        path = os.path.join(os.path.expanduser("~"), ".claude.json")
+        if not os.path.isfile(path):
+            return False
+        try:
+            with open(path, encoding="utf-8") as f:
+                config = json.load(f)
+        except (OSError, ValueError):
+            return True
+        if not isinstance(config, dict):
+            return True
+        return bool(config.get("oauthAccount") or config.get("primaryApiKey"))
 
     @staticmethod
     def _keychain_login_present() -> bool:
