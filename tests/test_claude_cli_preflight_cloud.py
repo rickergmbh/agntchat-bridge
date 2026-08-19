@@ -17,6 +17,7 @@ from agentchat.backends.claude_cli import (
     ClaudeCliBackend,
     _has_aws_credentials,
     _has_gcp_credentials,
+    _is_auth_failure,
 )
 
 AWS_ENV_VARS = (
@@ -175,6 +176,30 @@ def test_unparseable_config_file_fails_open(bare_machine, cli_present, no_claude
     (bare_machine / ".claude.json").write_text("not json {{{")
 
     assert ClaudeCliBackend(cli_connection="subscription").preflight().status == "ok"
+
+
+# --- turn-time auth classification -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # The CLI's expired-login phrasing, verbatim — slipped through as a
+        # generic failure (first-run greeting, Aug 2026) because the regex
+        # only knew "authentication failed" and "oauth TOKEN expired".
+        "Failed to authenticate: OAuth session expired and could not be refreshed",
+        "OAuth session expired",
+        "OAuth token revoked",
+        "Invalid API key · Please run /login",
+    ],
+)
+def test_auth_shaped_failures_are_classified(text):
+    assert _is_auth_failure(text) is True
+
+
+def test_ordinary_failures_are_not_auth():
+    assert _is_auth_failure("Model overloaded, please retry") is False
+    assert _is_auth_failure(None) is False
 
 
 def test_credentials_file_still_counts(bare_machine, cli_present, no_claude_seat, monkeypatch):

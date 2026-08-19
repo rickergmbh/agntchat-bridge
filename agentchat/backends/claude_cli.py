@@ -90,8 +90,13 @@ _AUTH_FAILURE_RE = re.compile(
     r"|no\s+credentials?\s+found"
     r"|could\s+not\s+load\s+credentials"
     r"|authentication[\s_-]*(failed|error|required)"
+    # "Failed to authenticate: OAuth session expired and could not be
+    # refreshed" — the CLI's expired-login phrasing (both halves match, added
+    # after it slipped through as a generic failure: first-run greeting,
+    # Aug 2026).
+    r"|failed\s+to\s+authenticate"
     r"|unauthorized"
-    r"|oauth[\s_-]*token[\s_-]*(expired|invalid|revoked)"
+    r"|oauth[\s_-]*(token|session)[\s_-]*(expired|invalid|revoked)"
     r"|credit\s+balance\s+is\s+too\s+low"
     r"|subscription\s+(expired|required|inactive)"
     r"|awsauthrefresh"

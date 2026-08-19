@@ -71,7 +71,12 @@ import time as _time  # noqa: E402
 
 from agentchat.auth import TokenManager  # noqa: E402
 from agentchat.errors import AgentChatError, AuthError, StaleContextError  # noqa: E402
-from agentchat.backends import MODEL_OVERRIDE, ChatMessage, create_backend  # noqa: E402
+from agentchat.backends import (  # noqa: E402
+    MODEL_OVERRIDE,
+    BackendAuthError,
+    ChatMessage,
+    create_backend,
+)
 from agentchat.executor import (  # noqa: E402
     CURRENT_TASK_ID,
     ExecutorClient,
@@ -195,6 +200,26 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("agent_bridge")
+
+
+def _model_failure_reply(error_msgs: dict, auth_failed: bool) -> str:
+    """User-facing text for a failed model turn — server copy first.
+
+    Credential failures get their own message: they are the one turn failure
+    the user can fix themselves, and hiding them behind the generic apology
+    left users retrying forever while the real cause ("Failed to
+    authenticate") sat in this log file.
+    """
+    if auth_failed:
+        return error_msgs.get(
+            "authFailure",
+            "I couldn't reach my model — the Claude sign-in on the machine running me "
+            "is missing or expired. Sign in there again, then send me another message.",
+        )
+    return error_msgs.get(
+        "modelFailure",
+        "I ran into an issue processing that request. Let me know if you'd like me to try again.",
+    )
 
 # ---------------------------------------------------------------------------
 # Profile & config helpers
@@ -4611,15 +4636,20 @@ def run_single_agent(
                     guardrail_config=_guardrail_config,
                     compaction_config=_compaction_config,
                 )
+            except BackendAuthError:
+                logger.exception("[%s] Model call failed (tool_use): credential rejected", executor_key)
+                result = None
+                _auth_failed = True
+                await _stream_cb.cancel()
             except Exception:
                 logger.exception("[%s] Model call failed (tool_use)", executor_key)
                 result = None
+                _auth_failed = False
                 await _stream_cb.cancel()
 
             if result is None:
                 _tu_failed = True
-                reply = error_msgs.get("modelFailure",
-                    "I ran into an issue processing that request. Let me know if you'd like me to try again.")
+                reply = _model_failure_reply(error_msgs, _auth_failed)
             else:
                 _cli_internal = bool((result.metadata or {}).get("cli_internal_loop"))
                 _loop_label = "CLI-internal loop" if _cli_internal else "outer loop"
@@ -4824,14 +4854,18 @@ def run_single_agent(
             _ca_failed = False
             try:
                 result = await backend.chat(msg_prompt, chat_messages)
+            except BackendAuthError:
+                logger.exception("[%s] Model call failed (code_action): credential rejected", executor_key)
+                result = None
+                _auth_failed = True
             except Exception:
                 logger.exception("[%s] Model call failed (code_action)", executor_key)
                 result = None
+                _auth_failed = False
 
             if result is None:
                 _ca_failed = True
-                reply = error_msgs.get("modelFailure",
-                    "I ran into an issue processing that request. Let me know if you'd like me to try again.")
+                reply = _model_failure_reply(error_msgs, _auth_failed)
             else:
                 code = extract_python_code(result.text)
 
@@ -4866,9 +4900,15 @@ def run_single_agent(
         _self_task_failed = False
         try:
             result = await backend.chat(msg_prompt, chat_messages, on_progress=_stream_cb)
+        except BackendAuthError:
+            logger.exception("[%s] Model call failed: credential rejected", executor_key)
+            result = None
+            _auth_failed = True
+            await _stream_cb.cancel()
         except Exception:
             logger.exception("[%s] Model call failed", executor_key)
             result = None
+            _auth_failed = False
             await _stream_cb.cancel()
 
         if result is not None:
@@ -4878,8 +4918,7 @@ def run_single_agent(
 
         if not reply and result is None:
             _self_task_failed = True
-            reply = error_msgs.get("modelFailure",
-                "I ran into an issue processing that request. Let me know if you'd like me to try again.")
+            reply = _model_failure_reply(error_msgs, _auth_failed)
         elif not reply:
             if human_expects_reply:
                 # Sole agent in a 1-human conversation (or explicitly addressed)

@@ -82,4 +82,12 @@ different things.
 # probe now looks for account markers (oauthAccount / primaryApiKey keys
 # only, never values) and recognises CLAUDE_CODE_OAUTH_TOKEN. Not gated on
 # by the server; safe to roll in either order.
-BRIDGE_VERSION = "2.7.4"
+# 2.7.5 — turn-time auth failures reach the user: _AUTH_FAILURE_RE learns
+# the CLI's "Failed to authenticate" / "OAuth session expired" phrasings
+# (previously only "authentication failed" / "oauth token expired", so an
+# expired login posted the generic modelFailure apology and never flipped
+# health), and BackendAuthError turns now reply with the server's
+# errorMessages.authFailure copy instead of the generic fallback. Pairs
+# with the backend adding that key; older backends fall back to a built-in
+# string, safe to roll in either order.
+BRIDGE_VERSION = "2.7.5"
