@@ -198,6 +198,35 @@ class ToolExecutor:
         param_names = set(schema.get("properties", {}).keys())
         executor_method = tool_def.get("executorMethod", tool_def.get("executor_method", tool_name))
 
+        # send_message is deliberately EXCLUDED from conversation_id
+        # auto-injection. For lifecycle verbs (create_task, complete_thread,
+        # report_progress) a guessed conversation is recoverable; for visible
+        # message delivery it silently reroutes a malformed model call into
+        # whatever conversation the bridge happens to be processing — the
+        # 2026-08-25 incident where a send_message call with placeholder args
+        # posted literal "placeholder" into a human DM. The backend's own MCP
+        # handler (Agentchat.MCP.Tools.Messaging.execute_send) errors on a
+        # missing conversation_id for the same reason; mirror it here with a
+        # structured error the model can act on.
+        if executor_method == "send_message" and _is_placeholder_conv_id(
+            arguments.get("conversation_id")
+        ):
+            logger.warning(
+                "[ToolExecutor] Rejected send_message with placeholder conversation_id=%r "
+                "(ctx_conv_id=%s) — visible delivery requires an explicit target",
+                arguments.get("conversation_id"),
+                str(self._context.get("conversation_id"))[:12],
+            )
+            return json.dumps({
+                "error": (
+                    "send_message requires an explicit conversation_id — the "
+                    "bridge will not infer a target for visible message "
+                    "delivery. Retry with the UUID of the conversation you "
+                    "intend to post to."
+                ),
+                "code": "missing_conversation_id",
+            })
+
         # Auto-inject conversation_id from context when the LLM didn't provide
         # a real value. The detector covers the common ways a model gestures at
         # "this conversation" without filling in the actual UUID:

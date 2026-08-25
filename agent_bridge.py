@@ -4653,6 +4653,14 @@ def run_single_agent(
             # no-op (conv 0634e889: the onboarding guide EndTurn'd to its
             # specialist, then leaked the fallback anyway).
             _tu_ended_turn = False
+            # True when the model delivered its reply via the send_message
+            # tool during this turn. Mirrors the task path's
+            # delivered_via_tool check: an empty text result after a
+            # send_message call is a COMPLETED delivery, not a blank failure
+            # — so it must not trip the empty-reply fallback either (which
+            # would post a duplicate/apology right after the tool-delivered
+            # reply).
+            _tu_sent_via_tool = False
             try:
                 result = await backend.chat_with_tools(
                     msg_prompt, chat_messages, _tool_defs, tool_exec,
@@ -4710,10 +4718,11 @@ def run_single_agent(
                 # result.tool_calls silently misses it — which is the exact
                 # path the hosted onboarding guide runs (conv 0634e889).
                 _tu_ended_turn = _tool_was_called(result, "end_turn")
+                _tu_sent_via_tool = _tool_was_called(result, "send_message")
 
                 reply = result.text[:MAX_REPLY_CHARS]
                 if not reply or not reply.strip():
-                    if human_expects_reply and not _tu_ended_turn:
+                    if human_expects_reply and not _tu_ended_turn and not _tu_sent_via_tool:
                         # The human directly engaged this agent (explicit
                         # address, or sole agent in a 1-human conversation like
                         # onboarding) but the model returned no text — usually a
@@ -4819,7 +4828,13 @@ def run_single_agent(
                 and not _tu_task_requests
                 and not tu_dm_blocks
             )
-            if nothing_emitted and human_expects_reply and not _tu_failed and not _tu_ended_turn:
+            if (
+                nothing_emitted
+                and human_expects_reply
+                and not _tu_failed
+                and not _tu_ended_turn
+                and not _tu_sent_via_tool
+            ):
                 logger.warning(
                     "[%s] tool_use reply parsed to empty with nothing emitted but "
                     "human expects a reply — using fallback",
