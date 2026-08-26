@@ -16,7 +16,14 @@ import re
 import time
 from typing import Any
 
-from . import TERMINAL_TOOL_NAMES, ChatMessage, ModelBackend, ModelResult, ToolCall
+from . import (
+    TERMINAL_TOOL_NAMES,
+    BackendRateLimitError,
+    ChatMessage,
+    ModelBackend,
+    ModelResult,
+    ToolCall,
+)
 
 logger = logging.getLogger("agentchat.backends.anthropic")
 
@@ -240,6 +247,27 @@ class AnthropicBackend(ModelBackend):
         out[-1] = last
         return out
 
+    def _raise_rate_limit(self, exc: Exception) -> None:
+        """Convert a 429/529 API error into BackendRateLimitError.
+
+        Marks health "rate_limited" so `/status` explains why, distinct from
+        a bare RuntimeError that would read as a generic/unknown failure.
+        `retry-after` (seconds, present on 429s) becomes a wall-clock reset
+        estimate — the same signal Claude Code's own CLI surfaces as
+        "Auto-resuming at HH:MM". 529 overload has no fixed window, so
+        reset_at stays None there rather than inventing one.
+        """
+        reset_at = None
+        response = getattr(exc, "response", None)
+        retry_after = response.headers.get("retry-after") if response is not None else None
+        if retry_after is not None:
+            try:
+                reset_at = time.time() + float(retry_after)
+            except ValueError:
+                reset_at = None
+        self._mark_health("rate_limited", str(exc)[:300])
+        raise BackendRateLimitError(f"Anthropic API rate limit: {exc}", reset_at=reset_at) from exc
+
     @staticmethod
     def _usage_dict(usage: Any) -> dict[str, int]:
         """Extract token usage including prompt-cache fields.
@@ -288,6 +316,12 @@ class AnthropicBackend(ModelBackend):
             raise TimeoutError(
                 f"Anthropic quick API timed out after {elapsed:.0f}s"
             )
+        except self._anthropic.RateLimitError as e:
+            self._raise_rate_limit(e)
+        except self._anthropic.APIStatusError as e:
+            if getattr(e, "status_code", None) == 529:
+                self._raise_rate_limit(e)
+            raise
 
         elapsed = time.monotonic() - start
         text = response.content[0].text if response.content else ""
@@ -314,6 +348,12 @@ class AnthropicBackend(ModelBackend):
             raise TimeoutError(
                 f"Anthropic API timed out after {elapsed:.0f}s"
             )
+        except self._anthropic.RateLimitError as e:
+            self._raise_rate_limit(e)
+        except self._anthropic.APIStatusError as e:
+            if getattr(e, "status_code", None) == 529:
+                self._raise_rate_limit(e)
+            raise
 
         elapsed = time.monotonic() - start
         text = response.content[0].text if response.content else ""
@@ -368,6 +408,12 @@ class AnthropicBackend(ModelBackend):
             raise TimeoutError(
                 f"Anthropic API timed out after {elapsed:.0f}s"
             )
+        except self._anthropic.RateLimitError as e:
+            self._raise_rate_limit(e)
+        except self._anthropic.APIStatusError as e:
+            if getattr(e, "status_code", None) == 529:
+                self._raise_rate_limit(e)
+            raise
 
         elapsed = time.monotonic() - start
         text = response.content[0].text if response.content else ""
@@ -677,6 +723,12 @@ class AnthropicBackend(ModelBackend):
                     f"Anthropic API timed out after {elapsed:.0f}s "
                     f"(iteration {iteration})"
                 )
+            except self._anthropic.RateLimitError as e:
+                self._raise_rate_limit(e)
+            except self._anthropic.APIStatusError as e:
+                if getattr(e, "status_code", None) == 529:
+                    self._raise_rate_limit(e)
+                raise
 
             for k, v in self._usage_dict(response.usage).items():
                 total_usage[k] = total_usage.get(k, 0) + v
@@ -838,6 +890,12 @@ class AnthropicBackend(ModelBackend):
                         f"Anthropic API timed out after {elapsed:.0f}s "
                         f"(final text call)"
                     )
+                except self._anthropic.RateLimitError as e:
+                    self._raise_rate_limit(e)
+                except self._anthropic.APIStatusError as e:
+                    if getattr(e, "status_code", None) == 529:
+                        self._raise_rate_limit(e)
+                    raise
 
                 for k, v in self._usage_dict(response.usage).items():
                     total_usage[k] = total_usage.get(k, 0) + v

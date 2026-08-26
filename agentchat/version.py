@@ -110,4 +110,19 @@ different things.
 # CLI's own (already-correct) remedy text appended verbatim. Pairs with the
 # backend adding that key; older backends fall back to a built-in string,
 # safe to roll in either order.
-BRIDGE_VERSION = "2.7.7"
+# 2.8.0 — Claude usage/rate-limit turns are classified distinctly from
+# credential failures and generic errors. New BackendRateLimitError
+# (claude_cli.py: _RATE_LIMIT_RE + best-effort _extract_reset_time;
+# anthropic.py: RateLimitError / APIStatusError 429/529) reports
+# backend_status "rate_limited" — self-healing, same as BackendAuthError's
+# "unauthenticated" clears on the next successful turn — and replies with
+# the server's errorMessages.rateLimitFailure copy, appending a "resumes
+# around HH:MM" ETA when one could be determined. Turns also carry
+# metadata.errorKind="rate_limit" (no button, unlike auth_failure — there's
+# nothing to click to fix a usage limit). Before this, a usage limit fell
+# into the generic modelFailure apology, indistinguishable from a real bug,
+# and invited retrying during the exact window that burns more of the same
+# quota. Pairs with the backend's Runnability :llm_rate_limited blocker
+# code and errorMessages.rateLimitFailure key; older backends fall back to
+# a built-in string, safe to roll in either order.
+BRIDGE_VERSION = "2.8.0"

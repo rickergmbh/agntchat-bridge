@@ -126,7 +126,7 @@ class BackendHealth:
     is coerced to "error" server-side.
     """
 
-    status: str = "ok"  # ok | unauthenticated | missing_cli | error
+    status: str = "ok"  # ok | unauthenticated | missing_cli | rate_limited | error
     detail: Union[str, None] = None
 
     def as_payload(self) -> dict[str, Any]:
@@ -141,6 +141,27 @@ class BackendAuthError(RuntimeError):
     the server explain the real problem to the user rather than posting the
     generic "I ran into an issue processing that request."
     """
+
+
+class BackendRateLimitError(RuntimeError):
+    """The backend rejected the call because a Claude usage/rate limit was hit.
+
+    Distinct from BackendAuthError: the credential is fine, the account is
+    just temporarily throttled (subscription session limit, or API 429/529).
+    This is self-healing — the executor flips health to "rate_limited" (not
+    "unauthenticated"), and the next successful turn clears it automatically,
+    same as Claude Code's own "Auto-resuming at HH:MM" banner. Without this
+    distinction the user saw the same generic apology for "come back in an
+    hour" as for "your credentials are broken and need attention."
+
+    ``reset_at`` is a best-effort unix epoch for when the limit is expected
+    to clear, when the backend could determine one (API 429's `retry-after`
+    header, or a parsed CLI message). None when no ETA is available.
+    """
+
+    def __init__(self, message: str, reset_at: Union[float, None] = None) -> None:
+        super().__init__(message)
+        self.reset_at = reset_at
 
 
 class ModelBackend(ABC):
@@ -379,6 +400,7 @@ def create_backend(name: str | None = None, **kwargs: Any) -> ModelBackend:
 
 __all__ = [
     "BackendAuthError",
+    "BackendRateLimitError",
     "BackendHealth",
     "ChatMessage",
     "ModelBackend",

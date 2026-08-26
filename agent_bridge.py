@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import atexit
+import datetime
 import json
 import logging
 import os
@@ -74,6 +75,7 @@ from agentchat.errors import AgentChatError, AuthError, StaleContextError  # noq
 from agentchat.backends import (  # noqa: E402
     MODEL_OVERRIDE,
     BackendAuthError,
+    BackendRateLimitError,
     ChatMessage,
     create_backend,
 )
@@ -202,11 +204,21 @@ logging.basicConfig(
 logger = logging.getLogger("agent_bridge")
 
 
+def _format_reset_eta(reset_at: float | None) -> str | None:
+    """Human wall-clock ETA for a rate-limit reset, or None if unknown."""
+    if not reset_at:
+        return None
+    dt = datetime.datetime.fromtimestamp(reset_at)
+    return dt.strftime("%I:%M %p").lstrip("0")
+
+
 def _model_failure_reply(
     error_msgs: dict,
     auth_failed: bool,
     cli_connection: str | None = None,
     auth_detail: str | None = None,
+    rate_limited: bool = False,
+    reset_at: float | None = None,
 ) -> str:
     """User-facing text for a failed model turn — server copy first.
 
@@ -224,6 +236,13 @@ def _model_failure_reply(
     Missed entirely on first contact (Jarvis/Bedrock, Aug 2026): the AWS SSO
     expiry wasn't even classified as an auth failure, so this branch never
     ran and the user saw only the generic apology.
+
+    Rate-limit failures also get their own message: unlike an auth failure
+    there's nothing for the user to fix — the account is just temporarily
+    throttled and will resume on its own once the limit clears, same as
+    Claude Code's own "Auto-resuming at HH:MM" banner. Conflating this with
+    the generic apology left users retrying (and burning more quota) during
+    the exact window retrying does no good.
     """
     if auth_failed:
         if cli_connection in ("bedrock", "vertex"):
@@ -238,6 +257,14 @@ def _model_failure_reply(
             "I couldn't reach my model — the Claude sign-in on the machine running me "
             "is missing or expired. Sign in there again, then send me another message.",
         )
+    if rate_limited:
+        lead_in = error_msgs.get(
+            "rateLimitFailure",
+            "⏳ I've hit my Claude usage limit for now. This clears itself — no action "
+            "needed — I'll be able to answer again once it resets.",
+        )
+        eta = _format_reset_eta(reset_at)
+        return f"{lead_in} It should resume around {eta}." if eta else lead_in
     return error_msgs.get(
         "modelFailure",
         "I ran into an issue processing that request. Let me know if you'd like me to try again.",
@@ -4645,6 +4672,8 @@ def run_single_agent(
             _tu_failed = False
             _auth_failed = False
             _auth_detail = None
+            _rate_limited = False
+            _reset_at = None
             # True when the model deliberately ended its turn via the `end_turn`
             # tool. That is a CHOSEN silence (e.g. a peer owns the exchange and
             # this agent stepped back), not a blank failure — so it must NOT
@@ -4674,6 +4703,12 @@ def run_single_agent(
                 _auth_failed = True
                 _auth_detail = str(e)
                 await _stream_cb.cancel()
+            except BackendRateLimitError as e:
+                logger.warning("[%s] Model call failed (tool_use): rate limited: %s", executor_key, e)
+                result = None
+                _rate_limited = True
+                _reset_at = e.reset_at
+                await _stream_cb.cancel()
             except Exception:
                 logger.exception("[%s] Model call failed (tool_use)", executor_key)
                 result = None
@@ -4686,6 +4721,8 @@ def run_single_agent(
                     error_msgs, _auth_failed,
                     cli_connection=getattr(backend, "cli_connection", None),
                     auth_detail=_auth_detail,
+                    rate_limited=_rate_limited,
+                    reset_at=_reset_at,
                 )
             else:
                 _cli_internal = bool((result.metadata or {}).get("cli_internal_loop"))
@@ -4768,6 +4805,12 @@ def run_single_agent(
                 # render a one-click fix (desktop's "Sign in to Claude"
                 # button) under the error bubble.
                 msg_meta_out["errorKind"] = "auth_failure"
+            elif _tu_failed and _rate_limited:
+                # No button to render (there's nothing the user can click to
+                # fix a usage limit) — stamped for future UI use and so the
+                # persistent health blocker (llm_rate_limited) has a matching
+                # marker on the message that triggered it.
+                msg_meta_out["errorKind"] = "rate_limit"
 
             # --- DM routing (tool_use mode) ---
             # The model can emit <dm target="..." topic="...">…</dm> tags in
@@ -4903,6 +4946,8 @@ def run_single_agent(
             _ca_failed = False
             _auth_failed = False
             _auth_detail = None
+            _rate_limited = False
+            _reset_at = None
             try:
                 result = await backend.chat(msg_prompt, chat_messages)
             except BackendAuthError as e:
@@ -4910,6 +4955,11 @@ def run_single_agent(
                 result = None
                 _auth_failed = True
                 _auth_detail = str(e)
+            except BackendRateLimitError as e:
+                logger.warning("[%s] Model call failed (code_action): rate limited: %s", executor_key, e)
+                result = None
+                _rate_limited = True
+                _reset_at = e.reset_at
             except Exception:
                 logger.exception("[%s] Model call failed (code_action)", executor_key)
                 result = None
@@ -4921,6 +4971,8 @@ def run_single_agent(
                     error_msgs, _auth_failed,
                     cli_connection=getattr(backend, "cli_connection", None),
                     auth_detail=_auth_detail,
+                    rate_limited=_rate_limited,
+                    reset_at=_reset_at,
                 )
             else:
                 code = extract_python_code(result.text)
@@ -4952,12 +5004,16 @@ def run_single_agent(
                 msg_meta_out["backend"] = effective_backend
             if _ca_failed and _auth_failed:
                 msg_meta_out["errorKind"] = "auth_failure"
+            elif _ca_failed and _rate_limited:
+                msg_meta_out["errorKind"] = "rate_limit"
             return {"content": reply, "metadata": msg_meta_out} if msg_meta_out else reply
 
         # --- Single-shot mode ---
         _self_task_failed = False
         _auth_failed = False
         _auth_detail = None
+        _rate_limited = False
+        _reset_at = None
         try:
             result = await backend.chat(msg_prompt, chat_messages, on_progress=_stream_cb)
         except BackendAuthError as e:
@@ -4965,6 +5021,12 @@ def run_single_agent(
             result = None
             _auth_failed = True
             _auth_detail = str(e)
+            await _stream_cb.cancel()
+        except BackendRateLimitError as e:
+            logger.warning("[%s] Model call failed: rate limited: %s", executor_key, e)
+            result = None
+            _rate_limited = True
+            _reset_at = e.reset_at
             await _stream_cb.cancel()
         except Exception:
             logger.exception("[%s] Model call failed", executor_key)
@@ -4983,6 +5045,8 @@ def run_single_agent(
                 error_msgs, _auth_failed,
                 cli_connection=getattr(backend, "cli_connection", None),
                 auth_detail=_auth_detail,
+                rate_limited=_rate_limited,
+                reset_at=_reset_at,
             )
         elif not reply:
             if human_expects_reply:
@@ -5128,6 +5192,8 @@ def run_single_agent(
             msg_meta_out["stream_id"] = _msg_stream_id
             if _self_task_failed and _auth_failed:
                 msg_meta_out["errorKind"] = "auth_failure"
+            elif _self_task_failed and _rate_limited:
+                msg_meta_out["errorKind"] = "rate_limit"
 
             # Send reply explicitly so we can create tasks AFTER it appears in the timeline.
             # Posted RAW and ONCE: splitting, pacing, humanlike_bubble metadata,

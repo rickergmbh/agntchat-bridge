@@ -22,6 +22,7 @@ Optional flags (constructor kwargs or env vars):
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import os
 import re
@@ -37,6 +38,7 @@ import logging
 from . import (
     BackendAuthError,
     BackendHealth,
+    BackendRateLimitError,
     ChatMessage,
     ModelBackend,
     ModelResult,
@@ -121,6 +123,85 @@ _AUTH_FAILURE_RE = re.compile(
 
 def _is_auth_failure(text: str | None) -> bool:
     return bool(text) and bool(_AUTH_FAILURE_RE.search(text))
+
+
+# Failure text that means "the Claude account this agent runs on has hit its
+# usage/rate limit" — as opposed to a bad credential (_AUTH_FAILURE_RE) or any
+# other CLI error. Distinguishing this from a generic failure is what lets the
+# server tell the user "this clears itself, no action needed" instead of the
+# same "I ran into an issue" apology used for real bugs.
+#
+# The CLI's exact headless-mode (`-p`) wording for a usage-limit hit isn't
+# fully characterized, so — same philosophy as _AUTH_FAILURE_RE — this stays
+# deliberately broad: a false positive costs a slightly-wrong explanation,
+# while a false negative costs total silence about a self-resolving state.
+_RATE_LIMIT_RE = re.compile(
+    r"(usage[\s_-]*limit"
+    r"|rate[\s_-]*limit"
+    r"|session\s+limit"
+    r"|limit\s+reached"
+    r"|too\s+many\s+requests"
+    r"|overloaded"
+    r"|\b429\b"
+    r"|\b529\b)",
+    re.IGNORECASE,
+)
+
+
+def _is_rate_limit_failure(text: str | None) -> bool:
+    return bool(text) and bool(_RATE_LIMIT_RE.search(text))
+
+
+# Reset-time shapes seen (or plausible) in usage-limit failure text:
+#   - a pipe-delimited unix timestamp, e.g. "...limit reached|1735689600"
+#   - an ISO8601 stamp
+#   - a bare clock time, e.g. "resets at 3:00pm"
+_RESET_EPOCH_RE = re.compile(r"\|\s*(\d{10,13})\b")
+_RESET_ISO_RE = re.compile(r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?)")
+_RESET_CLOCK_RE = re.compile(
+    r"resets?\s*(?:at\s*)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", re.IGNORECASE
+)
+
+
+def _extract_reset_time(text: str | None) -> float | None:
+    """Best-effort unix epoch for when a usage/rate limit should clear.
+
+    Degrades to None (no ETA shown to the user) rather than guessing wrong —
+    the CLI's exact wording here isn't fully characterized, so this only
+    claims a reset time for shapes it's confident about.
+    """
+    if not text:
+        return None
+
+    m = _RESET_EPOCH_RE.search(text)
+    if m:
+        raw = int(m.group(1))
+        return raw / 1000.0 if raw > 10_000_000_000 else float(raw)
+
+    m = _RESET_ISO_RE.search(text)
+    if m:
+        try:
+            return datetime.datetime.fromisoformat(m.group(1)).timestamp()
+        except ValueError:
+            pass
+
+    m = _RESET_CLOCK_RE.search(text)
+    if m:
+        hour = int(m.group(1))
+        minute = int(m.group(2) or 0)
+        meridiem = (m.group(3) or "").lower()
+        if meridiem == "pm" and hour != 12:
+            hour += 12
+        elif meridiem == "am" and hour == 12:
+            hour = 0
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            now = datetime.datetime.now()
+            candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if candidate <= now:
+                candidate += datetime.timedelta(days=1)
+            return candidate.timestamp()
+
+    return None
 
 
 def _has_aws_credentials() -> bool:
@@ -1178,6 +1259,10 @@ class ClaudeCliBackend(ModelBackend):
             self._mark_health("unauthenticated", detail[:300])
             return BackendAuthError(message)
 
+        if _is_rate_limit_failure(detail):
+            self._mark_health("rate_limited", detail[:300])
+            return BackendRateLimitError(message, reset_at=_extract_reset_time(detail))
+
         return RuntimeError(message)
 
     def outer_timeout(self) -> int:
@@ -1508,11 +1593,14 @@ class ClaudeCliBackend(ModelBackend):
                 )
                 raise self._classify_failure(detail, proc.returncode)
 
-        elif _result_is_error and _is_auth_failure(result_text):
-            # Exit 0 but the result event is flagged errored with auth text.
-            # The error branch above never runs, so without this the CLI's
-            # "Invalid API key · Please run /login" was returned as the
-            # agent's reply and posted verbatim into the user's chat.
+        elif _result_is_error and (
+            _is_auth_failure(result_text) or _is_rate_limit_failure(result_text)
+        ):
+            # Exit 0 but the result event is flagged errored with auth or
+            # rate-limit text. The error branch above never runs, so without
+            # this the CLI's raw error text ("Invalid API key · Please run
+            # /login", "usage limit reached...") was returned as the agent's
+            # reply and posted verbatim into the user's chat.
             raise self._classify_failure(result_text, 0)
 
         clean_text = result_text.strip() if result_text else ""
