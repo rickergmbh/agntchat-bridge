@@ -37,6 +37,20 @@ def _big_block(**overrides):
     return _block(**base)
 
 
+def _voice_block(**overrides):
+    """A transcribed voice note as the bridge emits it."""
+    base = {
+        "filename": "voice-note-2026-08-28.m4a",
+        "content_type": "audio/m4a",
+        "url": "https://signed.example/voice-note.m4a",
+        "label": "[Human: Tom] shared a file: voice-note-2026-08-28.m4a",
+        "size_bytes": 263589,
+        "transcript": "Ship the release notes today, then ping Stephen.",
+    }
+    base.update(overrides)
+    return _block(**base)
+
+
 # --- shared helper ----------------------------------------------------------
 
 
@@ -220,3 +234,71 @@ class TestOpenClawFlatten:
         out = _flatten_to_text([_big_block()])
         assert "Summary:" in out
         assert "read_attachment" in out
+
+
+# --- audio / voice notes ----------------------------------------------------
+
+
+class TestVoiceNoteRendering:
+    """No backend can hear audio. The backend transcribes voice notes
+    server-side and folds the text into the file message; every adapter must
+    surface that transcript instead of a bare .m4a reference — the bug that
+    made agents answer "Can't process audio files directly" while a good
+    transcript sat in the message."""
+
+    def test_audio_predicate(self):
+        assert att.is_audio_attachment(_voice_block())
+        assert not att.is_audio_attachment(_block())
+
+    def test_audio_text_renders_transcript_with_id(self):
+        text = att.audio_text(_voice_block())
+        assert "Ship the release notes today" in text
+        assert "abc-123" in text
+
+    def test_audio_text_is_none_for_non_audio(self):
+        assert att.audio_text(_block()) is None
+
+    def test_untranscribed_audio_says_so_instead_of_implying_playback(self):
+        text = att.audio_text(_voice_block(transcript=None))
+        assert "no transcript available" in text
+        assert "read_attachment" in text
+
+    def test_blank_transcript_treated_as_missing(self):
+        text = att.audio_text(_voice_block(transcript="   "))
+        assert "no transcript available" in text
+
+    def test_fallback_text_carries_transcript(self):
+        assert "Ship the release notes today" in att.fallback_text(_voice_block())
+
+    def test_large_voice_note_carries_transcript_not_size_pointer(self):
+        # A long note trips the size gate, but the transcript IS the content:
+        # a "large file, use the download URL" pointer would be useless.
+        block = _voice_block(size_bytes=2 * 1024 * 1024)
+        assert att.should_use_capped_path(block)
+        text = att.capped_pointer_text(block)
+        assert "Ship the release notes today" in text
+        assert "large file" not in text
+
+    def test_anthropic_emits_transcript_text(self):
+        msgs = _translate_attachments([
+            ChatMessage(role="user", content=[_voice_block()])
+        ])
+        blocks = msgs[0].content
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "text"
+        assert "Ship the release notes today" in blocks[0]["text"]
+
+    def test_openai_emits_transcript_text(self):
+        out = _translate_content([_voice_block()])
+        assert isinstance(out, str)
+        assert "Ship the release notes today" in out
+
+    def test_openclaw_emits_transcript_text(self):
+        assert "Ship the release notes today" in _flatten_to_text([_voice_block()])
+
+    def test_claude_cli_skips_temp_download_for_voice_note(self):
+        # The CLI's Read tool can't open an .m4a — no download should happen.
+        cleanup: list[str] = []
+        text = _attachment_to_cli_pointer(_voice_block(), cleanup)
+        assert "Ship the release notes today" in text
+        assert cleanup == []

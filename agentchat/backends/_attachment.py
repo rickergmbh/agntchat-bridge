@@ -8,7 +8,8 @@ The bridge's `messages_to_chat_history` emits a uniform block:
      "content_type": str,   # MIME
      "attachment_id": str | None,
      "url": str | None,     # presigned download URL
-     "label": str}          # human-readable "X shared a file: foo.pdf"
+     "label": str,          # human-readable "X shared a file: foo.pdf"
+     "transcript": str | None}  # server-side Whisper text, audio only
 
 Each backend adapter decides WHAT to do with that block (Anthropic
 emits native image/document blocks, Claude CLI downloads to a temp
@@ -17,9 +18,11 @@ identical across all backends live here:
 
   * `is_image_attachment`  — content-type predicate
   * `is_pdf_attachment`    — content-type predicate
+  * `is_audio_attachment`  — content-type predicate
   * `attachment_label`     — always includes attachment_id so the
                              model can call `read_attachment` even
                              when it also has the file inline
+  * `audio_text`           — a voice note rendered as its transcript
   * `fallback_text`        — text to emit when no native handling is
                              possible (or available) for this MIME
 """
@@ -64,6 +67,12 @@ def capped_pointer_text(block: dict[str, Any]) -> str:
     ready) and is told to call `read_attachment` for the full (capped)
     extracted text, or use the download URL for raw bytes.
     """
+    # A long voice note lands here on size alone, but its transcript IS the
+    # content — pointing the model at raw audio bytes helps nobody.
+    audio = audio_text(block)
+    if audio:
+        return audio
+
     parts = [attachment_label(block)]
 
     summary = block.get("summary")
@@ -86,6 +95,37 @@ def is_pdf_attachment(block: dict[str, Any]) -> bool:
     return (block.get("content_type") or "") == "application/pdf"
 
 
+def is_audio_attachment(block: dict[str, Any]) -> bool:
+    return (block.get("content_type") or "").startswith("audio/")
+
+
+def audio_text(block: dict[str, Any]) -> str | None:
+    """Render a voice note as its transcript; None when not audio.
+
+    No backend can hear: every adapter's native path is image or document,
+    so an .m4a otherwise reaches the model as a bare filename (or, on the
+    CLI, a temp file its Read tool can't open) and the model answers "I
+    can't process audio files" — which is what happened in production even
+    though a perfectly good transcript existed. The backend already
+    transcribed the note server-side (Whisper, `ExtractAttachmentTextWorker`)
+    and folded the text into the file message as `transcript`; surfacing it
+    here is what puts the spoken words into the turn.
+    """
+    if not is_audio_attachment(block):
+        return None
+
+    label = attachment_label(block)
+    transcript = block.get("transcript")
+    if isinstance(transcript, str) and transcript.strip():
+        return f"{label}\nVoice note transcript:\n{transcript.strip()}"
+
+    # Untranscribed (no OpenAI credential, or Whisper failed). Say so
+    # plainly rather than letting the model assume it was handed playable
+    # audio; read_attachment carries the server's specific reason.
+    hint = " — call read_attachment for why" if block.get("attachment_id") else ""
+    return f"{label} (voice note, no transcript available{hint}; the audio cannot be played)"
+
+
 def attachment_label(block: dict[str, Any]) -> str:
     """Human-readable label including the attachment_id when known.
 
@@ -103,6 +143,10 @@ def attachment_label(block: dict[str, Any]) -> str:
 
 def fallback_text(block: dict[str, Any]) -> str:
     """Plain-text reference + read_attachment hint for non-native paths."""
+    audio = audio_text(block)
+    if audio:
+        return audio
+
     label = attachment_label(block)
     if block.get("attachment_id"):
         return f"{label} (use read_attachment to read it)"

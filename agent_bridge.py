@@ -2086,6 +2086,12 @@ async def messages_to_chat_history(
                 "summary": (info or {}).get("summary"),
                 "summary_status": (info or {}).get("summaryStatus"),
                 "extraction_status": (info or {}).get("extractionStatus"),
+                # Voice notes only: the backend transcribes them server-side
+                # and folds the text into the file message's content JSON.
+                # No model can hear audio, so the transcript is the only way
+                # the spoken words reach the turn — adapters render it via
+                # `_attachment.audio_text`.
+                "transcript": file_info.get("transcript"),
             }
             history.append(ChatMessage(role=role, content=[attachment_block], source_id=msg.get("id")))
             continue

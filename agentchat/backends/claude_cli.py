@@ -352,6 +352,13 @@ def _attachment_to_cli_pointer(block: dict, cleanup_paths: list[str] | None = No
     """
     from . import _attachment as att
 
+    # Audio never goes down the download path: the CLI's Read tool can't
+    # open an .m4a, so a temp file would just make the model report that it
+    # can't process audio. The server-side transcript is the content.
+    audio = att.audio_text(block)
+    if audio:
+        return audio
+
     if att.should_use_capped_path(block):
         return att.capped_pointer_text(block)
 

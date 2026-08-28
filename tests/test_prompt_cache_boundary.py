@@ -226,6 +226,31 @@ class TestSourceIdAndTail:
         assert "att-123" in history[0].content
 
     @pytest.mark.asyncio
+    async def test_voice_note_transcript_reaches_the_attachment_block(self):
+        # The backend transcribes voice notes server-side and folds the text
+        # into the file message's content JSON. The bridge used to drop that
+        # field, so the model saw a bare .m4a and answered "can't process
+        # audio" with a good transcript sitting right there.
+        raw = [
+            {
+                "id": "m1",
+                "contentType": "file",
+                "content": (
+                    '{"attachmentId": "att-9", "filename": "voice-note.m4a", '
+                    '"contentType": "audio/m4a", "sizeBytes": 263589, '
+                    '"transcript": "Ship the release notes today."}'
+                ),
+                "senderId": "human-1",
+                "senderName": "Tom",
+                "senderType": "human",
+            },
+        ]
+        history = await messages_to_chat_history(raw, "agent-1")
+        block = history[0].content[0]
+        assert block["type"] == "attachment"
+        assert block["transcript"] == "Ship the release notes today."
+
+    @pytest.mark.asyncio
     async def test_text_message_without_readable_text_falls_back_to_content(self):
         raw = [
             {"id": "m1", "content": "hello", "contentType": "text",
