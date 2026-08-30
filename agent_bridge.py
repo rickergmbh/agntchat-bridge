@@ -3276,13 +3276,37 @@ def run_single_agent(
     except Exception as e:
         logger.warning("[%s] Could not attach file logger: %s", executor_key, e)
 
-    # Fetch agent profile — fast-fail on auth errors
+    # Fetch agent profile — fast-fail on auth errors. Retry when the fetch
+    # fails outright OR returns an empty `resolvedTools` catalog: the toolkit
+    # is snapshotted from this response, so accepting a degraded payload here
+    # (backend 503 during a pooler blip, or a transiently-empty resolve) boots
+    # a toolless bridge process. The 60s refresh path already guards against
+    # empty catalogs (_diff_resolved_toolkit); this is the boot-time twin.
     logger.info("[%s] Fetching agent profile...", executor_key)
-    try:
-        profile = asyncio.run(_fetch_profile(AGENTGRAM_API_URL, agent_id, api_key))
-    except AuthError as e:
-        logger.error("[%s] AUTH_FAILED: %s", executor_key, e)
-        sys.exit(1)
+    profile = None
+    for _attempt in range(3):
+        try:
+            profile = asyncio.run(_fetch_profile(AGENTGRAM_API_URL, agent_id, api_key))
+        except AuthError as e:
+            logger.error("[%s] AUTH_FAILED: %s", executor_key, e)
+            sys.exit(1)
+        if profile and profile.get("resolvedTools"):
+            break
+        reason = "unavailable" if not profile else "has empty resolvedTools"
+        if _attempt < 2:
+            delay = 2.0 * (_attempt + 1)
+            logger.warning(
+                "[%s] Agent profile %s at startup — retrying in %.0fs",
+                executor_key, reason, delay,
+            )
+            _time.sleep(delay)
+        else:
+            # Proceed best-effort — the 60s toolkit refresh heals the
+            # catalog once the backend recovers.
+            logger.warning(
+                "[%s] Agent profile still %s after 3 attempts — proceeding degraded",
+                executor_key, reason,
+            )
     agent_config = extract_agent_config(profile)
     agent_capabilities = extract_capabilities(profile)
 
