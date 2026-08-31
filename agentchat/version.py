@@ -125,4 +125,12 @@ different things.
 # quota. Pairs with the backend's Runnability :llm_rate_limited blocker
 # code and errorMessages.rateLimitFailure key; older backends fall back to
 # a built-in string, safe to roll in either order.
-BRIDGE_VERSION = "2.8.0"
+# 2.9.0 — MCP routing context moved into the MCP_CONTEXT contextvar
+# (backends/__init__.py), off the shared backend instance's mutable
+# _mcp_* attributes. Prerequisite for max_concurrent > 1: with two
+# in-flight turns, instance attributes interleave write→write→read→read
+# and turn A's tool calls route into turn B's conversation/task. NOT
+# safe to roll in either order — a pre-2.9 bridge handed 2 slots has the
+# race live, so the backend raises @min_bridge_version to 2.9.0 in the
+# same change that flips the max_concurrent_tasks default to 2.
+BRIDGE_VERSION = "2.9.0"
