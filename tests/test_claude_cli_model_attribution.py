@@ -10,6 +10,8 @@ fallback when no model was configured at all.
 The fake CLI uses sys.executable (not /bin/sh) so these run on Windows too.
 """
 
+from __future__ import annotations
+
 import json
 import sys
 
