@@ -36,10 +36,12 @@ from typing import Any
 import logging
 
 from . import (
+    MCP_CONTEXT,
     BackendAuthError,
     BackendHealth,
     BackendRateLimitError,
     ChatMessage,
+    MCPContext,
     ModelBackend,
     ModelResult,
     ProgressCallback,
@@ -568,13 +570,10 @@ class ClaudeCliBackend(ModelBackend):
         self._vertex_region = vertex_region
         self._vertex_project = vertex_project
 
-        # MCP context (set per-invocation via set_mcp_context)
-        self._mcp_resolved_tools: list[dict[str, Any]] | None = None
-        self._mcp_conversation_id: str = ""
-        self._mcp_task_id: str = ""
-        self._mcp_owner_id: str = ""
-        self._mcp_source_message_id: str = ""
-        self._mcp_last_seen_message_id: str = ""
+        # MCP routing context lives in backends.MCP_CONTEXT (a contextvar),
+        # NOT on this instance — one backend serves every concurrent turn,
+        # and instance attributes here would let turn A's tool calls route
+        # into turn B's conversation. Set per-invocation via set_mcp_context.
 
     @staticmethod
     def _find_mcp_server() -> str | None:
@@ -1012,13 +1011,19 @@ class ClaudeCliBackend(ModelBackend):
         Called by the bridge before each invocation to provide the agent's
         resolved tools and conversation context. The MCP server uses these
         to expose AgentGram tools natively alongside CLI tools.
+
+        Stored in the MCP_CONTEXT contextvar, so the anchor is scoped to
+        the calling asyncio task: concurrent turns on this one backend
+        instance each read their own context at request time.
         """
-        self._mcp_resolved_tools = resolved_tools
-        self._mcp_conversation_id = conversation_id
-        self._mcp_task_id = task_id
-        self._mcp_owner_id = owner_id
-        self._mcp_source_message_id = source_message_id
-        self._mcp_last_seen_message_id = last_seen_message_id
+        MCP_CONTEXT.set(MCPContext(
+            resolved_tools=resolved_tools,
+            conversation_id=conversation_id,
+            task_id=task_id,
+            owner_id=owner_id,
+            source_message_id=source_message_id,
+            last_seen_message_id=last_seen_message_id,
+        ))
 
     async def generate(
         self,
@@ -1026,14 +1031,15 @@ class ClaudeCliBackend(ModelBackend):
         user_prompt: str,
         on_progress: ProgressCallback | None = None,
     ) -> ModelResult:
+        mcp = MCP_CONTEXT.get()
         cmd, prompt, cleanup = self._base_cmd(
             user_prompt, system_prompt,
-            resolved_tools=self._mcp_resolved_tools,
-            conversation_id=self._mcp_conversation_id,
-            task_id=self._mcp_task_id,
-            owner_id=self._mcp_owner_id,
-            source_message_id=self._mcp_source_message_id,
-            last_seen_message_id=self._mcp_last_seen_message_id,
+            resolved_tools=mcp.resolved_tools,
+            conversation_id=mcp.conversation_id,
+            task_id=mcp.task_id,
+            owner_id=mcp.owner_id,
+            source_message_id=mcp.source_message_id,
+            last_seen_message_id=mcp.last_seen_message_id,
         )
 
         try:
@@ -1680,7 +1686,8 @@ class ClaudeCliBackend(ModelBackend):
 
         guardrail = ToolCallGuardrail(guardrail_config)
         # --- MCP path: single invocation, CLI handles tool loop ---
-        mcp_tools = self._mcp_resolved_tools
+        mcp = MCP_CONTEXT.get()
+        mcp_tools = mcp.resolved_tools
         if mcp_tools and self._mcp_server_script:
             conversation = []
             attachment_cleanup: list[str] = []
@@ -1694,11 +1701,11 @@ class ClaudeCliBackend(ModelBackend):
             cmd, prompt, cleanup = self._base_cmd(
                 user_prompt, system_prompt,
                 resolved_tools=mcp_tools,
-                conversation_id=self._mcp_conversation_id,
-                task_id=self._mcp_task_id,
-                owner_id=self._mcp_owner_id,
-                source_message_id=self._mcp_source_message_id,
-                last_seen_message_id=self._mcp_last_seen_message_id,
+                conversation_id=mcp.conversation_id,
+                task_id=mcp.task_id,
+                owner_id=mcp.owner_id,
+                source_message_id=mcp.source_message_id,
+                last_seen_message_id=mcp.last_seen_message_id,
             )
             cleanup.extend(attachment_cleanup)
             # Let CLI handle the tool loop with max-turns.

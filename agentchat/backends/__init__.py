@@ -47,6 +47,43 @@ MODEL_OVERRIDE: contextvars.ContextVar[Union[str, None]] = contextvars.ContextVa
 )
 
 
+@dataclass(frozen=True)
+class MCPContext:
+    """One turn's routing context for the AgentGram MCP server.
+
+    Every platform tool the CLI invokes over MCP routes on these values —
+    which conversation a send_message lands in, which task a progress
+    report attaches to. The bridge anchors them immediately before each
+    backend call (``_update_mcp_context`` in agent_bridge.py).
+
+    Frozen on purpose: a turn's context is written once, at anchor time,
+    and read at request time. Replace it (``MCP_CONTEXT.set(MCPContext(...))``),
+    never mutate it.
+    """
+
+    resolved_tools: Union[list[dict[str, Any]], None] = None
+    conversation_id: str = ""
+    task_id: str = ""
+    owner_id: str = ""
+    source_message_id: str = ""
+    last_seen_message_id: str = ""
+
+
+# Per-turn MCP routing context. A contextvar (not backend attributes) for
+# the same reason as MODEL_OVERRIDE above: the process has ONE backend
+# instance, so with max_concurrent > 1 two in-flight turns sharing mutable
+# ``self._mcp_*`` attributes would interleave write→write→read→read and
+# turn A's tool calls would land in turn B's conversation and task.
+# asyncio.create_task snapshots the context at creation and a set() inside
+# a handler task never leaks to siblings, so each turn reads its own
+# anchor. The bridge's anchor call runs INSIDE the handler task, right
+# before the backend call — same task as the read, which is what makes
+# this isolation hold.
+MCP_CONTEXT: contextvars.ContextVar[MCPContext] = contextvars.ContextVar(
+    "agentgram_mcp_context", default=MCPContext()
+)
+
+
 # Tools that finalize a task on the backend (visible reply already posted via
 # Tasks.complete_task_atomic / fail_task_atomic). Once one fires, the tool-use
 # loop should stop — any further model output is dead weight and keeps the

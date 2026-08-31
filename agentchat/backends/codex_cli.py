@@ -37,7 +37,15 @@ import sys
 import time
 from typing import Any
 
-from . import ChatMessage, ModelBackend, ModelResult, ProgressCallback, ToolCall
+from . import (
+    MCP_CONTEXT,
+    ChatMessage,
+    MCPContext,
+    ModelBackend,
+    ModelResult,
+    ProgressCallback,
+    ToolCall,
+)
 from ._cli_utils import (
     ANSI_ESCAPE_RE,
     cleanup_temp_files,
@@ -248,13 +256,10 @@ class CodexCliBackend(ModelBackend):
                 "Check that agentgram_mcp_server.py is reachable from the bridge dir."
             )
 
-        # MCP context (set per-invocation via set_mcp_context)
-        self._mcp_resolved_tools: list[dict[str, Any]] | None = None
-        self._mcp_conversation_id: str = ""
-        self._mcp_task_id: str = ""
-        self._mcp_owner_id: str = ""
-        self._mcp_source_message_id: str = ""
-        self._mcp_last_seen_message_id: str = ""
+        # MCP routing context lives in backends.MCP_CONTEXT (a contextvar),
+        # NOT on this instance — one backend serves every concurrent turn,
+        # and instance attributes here would let turn A's tool calls route
+        # into turn B's conversation. Set per-invocation via set_mcp_context.
 
         # Computer-use MCP server (desktop control). Same env contract as
         # claude_cli: Tauri sets AGENTGRAM_COMPUTER_USE=local when the
@@ -595,13 +600,20 @@ class CodexCliBackend(ModelBackend):
         source_message_id: str = "",
         last_seen_message_id: str = "",
     ) -> None:
-        """Set MCP context for the next generate/chat_with_tools call."""
-        self._mcp_resolved_tools = resolved_tools
-        self._mcp_conversation_id = conversation_id
-        self._mcp_task_id = task_id
-        self._mcp_owner_id = owner_id
-        self._mcp_source_message_id = source_message_id
-        self._mcp_last_seen_message_id = last_seen_message_id
+        """Set MCP context for the next generate/chat_with_tools call.
+
+        Stored in the MCP_CONTEXT contextvar, so the anchor is scoped to
+        the calling asyncio task: concurrent turns on this one backend
+        instance each read their own context at request time.
+        """
+        MCP_CONTEXT.set(MCPContext(
+            resolved_tools=resolved_tools,
+            conversation_id=conversation_id,
+            task_id=task_id,
+            owner_id=owner_id,
+            source_message_id=source_message_id,
+            last_seen_message_id=last_seen_message_id,
+        ))
 
     # ------------------------------------------------------------------
     # Generation
@@ -613,14 +625,15 @@ class CodexCliBackend(ModelBackend):
         user_prompt: str,
         on_progress: ProgressCallback | None = None,
     ) -> ModelResult:
+        mcp = MCP_CONTEXT.get()
         cmd, cleanup = self._base_cmd(
             system_prompt,
-            resolved_tools=self._mcp_resolved_tools,
-            conversation_id=self._mcp_conversation_id,
-            task_id=self._mcp_task_id,
-            owner_id=self._mcp_owner_id,
-            source_message_id=self._mcp_source_message_id,
-            last_seen_message_id=self._mcp_last_seen_message_id,
+            resolved_tools=mcp.resolved_tools,
+            conversation_id=mcp.conversation_id,
+            task_id=mcp.task_id,
+            owner_id=mcp.owner_id,
+            source_message_id=mcp.source_message_id,
+            last_seen_message_id=mcp.last_seen_message_id,
         )
 
         try:
@@ -941,7 +954,8 @@ class CodexCliBackend(ModelBackend):
         Codex has no built-in XML <tool_call> fallback, so without MCP
         the loop can't run.
         """
-        mcp_tools = self._mcp_resolved_tools
+        mcp = MCP_CONTEXT.get()
+        mcp_tools = mcp.resolved_tools
         if not (mcp_tools and self._mcp_server_script):
             raise NotImplementedError(
                 "codex_cli requires MCP context (call set_mcp_context with resolved_tools). "
@@ -960,11 +974,11 @@ class CodexCliBackend(ModelBackend):
         cmd, cleanup = self._base_cmd(
             system_prompt,
             resolved_tools=mcp_tools,
-            conversation_id=self._mcp_conversation_id,
-            task_id=self._mcp_task_id,
-            owner_id=self._mcp_owner_id,
-            source_message_id=self._mcp_source_message_id,
-            last_seen_message_id=self._mcp_last_seen_message_id,
+            conversation_id=mcp.conversation_id,
+            task_id=mcp.task_id,
+            owner_id=mcp.owner_id,
+            source_message_id=mcp.source_message_id,
+            last_seen_message_id=mcp.last_seen_message_id,
             image_paths=image_paths,
         )
         # Caller owns the image temp files too.
