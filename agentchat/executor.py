@@ -1808,49 +1808,65 @@ class ExecutorClient:
         return await self._post("/api/google/calendar/events", json=body)
 
     async def send_email(
-        self, to: str, subject: str, body: str, *,
+        self, to: str, body: str, subject: str | None = None, *,
         cc: list[str] | None = None, bcc: list[str] | None = None,
         content_type: str | None = None,
+        reply_to_message_id: str | None = None,
     ) -> dict[str, Any]:
         """Send an email via Gmail. Body is passed through as-is.
 
         content_type: "text/plain" or "text/html". If omitted, the backend
         auto-detects HTML content.
+
+        reply_to_message_id: send inside that message's thread instead of
+        starting a new one. The backend derives the threadId, the
+        In-Reply-To/References headers, and the subject from it, which is
+        why subject is optional when this is set.
         """
         payload: dict[str, Any] = {
             "to": to,
-            "subject": subject,
             "body": body,
         }
+        if subject:
+            payload["subject"] = subject
         if cc:
             payload["cc"] = cc
         if bcc:
             payload["bcc"] = bcc
         if content_type:
             payload["content_type"] = content_type
+        if reply_to_message_id:
+            payload["reply_to_message_id"] = reply_to_message_id
         return await self._post("/api/google/gmail/send", json=payload)
 
     async def save_draft(
-        self, to: str, subject: str, body: str, *,
+        self, to: str, body: str, subject: str | None = None, *,
         cc: list[str] | None = None, bcc: list[str] | None = None,
         content_type: str | None = None,
+        reply_to_message_id: str | None = None,
     ) -> dict[str, Any]:
         """Save an email as a draft in Gmail.
 
         content_type: "text/plain" or "text/html". If omitted, the backend
         auto-detects HTML content.
+
+        reply_to_message_id: draft the reply inside that message's thread;
+        the backend derives the subject, so it is optional when set.
         """
         payload: dict[str, Any] = {
             "to": to,
-            "subject": subject,
             "body": body,
         }
+        if subject:
+            payload["subject"] = subject
         if cc:
             payload["cc"] = cc
         if bcc:
             payload["bcc"] = bcc
         if content_type:
             payload["content_type"] = content_type
+        if reply_to_message_id:
+            payload["reply_to_message_id"] = reply_to_message_id
         return await self._post("/api/google/gmail/drafts", json=payload)
 
     async def get_draft(self, draft_id: str) -> dict[str, Any]:

@@ -3063,7 +3063,7 @@ async def _handle_cta_action(
         if not to or not body:
             return f"Cannot send — missing recipient or body."
         try:
-            result = await executor.send_email(to, subject, body)
+            result = await executor.send_email(to, body, subject)
             # Post-action verification: confirm the sent message exists
             verification = await verify_action(executor, "send_email", result)
             if verification and verification.verified:
@@ -3086,7 +3086,7 @@ async def _handle_cta_action(
         if not body:
             return "Cannot save draft — no email body."
         try:
-            result = await executor.save_draft(to, subject, body)
+            result = await executor.save_draft(to, body, subject)
             # Post-action verification: confirm the draft exists in Gmail
             verification = await verify_action(executor, "save_draft", result)
             if verification and verification.verified:
