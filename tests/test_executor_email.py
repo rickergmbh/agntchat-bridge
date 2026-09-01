@@ -30,21 +30,21 @@ class TestSendEmailPassthrough:
     async def test_body_passed_through_unchanged(self, executor):
         body = "Dear James\\,\\n\\nThank you\\!"
         with patch.object(executor, "_post", new=AsyncMock(return_value={})) as mock:
-            await executor.send_email("to@example.com", body, "Subject")
+            await executor.send_email(body, to="to@example.com", subject="Subject")
             assert _captured_body(mock) == body
 
     @pytest.mark.asyncio
     async def test_real_newlines_passed_through(self, executor):
         body = "Line one\nLine two\n\nLine four"
         with patch.object(executor, "_post", new=AsyncMock(return_value={})) as mock:
-            await executor.send_email("to@example.com", body, "Subject")
+            await executor.send_email(body, to="to@example.com", subject="Subject")
             assert _captured_body(mock) == body
 
     @pytest.mark.asyncio
     async def test_payload_routing(self, executor):
         """Verifies the body is sent to the correct endpoint."""
         with patch.object(executor, "_post", new=AsyncMock(return_value={})) as mock:
-            await executor.send_email("to@example.com", "Hello\\!", "Hi")
+            await executor.send_email("Hello\\!", to="to@example.com", subject="Hi")
             path = mock.call_args.args[0]
             assert path == "/api/google/gmail/send"
             payload = mock.call_args.kwargs["json"]
@@ -55,8 +55,7 @@ class TestSendEmailPassthrough:
     @pytest.mark.asyncio
     async def test_cc_bcc_forwarded(self, executor):
         with patch.object(executor, "_post", new=AsyncMock(return_value={})) as mock:
-            await executor.send_email(
-                "to@example.com", "Body", "Hi",
+            await executor.send_email("Body", to="to@example.com", subject="Hi",
                 cc=["cc@example.com"], bcc=["bcc@example.com"],
             )
             payload = mock.call_args.kwargs["json"]

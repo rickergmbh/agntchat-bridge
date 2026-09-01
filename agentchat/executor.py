@@ -1807,66 +1807,68 @@ class ExecutorClient:
             body["calendar_id"] = calendar_id
         return await self._post("/api/google/calendar/events", json=body)
 
+    @staticmethod
+    def _email_payload(
+        body: str, to: str | None, subject: str | None, *,
+        cc: list[str] | None, bcc: list[str] | None,
+        content_type: str | None, reply_to_message_id: str | None,
+        reply_all: bool | None,
+    ) -> dict[str, Any]:
+        """Shape shared by send_email / save_draft. Thin: the backend owns
+        every rule (to/subject required unless replying, reply_all
+        recipient derivation, HTML detection)."""
+        payload: dict[str, Any] = {"body": body}
+        if to:
+            payload["to"] = to
+        if subject:
+            payload["subject"] = subject
+        if cc:
+            payload["cc"] = cc
+        if bcc:
+            payload["bcc"] = bcc
+        if content_type:
+            payload["content_type"] = content_type
+        if reply_to_message_id:
+            payload["reply_to_message_id"] = reply_to_message_id
+        if reply_all is not None:
+            payload["reply_all"] = reply_all
+        return payload
+
     async def send_email(
-        self, to: str, body: str, subject: str | None = None, *,
+        self, body: str, to: str | None = None, subject: str | None = None, *,
         cc: list[str] | None = None, bcc: list[str] | None = None,
         content_type: str | None = None,
         reply_to_message_id: str | None = None,
+        reply_all: bool | None = None,
     ) -> dict[str, Any]:
         """Send an email via Gmail. Body is passed through as-is.
 
+        to and subject are required for new mail. On a reply
+        (reply_to_message_id) the backend derives both — plus the threadId
+        and In-Reply-To/References headers — from the original, and
+        reply_all CCs everyone else on it.
+
         content_type: "text/plain" or "text/html". If omitted, the backend
         auto-detects HTML content.
-
-        reply_to_message_id: send inside that message's thread instead of
-        starting a new one. The backend derives the threadId, the
-        In-Reply-To/References headers, and the subject from it, which is
-        why subject is optional when this is set.
         """
-        payload: dict[str, Any] = {
-            "to": to,
-            "body": body,
-        }
-        if subject:
-            payload["subject"] = subject
-        if cc:
-            payload["cc"] = cc
-        if bcc:
-            payload["bcc"] = bcc
-        if content_type:
-            payload["content_type"] = content_type
-        if reply_to_message_id:
-            payload["reply_to_message_id"] = reply_to_message_id
+        payload = self._email_payload(
+            body, to, subject, cc=cc, bcc=bcc, content_type=content_type,
+            reply_to_message_id=reply_to_message_id, reply_all=reply_all,
+        )
         return await self._post("/api/google/gmail/send", json=payload)
 
     async def save_draft(
-        self, to: str, body: str, subject: str | None = None, *,
+        self, body: str, to: str | None = None, subject: str | None = None, *,
         cc: list[str] | None = None, bcc: list[str] | None = None,
         content_type: str | None = None,
         reply_to_message_id: str | None = None,
+        reply_all: bool | None = None,
     ) -> dict[str, Any]:
-        """Save an email as a draft in Gmail.
-
-        content_type: "text/plain" or "text/html". If omitted, the backend
-        auto-detects HTML content.
-
-        reply_to_message_id: draft the reply inside that message's thread;
-        the backend derives the subject, so it is optional when set.
-        """
-        payload: dict[str, Any] = {
-            "to": to,
-            "body": body,
-        }
-        if subject:
-            payload["subject"] = subject
-        if cc:
-            payload["cc"] = cc
-        if bcc:
-            payload["bcc"] = bcc
-        if content_type:
-            payload["content_type"] = content_type
-        if reply_to_message_id:
-            payload["reply_to_message_id"] = reply_to_message_id
+        """Save an email as a draft in Gmail. Same contract as send_email."""
+        payload = self._email_payload(
+            body, to, subject, cc=cc, bcc=bcc, content_type=content_type,
+            reply_to_message_id=reply_to_message_id, reply_all=reply_all,
+        )
         return await self._post("/api/google/gmail/drafts", json=payload)
 
     async def get_draft(self, draft_id: str) -> dict[str, Any]:
@@ -1875,13 +1877,19 @@ class ExecutorClient:
 
     async def list_emails(
         self, *, max_results: int = 10, q: str | None = None,
+        page_token: str | None = None,
     ) -> dict[str, Any]:
-        """List recent emails from Gmail inbox."""
+        """List email summaries (inbox by default; q scopes elsewhere).
+
+        page_token: next_page_token from a previous page.
+        """
         params: dict[str, str] = {}
         if max_results:
             params["max_results"] = str(max_results)
         if q:
             params["q"] = q
+        if page_token:
+            params["page_token"] = page_token
         return await self._get("/api/google/gmail/messages", params=params)
 
     async def get_email(self, message_id: str) -> dict[str, Any]:
