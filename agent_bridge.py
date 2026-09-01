@@ -2278,6 +2278,54 @@ def _tool_was_called(result: Any, canonical_name: str) -> bool:
     return any(_normalized_tool_name(name) == canonical_name for name in names)
 
 
+def _tool_call_arguments(result: Any, canonical_name: str) -> dict[str, Any] | None:
+    """Arguments of the LAST call to `canonical_name` in this model run, or
+    None when it was not called. Reads `result.tool_calls[].arguments` (API
+    backends, the bridge's own tool loop) and
+    `result.metadata["cli_tool_uses"][].arguments` (claude_cli / codex_cli
+    internal loops, where the stream parser captures the input). A call whose
+    arguments were not captured yields `{}`."""
+    found: dict[str, Any] | None = None
+
+    for tc in getattr(result, "tool_calls", []) or []:
+        if _normalized_tool_name(str(getattr(tc, "name", "") or "")) == canonical_name:
+            args = getattr(tc, "arguments", None)
+            found = dict(args) if isinstance(args, dict) else {}
+
+    metadata = getattr(result, "metadata", None) or {}
+    for tu in metadata.get("cli_tool_uses") or []:
+        if isinstance(tu, dict) and _normalized_tool_name(str(tu.get("name") or "")) == canonical_name:
+            args = tu.get("arguments")
+            found = dict(args) if isinstance(args, dict) else {}
+
+    return found
+
+
+# EndTurn reasons that mean "I post nothing this turn". Mirrors the server's
+# `FillerSuppression.silent_end_turn_reasons/0`. The other canonical reasons
+# (task_complete, awaiting_input, blocked) are the TERMINATOR use from the
+# identity directive: the model delivered its answer as final text and
+# end_turn merely closes the turn — that text must still be posted.
+_SILENT_END_TURN_REASONS = frozenset({"no_action_needed", "thread_redirect"})
+
+
+def _silent_end_turn_called(result: Any) -> bool:
+    """True when the model called `end_turn` to be SILENT this turn.
+
+    Any prose the model emitted alongside that call is the declined turn
+    leaking out ("Trip King's got the hotel lookup — nothing for me to add
+    here", conv 0b86e6ed) and must not be posted. A missing/unknown reason
+    counts as silence, matching the server's coercion of unknown reasons to
+    `no_action_needed`."""
+    args = _tool_call_arguments(result, "end_turn")
+    if args is None:
+        return False
+    reason = args.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return True
+    return reason.strip() in _SILENT_END_TURN_REASONS
+
+
 def _accumulated_stream_text(result: Any) -> str:
     """Text accumulated from CLI streaming before a final tool call."""
     metadata = getattr(result, "metadata", None) or {}
@@ -4788,6 +4836,23 @@ def run_single_agent(
                 _tu_sent_via_tool = _tool_was_called(result, "send_message")
 
                 reply = result.text[:MAX_REPLY_CHARS]
+
+                # The model chose SILENCE (end_turn with a silent reason) and
+                # still produced prose. That prose is the declined turn leaking
+                # out — the identity directive's one silence mechanic is the
+                # tool call, and "nothing to add" IS a message. Drop it at the
+                # source; the server's FillerSuppression.end_turn_leak?/4 is
+                # the backstop for runtimes that don't. A terminator reason
+                # (task_complete / awaiting_input / blocked) keeps the text:
+                # that IS the delivery.
+                if _tu_ended_turn and reply and reply.strip() and _silent_end_turn_called(result):
+                    logger.info(
+                        "[%s] end_turn (silent) was called but the model also produced "
+                        "%d chars of prose — dropping it (the turn already ended)",
+                        executor_key, len(reply),
+                    )
+                    reply = ""
+
                 if not reply or not reply.strip():
                     if human_expects_reply and not _tu_ended_turn and not _tu_sent_via_tool:
                         # The human directly engaged this agent (explicit

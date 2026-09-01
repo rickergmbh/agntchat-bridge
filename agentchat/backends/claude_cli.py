@@ -1528,6 +1528,11 @@ class ClaudeCliBackend(ModelBackend):
                                     args = json.loads(raw) if raw else {}
                                 except json.JSONDecodeError:
                                     args = {}
+                                # Keep the parsed input on the recorded tool use
+                                # so the bridge can read e.g. end_turn's
+                                # `reason` (silent vs terminator) after the run.
+                                if _tool_uses and isinstance(args, dict):
+                                    _tool_uses[-1]["arguments"] = args
                                 if args:
                                     await on_progress({
                                         "type": "tool_call",
@@ -1748,7 +1753,7 @@ class ClaudeCliBackend(ModelBackend):
                 ToolCall(
                     id=tu.get("id", ""),
                     name=tu.get("name", "tool"),
-                    arguments={},
+                    arguments=tu.get("arguments") if isinstance(tu.get("arguments"), dict) else {},
                     result="",
                 )
                 for tu in cli_tool_uses

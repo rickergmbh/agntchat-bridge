@@ -152,4 +152,10 @@ different things.
 # deadline. Safe to roll in either order: an older backend ignores the
 # extra key, and an older bridge sends no reset_at, which keeps the
 # pre-2.9.2 clear-on-success behaviour for that executor.
-BRIDGE_VERSION = "2.9.2"
+#
+# 2.9.3 — a silent `end_turn` (reason no_action_needed / thread_redirect)
+# drops any prose the model emitted alongside it instead of posting the
+# declined turn ("…nothing for me to add here", conv 0b86e6ed). The claude_cli
+# stream parser now keeps each tool use's parsed input so the reason is
+# readable after the run. Terminator reasons keep their text.
+BRIDGE_VERSION = "2.9.3"
