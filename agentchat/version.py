@@ -133,4 +133,12 @@ different things.
 # safe to roll in either order — a pre-2.9 bridge handed 2 slots has the
 # race live, so the backend raises @min_bridge_version to 2.9.0 in the
 # same change that flips the max_concurrent_tasks default to 2.
-BRIDGE_VERSION = "2.9.0"
+# 2.9.1 — every REST call carries X-Bridge-Version (rest.py _request).
+# The backend's /api/agents/my/settings clamps max_concurrent_tasks to 1
+# for callers that don't prove the 2.9.0 floor; since pre-2.9.1 bridges
+# never send the header, the concurrency floor now holds by construction
+# instead of resting on the enforce_bridge_version feature flag staying
+# on. Safe to roll in either order: an older backend ignores the header,
+# a newer backend clamps older bridges to the single slot they had
+# before 2.9.0 anyway.
+BRIDGE_VERSION = "2.9.1"

@@ -10,6 +10,7 @@ import httpx
 from .auth import TokenManager
 from .errors import AuthError, RateLimitError, AgentChatError
 from .models import Conversation, Message, Participant
+from .version import BRIDGE_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -336,9 +337,17 @@ class RestClient:
     ) -> dict:
         """Execute an HTTP request with automatic token refresh on 401."""
         token = await self._token_manager.ensure_fresh()
+        # X-Bridge-Version lets the server tailor responses to what this
+        # bridge can actually do — notably `/api/agents/my/settings` clamps
+        # max_concurrent_tasks to 1 for any caller that doesn't prove the
+        # concurrency floor. Absence of the header IS the signal for a
+        # pre-2.9.1 bridge, so the clamp holds by construction.
         kwargs: dict[str, Any] = {
             "params": params,
-            "headers": {"Authorization": f"Bearer {token}"},
+            "headers": {
+                "Authorization": f"Bearer {token}",
+                "X-Bridge-Version": BRIDGE_VERSION,
+            },
         }
         if json is not None:
             kwargs["json"] = json
@@ -350,7 +359,10 @@ class RestClient:
             # Token may have expired between ensure_fresh and server check.
             # Force a refresh and retry once.
             token = await self._token_manager.get_token()
-            kwargs["headers"] = {"Authorization": f"Bearer {token}"}
+            kwargs["headers"] = {
+                "Authorization": f"Bearer {token}",
+                "X-Bridge-Version": BRIDGE_VERSION,
+            }
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await getattr(client, method)(
                     f"{self._base_url}{path}", **kwargs
