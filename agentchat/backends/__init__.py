@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextvars
 import os
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Union
@@ -148,6 +149,15 @@ class ModelResult:
     stop_reason: str = "end_turn"
 
 
+# When a rate-limited backend gives no reset ETA, assume the limit clears
+# within this window. Deliberately shorter than a full Claude 5-hour usage
+# window: if the guess is early, the agent reads online, the next real turn
+# fails fast, and health re-marks with a fresh deadline — a cheap flap. If
+# the guess were late, the agent would sit visibly offline after the limit
+# already lifted, which is the exact stale state this exists to bound.
+RATE_LIMIT_RESET_FALLBACK_SECONDS = 3600
+
+
 @dataclass
 class BackendHealth:
     """Whether this backend can actually run a turn right now.
@@ -165,9 +175,15 @@ class BackendHealth:
 
     status: str = "ok"  # ok | unauthenticated | missing_cli | rate_limited | error
     detail: Union[str, None] = None
+    # Unix epoch for when a "rate_limited" status is expected to clear.
+    # Always set for rate_limited (a parsed ETA when the backend produced
+    # one, RATE_LIMIT_RESET_FALLBACK_SECONDS from the failure otherwise) so
+    # the server can expire the blocker instead of showing the agent offline
+    # forever when no traffic arrives to trigger the clearing turn.
+    reset_at: Union[float, None] = None
 
     def as_payload(self) -> dict[str, Any]:
-        return {"status": self.status, "detail": self.detail}
+        return {"status": self.status, "detail": self.detail, "reset_at": self.reset_at}
 
 
 class BackendAuthError(RuntimeError):
@@ -227,6 +243,17 @@ class ModelBackend(ABC):
 
     def _mark_health(self, status: str, detail: Union[str, None] = None) -> None:
         self._health = BackendHealth(status=status, detail=detail)
+
+    def _mark_rate_limited(self, detail: Union[str, None], reset_at: Union[float, None]) -> None:
+        """Record a rate-limited backend, always with a reset deadline.
+
+        ``reset_at`` may be None when the error text carried no ETA — the
+        fallback bounds the blocker anyway, so the server-side auto-clear
+        (Agentchat.Agents.Runnability) never depends on the CLI's wording.
+        """
+        if reset_at is None:
+            reset_at = time.time() + RATE_LIMIT_RESET_FALLBACK_SECONDS
+        self._health = BackendHealth(status="rate_limited", detail=detail, reset_at=reset_at)
 
     def _mark_healthy(self) -> None:
         """A turn succeeded — clear any previously reported problem.

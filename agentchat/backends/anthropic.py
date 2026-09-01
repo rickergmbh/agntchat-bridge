@@ -254,8 +254,10 @@ class AnthropicBackend(ModelBackend):
         a bare RuntimeError that would read as a generic/unknown failure.
         `retry-after` (seconds, present on 429s) becomes a wall-clock reset
         estimate — the same signal Claude Code's own CLI surfaces as
-        "Auto-resuming at HH:MM". 529 overload has no fixed window, so
-        reset_at stays None there rather than inventing one.
+        "Auto-resuming at HH:MM". 529 overload has no fixed window, so the
+        *error's* reset_at stays None there rather than showing the user an
+        invented time — health still gets the fallback deadline via
+        _mark_rate_limited so the server-side blocker always expires.
         """
         reset_at = None
         response = getattr(exc, "response", None)
@@ -265,7 +267,7 @@ class AnthropicBackend(ModelBackend):
                 reset_at = time.time() + float(retry_after)
             except ValueError:
                 reset_at = None
-        self._mark_health("rate_limited", str(exc)[:300])
+        self._mark_rate_limited(str(exc)[:300], reset_at)
         raise BackendRateLimitError(f"Anthropic API rate limit: {exc}", reset_at=reset_at) from exc
 
     @staticmethod

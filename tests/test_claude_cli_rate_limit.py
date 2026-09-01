@@ -94,3 +94,45 @@ def test_classify_failure_generic_error_is_neither():
     exc = backend._classify_failure("Model returned malformed output", returncode=1)
     assert type(exc) is RuntimeError
     assert backend.health.status == "ok"
+
+
+def test_rate_limited_health_carries_parsed_reset_deadline():
+    """The server expires the :llm_rate_limited blocker at reset_at — the
+    fix for agents that read offline forever after a limit already reset
+    because no traffic arrived to trigger the clearing turn."""
+    backend = _backend()
+    backend._classify_failure("Claude AI usage limit reached|1735689600", returncode=1)
+    assert backend.health.reset_at == 1735689600.0
+    payload = backend.health.as_payload()
+    assert payload["status"] == "rate_limited"
+    assert payload["reset_at"] == 1735689600.0
+
+
+def test_rate_limited_health_falls_back_to_bounded_deadline():
+    """No parseable ETA must still produce a deadline: an unbounded
+    rate_limited blocker is exactly the stale-offline state being fixed."""
+    import time
+
+    from agentchat.backends import RATE_LIMIT_RESET_FALLBACK_SECONDS
+
+    backend = _backend()
+    before = time.time()
+    exc = backend._classify_failure(
+        "Claude AI usage limit reached, try again later", returncode=1
+    )
+    # The error keeps None (no invented ETA shown to the user)...
+    assert isinstance(exc, BackendRateLimitError)
+    assert exc.reset_at is None
+    # ...but health gets the fallback so the server-side clear is bounded.
+    assert backend.health.reset_at is not None
+    assert backend.health.reset_at == pytest.approx(
+        before + RATE_LIMIT_RESET_FALLBACK_SECONDS, abs=30
+    )
+
+
+def test_mark_healthy_clears_reset_deadline():
+    backend = _backend()
+    backend._classify_failure("Claude AI usage limit reached|1735689600", returncode=1)
+    backend._mark_healthy()
+    assert backend.health.status == "ok"
+    assert backend.health.reset_at is None

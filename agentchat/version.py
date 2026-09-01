@@ -141,4 +141,15 @@ different things.
 # on. Safe to roll in either order: an older backend ignores the header,
 # a newer backend clamps older bridges to the single slot they had
 # before 2.9.0 anyway.
-BRIDGE_VERSION = "2.9.1"
+# 2.9.2 — rate_limited health carries a reset deadline. backend_health
+# gains `reset_at` (unix epoch): the parsed ETA when the CLI/API error
+# named one, else now + RATE_LIMIT_RESET_FALLBACK_SECONDS. Closes the
+# stale-offline gap in the 2.8.0 self-healing story: the blocker only
+# cleared on a *successful turn*, so an agent that got no traffic after
+# the limit reset read offline indefinitely. The server (Runnability)
+# now expires an :llm_rate_limited blocker once reset_at passes; if the
+# guess was early the next turn fails fast and re-marks with a fresh
+# deadline. Safe to roll in either order: an older backend ignores the
+# extra key, and an older bridge sends no reset_at, which keeps the
+# pre-2.9.2 clear-on-success behaviour for that executor.
+BRIDGE_VERSION = "2.9.2"

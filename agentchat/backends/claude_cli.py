@@ -1273,8 +1273,12 @@ class ClaudeCliBackend(ModelBackend):
             return BackendAuthError(message)
 
         if _is_rate_limit_failure(detail):
-            self._mark_health("rate_limited", detail[:300])
-            return BackendRateLimitError(message, reset_at=_extract_reset_time(detail))
+            # The error keeps the possibly-None parsed ETA (user copy shows
+            # no time rather than a guessed one); health always gets a
+            # deadline so the server can expire the blocker.
+            reset_at = _extract_reset_time(detail)
+            self._mark_rate_limited(detail[:300], reset_at)
+            return BackendRateLimitError(message, reset_at=reset_at)
 
         return RuntimeError(message)
 
