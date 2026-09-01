@@ -2804,6 +2804,13 @@ class ExecutorClient:
         try:
             await self._handle_message(msg)
             logger.info("[MSG-DISPATCH] Handler completed normally for %s", msg.id)
+        except asyncio.CancelledError:
+            # A cancelled turn (stop directive, shutdown) is not a handler
+            # error — the old catch-all BaseException logged it as one, with
+            # a full traceback, indistinguishable from a real crash. Same
+            # deliberate swallow as _handle_task_wrapper: the canceller has
+            # already handled the consequences; just release the slot.
+            logger.info("[MSG-DISPATCH] Handler cancelled for %s", msg.id)
         except BaseException as e:
             logger.exception("[MSG-DISPATCH] Handler raised %s for %s: %s", type(e).__name__, msg.id, e)
         finally:
