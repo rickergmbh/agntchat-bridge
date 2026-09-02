@@ -218,17 +218,42 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+_SHELLS = {"sh", "bash", "zsh", "fish", "dash", "ksh"}
+
+
+def _is_cli_process(args: str) -> bool:
+    """Does this command line belong to the Claude Code / Codex CLI itself?
+
+    Only the program (argv[0]) and the script it runs (argv[1], for
+    `node .../claude-code/cli.js`) count — never the rest of the line. A
+    shell never counts: hooks run through one, and a wrapper such as
+    `zsh -c 'source ~/.claude/...'` mentions "claude" without being it.
+    """
+    tokens = args.split()
+    if not tokens:
+        return False
+    program = os.path.basename(tokens[0])
+    if program in _SHELLS:
+        return False
+    head = " ".join(tokens[:2]).lower()
+    return (
+        program in ("claude", "codex")
+        or "claude-code" in head
+        or "@openai/codex" in head
+    )
+
+
 def _cli_pid() -> Optional[int]:
     """Walk up from this hook process to the CLI process that spawned it.
 
-    Hooks may run through an intermediate shell, so the direct parent is not
-    reliable. Returns the nearest ancestor whose command line names the CLI,
-    else the highest live ancestor below init.
+    Hooks run through an intermediate shell, so the direct parent is not
+    reliable. Returns the nearest ancestor that is the CLI, or None — no
+    heartbeat is better than one bound to the terminal or the desktop app,
+    which would keep a dead session "running" until the app quits.
     """
     if os.name == "nt":
         return None
     pid = os.getppid()
-    best = None
     for _ in range(8):
         if pid <= 1:
             break
@@ -245,15 +270,13 @@ def _cli_pid() -> Optional[int]:
         if not out:
             break
         ppid_s, _, args = out.partition(" ")
-        args = args.strip()
-        if "claude" in args or "codex" in args:
+        if _is_cli_process(args.strip()):
             return pid
-        best = pid
         try:
             pid = int(ppid_s.strip())
         except ValueError:
             break
-    return best
+    return None
 
 
 def _pidfile(session: str) -> Path:

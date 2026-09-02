@@ -187,3 +187,25 @@ def test_hook_prompt_prints_inbox_digest(monkeypatch, capsys):
     assert "Fix build" in out
     assert "task_id t1" in out
     assert "2 unread" in out
+
+
+@pytest.mark.parametrize(
+    "args,is_cli",
+    [
+        ("/Users/x/Library/Application Support/Claude/claude-code/2.1.255/claude.app/Contents/MacOS/claude --output-format stream-json", True),
+        ("/usr/local/bin/claude", True),
+        ("node /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js", True),
+        ("/opt/homebrew/bin/codex exec", True),
+        ("node /usr/lib/node_modules/@openai/codex/bin/codex.js", True),
+        # The shell that runs the hook mentions claude without being it.
+        ("/bin/zsh -c source /Users/x/.claude/shell-snapshots/snap.sh && python3 hook.py", False),
+        ("/bin/sh -c /Users/x/claude-stuff/venv/bin/python3 hook.py", False),
+        # The desktop app hosting the CLI is not the CLI: binding a heartbeat
+        # to it would keep a dead session "running" until the app quits.
+        ("/Applications/Claude.app/Contents/MacOS/Claude", False),
+        ("/Applications/Terminal.app/Contents/MacOS/Terminal", False),
+        ("", False),
+    ],
+)
+def test_hook_cli_process_matcher(args, is_cli):
+    assert hook._is_cli_process(args) is is_cli
