@@ -44,6 +44,8 @@ async def claim_invite(
     executor_key: Optional[str] = None,
     executor_display_name: Optional[str] = None,
     executor_capabilities: Optional[list] = None,
+    runtime: Optional[str] = None,
+    external_tool: Optional[str] = None,
 ) -> ClaimResult:
     """Claim an invite code and get back agent credentials.
 
@@ -73,6 +75,12 @@ async def claim_invite(
         body["executorDisplayName"] = executor_display_name
     if executor_capabilities:
         body["executorCapabilities"] = executor_capabilities
+    # External runtime (#148): a CLI session the user drives themselves.
+    # Requires the `external_agents` feature flag for the invite creator.
+    if runtime:
+        body["runtime"] = runtime
+    if external_tool:
+        body["externalTool"] = external_tool
 
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
@@ -81,6 +89,15 @@ async def claim_invite(
         )
 
     if resp.status_code == 404:
+        try:
+            error = resp.json().get("error")
+        except Exception:  # noqa: BLE001
+            error = None
+        if error == "external_agents_disabled":
+            raise ValueError(
+                "External agents are not enabled for the account that created this "
+                "invite (feature flag `external_agents`)"
+            )
         raise ValueError(f"Invite not found: {code}")
     if resp.status_code == 409:
         raise ValueError(f"Invite already claimed or revoked: {code}")

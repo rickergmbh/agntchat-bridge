@@ -24,6 +24,7 @@ from typing import Any
 
 from agentchat.executor import ExecutorClient  # noqa: E402
 from agentchat.tools.executor import ToolExecutor  # noqa: E402
+from agentchat.external import load_credentials  # noqa: E402
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="[MCP] %(message)s")
 logger = logging.getLogger("agentgram_mcp")
@@ -39,10 +40,28 @@ except Exception as _e:  # noqa: BLE001
     logger.warning("Could not attach file logger: %s", _e)
 
 # --- Configuration from environment ---
+#
+# Two ways to run:
+#
+# * **Bridge-spawned** (the normal case): `agent_bridge.py` sets every value
+#   below, including the per-turn context (conversation, task, source
+#   message) and the serialized tool catalog.
+# * **Standalone / external agent (#148)**: a user's own Claude Code / Codex
+#   session loads this script via `claude mcp add` / `codex mcp add`. No
+#   bridge, so nothing is pre-resolved: credentials come from
+#   `~/.agentchat/credentials.json` (written by `python -m agentchat
+#   connect`), the tool catalog is fetched from `GET /api/me`, and the
+#   default conversation is the owner DM, resolved on first use. Detected by
+#   the ABSENCE of `AGENTGRAM_TOOL_DEFS` — the bridge always sets it.
 
-API_URL = os.environ.get("AGENTGRAM_API_URL", "https://agentchat-backend.fly.dev")
-AGENT_ID = os.environ.get("AGENTGRAM_AGENT_ID", "")
-API_KEY = os.environ.get("AGENTGRAM_API_KEY", "")
+STANDALONE = "AGENTGRAM_TOOL_DEFS" not in os.environ
+_CREDS = load_credentials() if STANDALONE else None
+
+API_URL = os.environ.get("AGENTGRAM_API_URL") or (
+    _CREDS["gateway_url"] if _CREDS else "https://agentchat-backend.fly.dev"
+)
+AGENT_ID = os.environ.get("AGENTGRAM_AGENT_ID") or (_CREDS["agent_id"] if _CREDS else "")
+API_KEY = os.environ.get("AGENTGRAM_API_KEY") or (_CREDS["api_key"] if _CREDS else "")
 CONVERSATION_ID = os.environ.get("AGENTGRAM_CONVERSATION_ID", "")
 TASK_ID = os.environ.get("AGENTGRAM_TASK_ID", "")
 OWNER_ID = os.environ.get("AGENTGRAM_OWNER_ID", "")
@@ -63,6 +82,52 @@ def load_tools() -> list[dict[str, Any]]:
 
 TOOLS = load_tools()
 TOOL_MAP = {t["name"]: t for t in TOOLS if t.get("name")}
+
+
+def _ensure_standalone_context() -> None:
+    """Standalone only: resolve the tool catalog and the owner DM lazily.
+
+    Runs on the first `tools/list` / `tools/call` rather than at import so
+    `initialize` answers instantly and a backend blip is retried on the next
+    request instead of poisoning the process. The catalog mirrors what the
+    bridge hands us: the agent's resolved tools minus `server_tool`s (those
+    execute inside the bridge's own turn loop, which does not exist here).
+    """
+    global TOOLS, TOOL_MAP, CONVERSATION_ID, OWNER_ID
+    if not STANDALONE:
+        return
+    if TOOLS and CONVERSATION_ID:
+        return
+    try:
+        executor = get_executor()
+        profile = asyncio.run(executor.get_profile())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Standalone: could not load profile: %s", exc)
+        return
+
+    if not TOOLS:
+        resolved = [
+            t for t in (profile.get("resolvedTools") or []) if t.get("category") != "server_tool"
+        ]
+        if resolved:
+            TOOLS = resolved
+            TOOL_MAP = {t["name"]: t for t in TOOLS if t.get("name")}
+            logger.info("Standalone: loaded %d tools from /api/me", len(TOOLS))
+            te = get_tool_executor()
+            te._catalog = {t["name"]: t for t in TOOLS if t.get("name")}
+
+    if not OWNER_ID:
+        OWNER_ID = profile.get("ownerId") or ""
+        get_tool_executor()._context["owner_id"] = OWNER_ID
+
+    if not CONVERSATION_ID and OWNER_ID:
+        try:
+            dm = asyncio.run(executor.find_or_create_dm(OWNER_ID))
+            CONVERSATION_ID = dm.get("id") or ""
+            get_tool_executor()._context["conversation_id"] = CONVERSATION_ID
+            logger.info("Standalone: default conversation = owner DM %s", CONVERSATION_ID[:12])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Standalone: could not resolve owner DM: %s", exc)
 
 # --- Permission prompt (#67) ---
 #
@@ -146,6 +211,7 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     if method == "tools/list":
+        _ensure_standalone_context()
         mcp_tools = []
         for t in TOOLS:
             schema = t.get("inputSchema", t.get("input_schema", {}))
@@ -193,6 +259,7 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
                 "result": {"content": [{"type": "text", "text": json.dumps(decision)}]},
             }
 
+        _ensure_standalone_context()
         logger.info("Executing tool: %s | args=%s | ctx_conv=%s | ctx_task=%s | source=%s",
                      tool_name, json.dumps(arguments, default=str)[:200],
                      CONVERSATION_ID[:12] if CONVERSATION_ID else "none",
@@ -326,7 +393,17 @@ def main() -> None:
     sys.stdin.reconfigure(encoding="utf-8")
     sys.stdout.reconfigure(encoding="utf-8")
 
-    logger.info("AgentGram MCP server starting (agent=%s, tools=%d)", AGENT_ID, len(TOOLS))
+    logger.info(
+        "AgentGram MCP server starting (agent=%s, tools=%d, mode=%s)",
+        AGENT_ID,
+        len(TOOLS),
+        "standalone" if STANDALONE else "bridge",
+    )
+    if not AGENT_ID or not API_KEY:
+        logger.error(
+            "No credentials: set AGENTGRAM_AGENT_ID/AGENTGRAM_API_KEY or run "
+            "`python -m agentchat connect <invite-code>`"
+        )
 
     for line in sys.stdin:
         line = line.strip()

@@ -1,9 +1,11 @@
 """AgentChat CLI — python -m agentchat <command>
 
 Commands:
-    join <code>   Claim an invite, save credentials, start executor
-    info <code>   Show public invite info
-    status        Show saved credentials
+    join <code>      Claim an invite, save credentials, start executor
+    connect <code>   Claim an invite as an EXTERNAL agent (your own Claude
+                     Code / Codex session) and print the CLI configuration
+    info <code>      Show public invite info
+    status           Show saved credentials
 """
 
 from __future__ import annotations
@@ -41,6 +43,25 @@ def main() -> None:
     join_parser.add_argument("--capabilities", default=None, help="Comma-separated capabilities (e.g. code,git,shell)")
     join_parser.add_argument("--no-start", action="store_true", help="Don't start the executor gateway loop")
 
+    # connect (external agent, #148)
+    connect_parser = subparsers.add_parser(
+        "connect",
+        help="Claim an invite as an external agent and print the Claude Code / Codex config",
+    )
+    connect_parser.add_argument("code", help="Invite code (e.g. inv_Abc123)")
+    connect_parser.add_argument("--gateway-url", default=DEFAULT_GATEWAY_URL, help="Backend URL")
+    connect_parser.add_argument(
+        "--tool",
+        choices=["claude-code", "codex"],
+        default="claude-code",
+        help="Which CLI you drive (default: claude-code)",
+    )
+    connect_parser.add_argument(
+        "--install",
+        action="store_true",
+        help="Claude Code only: run `claude mcp add` and merge the hooks into ~/.claude/settings.json",
+    )
+
     # info
     info_parser = subparsers.add_parser("info", help="Show public invite info")
     info_parser.add_argument("code", help="Invite code")
@@ -57,6 +78,8 @@ def main() -> None:
 
     if args.command == "join":
         asyncio.run(_cmd_join(args))
+    elif args.command == "connect":
+        asyncio.run(_cmd_connect(args))
     elif args.command == "info":
         asyncio.run(_cmd_info(args))
     elif args.command == "status":
@@ -112,6 +135,42 @@ async def _cmd_join(args: argparse.Namespace) -> None:
 
     logger.info("Executor running. Press Ctrl+C to stop.")
     executor.run()
+
+
+async def _cmd_connect(args: argparse.Namespace) -> None:
+    """External agent (#148): claim the invite with `runtime: external` (no
+    executor is registered — nothing will ever be pushed to this agent), save
+    credentials, and print or install the CLI configuration."""
+    from . import external
+    from .invite import claim_invite, save_credentials
+
+    tool = "codex" if args.tool == "codex" else "claude_code"
+    logger.info("Claiming invite %s as an external %s agent...", args.code, args.tool)
+
+    try:
+        result = await claim_invite(
+            gateway_url=args.gateway_url,
+            code=args.code,
+            runtime="external",
+            external_tool=tool,
+        )
+    except ValueError as e:
+        logger.error("Claim failed: %s", e)
+        sys.exit(1)
+
+    logger.info("Agent created: %s (id=%s)", result.display_name, result.agent_id)
+    creds_path = save_credentials(result)
+    logger.info("Credentials saved to %s", creds_path)
+
+    print()
+    if args.install and tool == "claude_code":
+        for step in external.install_claude():
+            print(f"  • {step}")
+        print()
+        print("Start a new `claude` session — it appears in agntchat as an External agent.")
+    else:
+        print(external.render_instructions(tool))
+    print()
 
 
 async def _cmd_info(args: argparse.Namespace) -> None:
