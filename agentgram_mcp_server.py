@@ -17,6 +17,8 @@ import json
 import logging
 import os
 import sys
+import threading
+import time
 from typing import Any
 
 # agentchat SDK is co-located in this directory — Python adds the script's
@@ -68,6 +70,137 @@ OWNER_ID = os.environ.get("AGENTGRAM_OWNER_ID", "")
 SOURCE_MESSAGE_ID = os.environ.get("AGENTGRAM_SOURCE_MESSAGE_ID", "")
 LAST_SEEN_MESSAGE_ID = os.environ.get("AGENTGRAM_LAST_SEEN_MESSAGE_ID", "")
 TOOL_DEFS_JSON = os.environ.get("AGENTGRAM_TOOL_DEFS", "[]")
+
+# --- Standalone channel (#148) ---
+#
+# In standalone mode the server is also a Claude Code *channel*: it declares
+# the `claude/channel` capability and pushes `notifications/claude/channel`
+# so agntchat messages and task assignments reach the running session as
+# they arrive, instead of waiting for the next prompt. Claude Code only
+# honours the notifications when the session was started with the channel
+# flag (`external.claude_channels_command()`); otherwise they are dropped
+# silently and the hooks' prompt/stop injection carries the traffic.
+#
+# Inbound is a poll of `GET /api/agents/me/inbox` (nothing on the agent's
+# user channel signals new messages without an executor). Every pushed
+# conversation is marked read so the hooks never inject it a second time.
+_CHANNEL_POLL_SECONDS = 3.0
+_CHANNEL_SEEN_MAX = 500
+_stdout_lock = threading.Lock()
+
+CHANNEL_INSTRUCTIONS = (
+    "agntchat messages arrive as "
+    '<channel source="agntchat" conversation_id="…" sender="…" owner_dm="true|false">. '
+    "When owner_dm is true, answer in your normal response: your terminal replies are "
+    "mirrored into that conversation automatically, so do not also call send_message "
+    "for it. For any other conversation, reply with the send_message tool passing that "
+    "conversation_id. Task events carry a task_id — use the task tools (accept_task, "
+    "report_progress, complete-task) on it."
+)
+
+
+def _write_out(obj: dict[str, Any]) -> None:
+    line = json.dumps(obj) + "\n"
+    with _stdout_lock:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
+
+def _channel_events(data: dict[str, Any], seen: set[str]) -> tuple[list[dict[str, Any]], list[str]]:
+    """Turn one inbox payload into channel notifications for everything not
+    yet pushed. Returns `(notifications, conversation_ids_to_mark_read)`.
+    Pure — the poll loop does the I/O."""
+    notes: list[dict[str, Any]] = []
+    to_read: list[str] = []
+    for conv in data.get("unread") or []:
+        conv_id = str(conv.get("conversationId") or "")
+        fresh = [m for m in (conv.get("messages") or []) if str(m.get("id")) not in seen]
+        if not conv_id or not fresh:
+            continue
+        label = conv.get("title") or conv.get("type") or "conversation"
+        for m in fresh:
+            seen.add(str(m.get("id")))
+            content = (m.get("content") or "").strip()
+            if m.get("contentType") not in (None, "text"):
+                content = f"[{m.get('contentType')}] {content}".strip()
+            meta = {
+                "conversation_id": conv_id,
+                "conversation": str(label),
+                "sender": str(m.get("senderName") or m.get("senderType") or "someone"),
+                "owner_dm": "true" if conv.get("ownerDm") else "false",
+                "message_id": str(m.get("id") or ""),
+            }
+            notes.append(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/claude/channel",
+                    "params": {"content": content, "meta": meta},
+                }
+            )
+        to_read.append(conv_id)
+    for t in data.get("tasks") or []:
+        key = f"task:{t.get('id')}"
+        if key in seen:
+            continue
+        seen.add(key)
+        notes.append(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/claude/channel",
+                "params": {
+                    "content": f"Task assigned to you ({t.get('status')}): {t.get('title')}",
+                    "meta": {
+                        "task_id": str(t.get("id") or ""),
+                        "conversation_id": str(t.get("conversationId") or ""),
+                        "kind": "task",
+                    },
+                },
+            }
+        )
+    return notes, to_read
+
+
+def _channel_poll_loop() -> None:
+    # The hook module is stdlib-only and owns the credentials + cached agent
+    # JWT; reuse it rather than sharing the async ExecutorClient across
+    # threads (each tool call runs its own event loop on the main thread).
+    try:
+        import agntchat_hook as hook  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Channel: hook module unavailable (%s); no live push", exc)
+        return
+    creds = hook._load_credentials()
+    if not creds:
+        return
+    seen: set[str] = set()
+    logger.info("Channel: polling inbox every %ss", _CHANNEL_POLL_SECONDS)
+    while True:
+        time.sleep(_CHANNEL_POLL_SECONDS)
+        try:
+            status, data = hook._api(creds, "GET", "/api/agents/me/inbox")
+            if status != 200 or not isinstance(data, dict):
+                continue
+            notes, to_read = _channel_events(data, seen)
+            for note in notes:
+                _write_out(note)
+            for conv_id in to_read:
+                hook._api(creds, "POST", f"/api/conversations/{conv_id}/read")
+            if len(seen) > _CHANNEL_SEEN_MAX:
+                seen.clear()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Channel poll failed: %s", exc)
+
+
+_channel_thread: threading.Thread | None = None
+
+
+def _start_channel_poller() -> None:
+    global _channel_thread
+    if not STANDALONE or _channel_thread is not None:
+        return
+    _channel_thread = threading.Thread(target=_channel_poll_loop, name="agntchat-channel", daemon=True)
+    _channel_thread.start()
+
 
 # --- Tool catalog ---
 
@@ -197,17 +330,20 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
     params = req.get("params", {})
 
     if method == "initialize":
-        return {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "serverInfo": {"name": "AgentGram Tools", "version": "1.0.0"},
-                "capabilities": {"tools": {}},
-            },
+        result: dict[str, Any] = {
+            "protocolVersion": "2024-11-05",
+            "serverInfo": {"name": "AgentGram Tools", "version": "1.0.0"},
+            "capabilities": {"tools": {}},
         }
+        if STANDALONE:
+            # Channel: Claude Code registers a listener for our push
+            # notifications and hands `instructions` to the model.
+            result["capabilities"]["experimental"] = {"claude/channel": {}}
+            result["instructions"] = CHANNEL_INSTRUCTIONS
+        return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
     if method == "notifications/initialized":
+        _start_channel_poller()
         return None
 
     if method == "tools/list":
@@ -418,8 +554,7 @@ def main() -> None:
 
         response = handle_request(req)
         if response is not None:
-            sys.stdout.write(json.dumps(response) + "\n")
-            sys.stdout.flush()
+            _write_out(response)
 
 
 if __name__ == "__main__":

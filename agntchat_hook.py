@@ -4,9 +4,12 @@
 Wire this into Claude Code's hooks (or Codex's ``notify``) and the session
 you are driving yourself shows up in agntchat as an agent: online while the
 session lives, "thinking"/"tool call"/"waiting" as it works, a session card
-in the owner DM at start and end, and an inbox digest injected before each
-prompt. `python -m agentchat connect <invite-code>` prints the exact hook
-configuration.
+in the owner DM at start and end, and the transcript mirrored into that DM —
+every prompt you type and every assistant message, as they happen. Chat
+flows the other way too: unread agntchat messages are injected before each
+prompt and, at the end of a turn, keep the turn going so the session
+answers them (the standalone MCP server also pushes them live as a channel).
+`python -m agentchat connect <invite-code>` prints the exact configuration.
 
 Standard library only — this runs under whatever ``python3`` the CLI finds,
 which may not have the bridge's dependencies. Never blocks the session:
@@ -42,10 +45,17 @@ _DIR = Path(os.environ.get("AGNTCHAT_HOME", str(Path.home() / ".agentchat")))
 _CREDENTIALS = Path(os.environ.get("AGNTCHAT_CREDENTIALS", str(_DIR / "credentials.json")))
 _TOKEN_CACHE = _DIR / "hook-token.json"
 _PIDS = _DIR / "hooks"
+_DISPLAY = _DIR / "display"
 _TIMEOUT = 5
 # Agent JWTs live 15 minutes server-side; refresh well inside that.
 _TOKEN_MAX_AGE = 12 * 60
 _HEARTBEAT_SECONDS = 60
+# Mirrored transcript text is capped here and server-side (the text
+# message limit).
+_TEXT_MAX_CHARS = 10_000
+# MessageDisplay batches run detached; the final batch waits this long for
+# earlier batches' files before assembling the message.
+_DISPLAY_ASSEMBLE_WAIT = 2.0
 
 # Claude Code hook_event_name → agntchat session event. Anything not listed
 # is ignored (SubagentStart/Stop, PreCompact, ...).
@@ -55,6 +65,7 @@ _EVENT_FOR = {
     "UserPromptSubmit": "prompt",
     "PreToolUse": "tool_start",
     "PostToolUse": "tool_end",
+    "MessageDisplay": "assistant_message",
     "Stop": "stop",
     "Notification": "waiting",
 }
@@ -341,27 +352,167 @@ def _heartbeat_loop(session: str, cli_pid: int) -> None:
 # --- inbox digest --------------------------------------------------------
 
 
-def _inbox_digest(creds: dict) -> Optional[str]:
+def _fetch_inbox(creds: dict) -> Optional[dict]:
     status, data = _api(creds, "GET", "/api/agents/me/inbox")
-    if status != 200:
-        return None
-    tasks = data.get("tasks") or []
+    return data if status == 200 and isinstance(data, dict) else None
+
+
+def _safe_key(value: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in value)[:80]
+
+
+def _conversation_label(conv: dict) -> str:
+    title = conv.get("title")
+    kind = conv.get("type") or "conversation"
+    if conv.get("ownerDm"):
+        return "your owner's DM"
+    return f'{kind} "{title}"' if title else kind
+
+
+def _message_line(msg: dict) -> str:
+    who = msg.get("senderName") or msg.get("senderType") or "someone"
+    text = (msg.get("content") or "").strip()
+    if msg.get("contentType") not in (None, "text"):
+        text = f"[{msg.get('contentType')}] {text}".strip()
+    text = " ".join(text.split())
+    if len(text) > 1500:
+        text = text[:1500] + "…"
+    return f"    {who}: {text}"
+
+
+def _render_inbox(data: dict, *, with_tasks: bool) -> tuple[Optional[str], list[str]]:
+    """Render the inbox for the model. Returns `(digest, conversation_ids)`
+    where the ids are the conversations whose messages were rendered — the
+    caller marks those read so nothing is injected twice."""
+    tasks = (data.get("tasks") or []) if with_tasks else []
     unread = data.get("unread") or []
-    if not tasks and not unread:
-        return None
-    lines = ["agntchat inbox (use the agntchat MCP tools to act on these):"]
+    lines: list[str] = []
+    rendered: list[str] = []
     for t in tasks[:5]:
         lines.append(f"- task {t.get('status')}: {t.get('title')} (task_id {t.get('id')})")
     if len(tasks) > 5:
         lines.append(f"- …and {len(tasks) - 5} more assigned tasks")
     for u in unread[:5]:
-        label = u.get("title") or u.get("type") or "conversation"
-        lines.append(
-            f"- {u.get('count')} unread in {label} (conversation_id {u.get('conversationId')})"
-        )
+        conv_id = u.get("conversationId")
+        msgs = u.get("messages") or []
+        label = _conversation_label(u)
+        if u.get("ownerDm"):
+            how = "reply in your normal response — it is mirrored there automatically"
+        else:
+            how = "reply with the send_message tool, passing this conversation_id"
+        if msgs:
+            lines.append(f"- {label} (conversation_id {conv_id}; {how}):")
+            lines.extend(_message_line(m) for m in msgs)
+            if conv_id:
+                rendered.append(conv_id)
+        else:
+            lines.append(f"- {u.get('count')} unread in {label} (conversation_id {conv_id}; {how})")
     if len(unread) > 5:
         lines.append(f"- …and {len(unread) - 5} more conversations with unread messages")
-    return "\n".join(lines)
+    if not lines:
+        return None, []
+    header = "agntchat inbox (use the agntchat MCP tools to act on these):"
+    return "\n".join([header, *lines]), rendered
+
+
+def _mark_read(creds: dict, conversation_ids: list[str]) -> None:
+    for conv_id in conversation_ids:
+        _api(creds, "POST", f"/api/conversations/{conv_id}/read")
+
+
+def _inbox_digest(creds: dict) -> Optional[str]:
+    """Prompt-time digest: tasks + unread messages; marks the rendered
+    conversations read since the model now has them."""
+    data = _fetch_inbox(creds)
+    if not data:
+        return None
+    digest, rendered = _render_inbox(data, with_tasks=True)
+    _mark_read(creds, rendered)
+    return digest
+
+
+def _stop_decision(creds: dict) -> Optional[dict]:
+    """End of turn: if agntchat messages arrived while the session worked,
+    keep the turn going so it answers them (Claude Code caps consecutive
+    continuations, and the messages are marked read here, so this cannot
+    loop on the same content). Tasks never block a stop — they would block
+    every stop until done."""
+    data = _fetch_inbox(creds)
+    if not data:
+        return None
+    digest, rendered = _render_inbox(data, with_tasks=False)
+    if not rendered or not digest:
+        return None
+    _mark_read(creds, rendered)
+    return {
+        "decision": "block",
+        "reason": (
+            "New agntchat messages arrived during this turn. Answer them now:\n" + digest
+        ),
+    }
+
+
+# --- assistant messages (MessageDisplay) ---------------------------------
+
+
+def _collect_display(session: str, payload: dict) -> Optional[str]:
+    """Assemble one assistant message from MessageDisplay batches.
+
+    Each batch (a hook run of its own, detached) writes its `delta` to a
+    per-index file; the `final` batch waits briefly for earlier indices,
+    concatenates in order, and returns the text. Returns None until final.
+    """
+    msg_id = payload.get("message_id")
+    delta = payload.get("delta") or ""
+    final = bool(payload.get("final"))
+    try:
+        index = int(payload.get("index") or 0)
+    except (TypeError, ValueError):
+        index = 0
+    if not msg_id:
+        return delta if final else None
+
+    folder = _DISPLAY / _safe_key(session) / _safe_key(str(msg_id))
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"{index:06d}").write_text(delta, encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        _log(f"could not buffer display batch: {exc}")
+        return delta if final else None
+    if not final:
+        return None
+
+    deadline = time.time() + _DISPLAY_ASSEMBLE_WAIT
+    while True:
+        try:
+            have = {p.name for p in folder.iterdir()}
+        except Exception:  # noqa: BLE001
+            have = set()
+        missing = [i for i in range(index) if f"{i:06d}" not in have]
+        if not missing or time.time() >= deadline:
+            break
+        time.sleep(0.1)
+
+    parts: list[str] = []
+    try:
+        for p in sorted(folder.iterdir()):
+            parts.append(p.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        _log(f"could not assemble display batches: {exc}")
+    _rm_tree(folder)
+    return "".join(parts)
+
+
+def _rm_tree(path: Path) -> None:
+    try:
+        for child in path.iterdir():
+            if child.is_dir():
+                _rm_tree(child)
+            else:
+                child.unlink()
+        path.rmdir()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # --- main ----------------------------------------------------------------
@@ -391,6 +542,20 @@ def _handle_hook() -> None:
     if event in ("tool_start", "tool_end") and payload.get("tool_name"):
         body["toolName"] = str(payload["tool_name"])[:60]
 
+    # Transcript mirror: what the user typed, each finished assistant
+    # message, and (fallback, deduped server-side) the turn's final text.
+    if event == "assistant_message":
+        if payload.get("agent_id"):
+            return  # a subagent's output is not the conversation
+        text = _collect_display(session, payload)
+        if text is None or not text.strip():
+            return
+        body["text"] = text[:_TEXT_MAX_CHARS]
+    elif event == "prompt" and isinstance(payload.get("prompt"), str):
+        body["text"] = payload["prompt"][:_TEXT_MAX_CHARS]
+    elif event == "stop" and isinstance(payload.get("last_assistant_message"), str):
+        body["text"] = payload["last_assistant_message"][:_TEXT_MAX_CHARS]
+
     status, _ = _api(creds, "POST", "/api/agents/me/sessions/events", body)
     if status == 404:
         _log("external agents are not enabled for this account (404)")
@@ -398,11 +563,19 @@ def _handle_hook() -> None:
 
     if event == "session_start":
         _spawn_heartbeat(session)
+    elif event == "session_end":
+        _rm_tree(_DISPLAY / _safe_key(session))
     elif event == "prompt":
         digest = _inbox_digest(creds)
         if digest:
             # stdout of a UserPromptSubmit hook is added to the model's context.
             sys.stdout.write(digest + "\n")
+            sys.stdout.flush()
+    elif event == "stop":
+        decision = _stop_decision(creds)
+        if decision:
+            # JSON on stdout is the Stop hook's decision channel.
+            sys.stdout.write(json.dumps(decision) + "\n")
             sys.stdout.flush()
 
 
@@ -427,8 +600,28 @@ def _handle_codex_notify(raw: str) -> None:
     creds = _load_credentials()
     if not creds:
         return
+    context = _context(os.getcwd(), with_git=True)
+    # Codex hands us the turn's input and final text — mirror both.
+    inputs = payload.get("input-messages") or payload.get("input_messages") or []
+    prompt = "\n".join(str(m) for m in inputs if isinstance(m, str)).strip()
+    if prompt:
+        _api(
+            creds,
+            "POST",
+            "/api/agents/me/sessions/events",
+            {
+                "sessionId": str(session),
+                "event": "prompt",
+                "tool": "codex",
+                "text": prompt[:_TEXT_MAX_CHARS],
+                **context,
+            },
+        )
     body: dict[str, Any] = {"sessionId": str(session), "event": "stop", "tool": "codex"}
-    body.update(_context(os.getcwd(), with_git=True))
+    body.update(context)
+    reply = payload.get("last-assistant-message") or payload.get("last_assistant_message")
+    if isinstance(reply, str) and reply.strip():
+        body["text"] = reply[:_TEXT_MAX_CHARS]
     status, _ = _api(creds, "POST", "/api/agents/me/sessions/events", body)
     if status == 200:
         _spawn_heartbeat(str(session))

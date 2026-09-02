@@ -33,17 +33,25 @@ MCP_SERVER_SCRIPT = _BRIDGE_DIR / "agentgram_mcp_server.py"
 HOOK_SCRIPT = _BRIDGE_DIR / "agntchat_hook.py"
 
 # Claude Code hook events we report, and whether the hook may run detached.
-# UserPromptSubmit stays synchronous: its stdout is injected into the
-# model's context (the inbox digest). Everything else is fire-and-forget.
+# Two stay synchronous because their stdout is a decision channel:
+# UserPromptSubmit (the inbox digest goes into the model's context) and
+# Stop (unread agntchat messages keep the turn going so the session answers
+# them). Everything else is fire-and-forget — MessageDisplay in particular
+# must never slow the terminal's rendering.
 _CLAUDE_HOOK_EVENTS = [
     ("SessionStart", True),
     ("SessionEnd", False),
     ("UserPromptSubmit", False),
     ("PreToolUse", True),
     ("PostToolUse", True),
-    ("Stop", True),
+    ("MessageDisplay", True),
+    ("Stop", False),
     ("Notification", True),
 ]
+
+# The MCP server name registered by `claude mcp add`; `--channels`-style
+# flags address it as `server:<name>`.
+MCP_SERVER_NAME = "agntchat"
 
 
 def load_credentials() -> Optional[dict[str, Any]]:
@@ -83,7 +91,19 @@ def python_executable() -> str:
 def claude_mcp_add_command(python: Optional[str] = None) -> str:
     """The `claude mcp add` line that registers the agntchat MCP server."""
     py = python or python_executable()
-    return f"claude mcp add --scope user agntchat -- {_quote(py)} {_quote(str(MCP_SERVER_SCRIPT))}"
+    return (
+        f"claude mcp add --scope user {MCP_SERVER_NAME} -- "
+        f"{_quote(py)} {_quote(str(MCP_SERVER_SCRIPT))}"
+    )
+
+
+def claude_channels_command() -> str:
+    """How to start Claude Code so agntchat messages are pushed into the
+    session live (Claude Code "channels"). Custom channels are behind the
+    development flag while channels are in research preview; without it,
+    messages still reach the session before each prompt and at the end of
+    each turn via the hooks."""
+    return f"claude --dangerously-load-development-channels server:{MCP_SERVER_NAME}"
 
 
 def codex_mcp_add_command(python: Optional[str] = None) -> str:
@@ -141,8 +161,16 @@ def render_instructions(tool: str, python: Optional[str] = None) -> str:
             "",
             _indent(hooks, 3),
             "",
-            "Then start a new `claude` session. It appears in agntchat's agent list as",
-            "an External agent while it runs.",
+            "3. Start a new session. For live chat (agntchat messages pushed into the",
+            "   session as they arrive) start it as a channel:",
+            "",
+            f"   {claude_channels_command()}",
+            "",
+            "   A plain `claude` works too: messages then reach the session before each",
+            "   prompt and at the end of each turn.",
+            "",
+            "The session appears in agntchat's agent list as an External agent while it",
+            "runs, and its transcript is mirrored into your DM with it.",
         ]
     )
 

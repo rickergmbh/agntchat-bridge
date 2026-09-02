@@ -167,7 +167,12 @@ async def _cmd_connect(args: argparse.Namespace) -> None:
         for step in external.install_claude():
             print(f"  • {step}")
         print()
-        print("Start a new `claude` session — it appears in agntchat as an External agent.")
+        print("Start a new session — for live chat from agntchat, start it as a channel:")
+        print()
+        print(f"  {external.claude_channels_command()}")
+        print()
+        print("(A plain `claude` works too; messages then arrive before each prompt and")
+        print("at the end of each turn.) It appears in agntchat as an External agent.")
     else:
         print(external.render_instructions(tool))
     print()
