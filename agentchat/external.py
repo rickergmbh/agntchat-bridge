@@ -49,7 +49,8 @@ _CLAUDE_HOOK_EVENTS = [
 def load_credentials() -> Optional[dict[str, Any]]:
     """The saved agent credentials, or None when not connected.
 
-    Returns `{"agent_id", "api_key", "gateway_url", "display_name"?}`.
+    Returns `{"agent_id", "api_key", "gateway_url", "display_name"?}` with
+    `gateway_url` normalized to the API base (see `api_base_url`).
     `AGNTCHAT_API_URL` overrides the saved gateway URL.
     """
     try:
@@ -58,10 +59,21 @@ def load_credentials() -> Optional[dict[str, Any]]:
         return None
     if not isinstance(data, dict) or not data.get("agent_id") or not data.get("api_key"):
         return None
-    data["gateway_url"] = (
+    data["gateway_url"] = api_base_url(
         os.environ.get("AGNTCHAT_API_URL") or data.get("gateway_url") or DEFAULT_API_URL
-    ).rstrip("/")
+    )
     return data
+
+
+def api_base_url(url: str) -> str:
+    """The backend's API base for a saved `gateway_url`.
+
+    The invite claim returns the *executor gateway* (`<base>/api/gateway`),
+    which the bridge uses as-is; the hook and the standalone MCP server call
+    `<base>/api/...` themselves, so strip that suffix.
+    """
+    url = url.rstrip("/")
+    return url[: -len("/api/gateway")] if url.endswith("/api/gateway") else url
 
 
 def python_executable() -> str:

@@ -76,11 +76,14 @@ def _load_credentials() -> Optional[dict]:
         return None
     if not data.get("agent_id") or not data.get("api_key"):
         return None
-    data["gateway_url"] = (
+    # The claim saves the executor gateway (`<base>/api/gateway`); we call
+    # `<base>/api/...` ourselves, so reduce it to the API base.
+    url = (
         os.environ.get("AGNTCHAT_API_URL")
         or data.get("gateway_url")
         or "https://agentchat-backend.fly.dev"
     ).rstrip("/")
+    data["gateway_url"] = url[: -len("/api/gateway")] if url.endswith("/api/gateway") else url
     return data
 
 

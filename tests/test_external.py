@@ -24,6 +24,31 @@ def test_load_credentials_reads_file(tmp_path, monkeypatch):
     assert loaded["gateway_url"] == "https://x"
 
 
+def test_load_credentials_reduces_executor_gateway_to_api_base(tmp_path, monkeypatch):
+    """`connect` saves what the claim returns — the executor gateway
+    (`<base>/api/gateway`). The hook and the standalone MCP server call
+    `<base>/api/...` themselves; a verbatim value would 404 every request."""
+    creds = tmp_path / "credentials.json"
+    creds.write_text(
+        json.dumps(
+            {
+                "agent_id": "a1",
+                "api_key": "ak_x",
+                "gateway_url": "https://agentchat-backend.fly.dev/api/gateway",
+            }
+        )
+    )
+    monkeypatch.setattr(external, "CREDENTIALS_FILE", creds)
+    monkeypatch.delenv("AGNTCHAT_API_URL", raising=False)
+    assert external.load_credentials()["gateway_url"] == "https://agentchat-backend.fly.dev"
+
+    monkeypatch.setattr(hook, "_CREDENTIALS", creds)
+    assert hook._load_credentials()["gateway_url"] == "https://agentchat-backend.fly.dev"
+
+    assert external.api_base_url("https://x/api/gateway/") == "https://x"
+    assert external.api_base_url("https://x/") == "https://x"
+
+
 def test_load_credentials_missing_or_incomplete(tmp_path, monkeypatch):
     monkeypatch.setattr(external, "CREDENTIALS_FILE", tmp_path / "nope.json")
     assert external.load_credentials() is None
