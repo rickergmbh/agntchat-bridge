@@ -2938,6 +2938,43 @@ def _diff_resolved_toolkit(
     }
 
 
+def _degraded_refresh_state(
+    *,
+    currently_degraded: bool,
+    fetch_empty: bool,
+    streak: int,
+    ttl: float,
+    retry_interval: float,
+    max_attempts: int,
+) -> tuple[int, float]:
+    """Decide the next wake-time refresh cadence and degraded-streak count.
+
+    Hardening for issue #146: a toolkit that boots (or stays) empty has no
+    known-good state to protect from a transient blip, so treating "fetch
+    came back empty" identically whether or not there's a live toolkit at
+    stake meant a persistently-empty backend could only ever be healed by a
+    manual restart — every wake-time refresh silently waited out the full
+    TTL and tried again, indistinguishable from doing nothing.
+
+    While `currently_degraded` and the fetch is still empty, escalate to a
+    fast `retry_interval` cadence for up to `max_attempts` consecutive
+    attempts (bounded, so a genuinely broken backend isn't hammered
+    forever), then fall back to `ttl`. Any fetch that isn't
+    (degraded AND empty) — i.e. the toolkit healed, or it was never degraded
+    to begin with — resets the streak and cadence to normal.
+
+    Pure — no I/O — so the escalation policy is unit-testable independent of
+    `_maybe_refresh_resolved_tools`'s async fetch plumbing.
+
+    Returns ``(new_streak, next_refresh_after)``.
+    """
+    if currently_degraded and fetch_empty:
+        new_streak = streak + 1
+        delay = retry_interval if new_streak <= max_attempts else ttl
+        return new_streak, delay
+    return 0, ttl
+
+
 def _build_system_prompt_from_directives(
     directives: dict[str, Any] | None,
 ) -> str | None:
@@ -3834,12 +3871,22 @@ def run_single_agent(
     # don't hit /api/me on every single turn.
     _tools_refreshed_at = _time.monotonic()
     _TOOLS_REFRESH_TTL = 60.0
+    # Hardening for #146: a boot (or refresh) that landed with an empty
+    # `resolvedTools` catalog has no known-good toolkit to protect, so waiting
+    # out the full 60s TTL between retries — forever — turns a transient
+    # backend blip into a manual-restart-only outage. Retry on a fast 10s
+    # cadence for a bounded number of attempts while degraded, then fall back
+    # to the normal TTL so a genuinely broken backend isn't hammered forever.
+    _DEGRADED_RETRY_INTERVAL = 10.0
+    _DEGRADED_ESCALATION_ATTEMPTS = 5
+    _degraded_streak = 0
+    _next_refresh_after = _TOOLS_REFRESH_TTL
 
     async def _maybe_refresh_resolved_tools() -> None:
         nonlocal resolved_tools, server_tools, _tool_defs, _tool_prompt_suffix
-        nonlocal _has_mcp, _tools_refreshed_at
+        nonlocal _has_mcp, _tools_refreshed_at, _degraded_streak, _next_refresh_after
 
-        if _time.monotonic() - _tools_refreshed_at < _TOOLS_REFRESH_TTL:
+        if _time.monotonic() - _tools_refreshed_at < _next_refresh_after:
             return
         # Stamp before the fetch so a slow/failed call doesn't let concurrent
         # turns pile up duplicate refreshes.
@@ -3854,11 +3901,64 @@ def run_single_agent(
             return
 
         all_resolved = (fresh or {}).get("resolvedTools") or []
+        currently_degraded = not resolved_tools and not server_tools
+
+        if not all_resolved and currently_degraded:
+            # Authoritatively-empty-so-far, not a blip against a live
+            # toolkit — there's nothing to protect, so keep retrying on the
+            # fast cadence instead of silently waiting out the full TTL
+            # again (that silence is exactly what made "try again" look like
+            # a no-op in #146).
+            _degraded_streak, _next_refresh_after = _degraded_refresh_state(
+                currently_degraded=True,
+                fetch_empty=True,
+                streak=_degraded_streak,
+                ttl=_TOOLS_REFRESH_TTL,
+                retry_interval=_DEGRADED_RETRY_INTERVAL,
+                max_attempts=_DEGRADED_ESCALATION_ATTEMPTS,
+            )
+            if _degraded_streak <= _DEGRADED_ESCALATION_ATTEMPTS:
+                logger.warning(
+                    "[%s] Still toolless after %d fast retries (/api/me keeps "
+                    "returning empty resolvedTools) — retrying again in %.0fs",
+                    executor_key, _degraded_streak, _next_refresh_after,
+                )
+            else:
+                logger.error(
+                    "[%s] Toolless after %d retries — /api/me resolvedTools "
+                    "looks authoritatively empty, not transient. This agent "
+                    "cannot call any AgentGram platform tool until the backend "
+                    "resolution is fixed (or self-heals) and picked up; falling "
+                    "back to a %.0fs retry cadence",
+                    executor_key, _degraded_streak, _next_refresh_after,
+                )
+            return
+
         # Partition + diff the fetched catalog. Returns None on an empty fetch
-        # (transient blip — keep the current toolkit) or when nothing changed.
+        # against a known-good toolkit (transient blip — keep it) or when
+        # nothing changed.
         diff = _diff_resolved_toolkit(all_resolved, resolved_tools, server_tools)
         if diff is None:
+            _degraded_streak, _next_refresh_after = _degraded_refresh_state(
+                currently_degraded=False, fetch_empty=not all_resolved,
+                streak=_degraded_streak, ttl=_TOOLS_REFRESH_TTL,
+                retry_interval=_DEGRADED_RETRY_INTERVAL,
+                max_attempts=_DEGRADED_ESCALATION_ATTEMPTS,
+            )
             return
+
+        if currently_degraded and _degraded_streak:
+            logger.info(
+                "[%s] Toolkit self-healed after %d degraded refresh attempt(s) "
+                "— resolvedTools is no longer empty",
+                executor_key, _degraded_streak,
+            )
+        _degraded_streak, _next_refresh_after = _degraded_refresh_state(
+            currently_degraded=False, fetch_empty=False,
+            streak=_degraded_streak, ttl=_TOOLS_REFRESH_TTL,
+            retry_interval=_DEGRADED_RETRY_INTERVAL,
+            max_attempts=_DEGRADED_ESCALATION_ATTEMPTS,
+        )
 
         added = diff["added"]
         removed = diff["removed"]

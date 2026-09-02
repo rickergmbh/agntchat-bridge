@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent_bridge import _diff_resolved_toolkit, execute_tool_calls
+from agent_bridge import _degraded_refresh_state, _diff_resolved_toolkit, execute_tool_calls
 
 
 def _tool(name: str, *, category: str | None = None, method: str | None = None) -> dict:
@@ -92,6 +92,54 @@ class TestDiffResolvedToolkit:
         diff = _diff_resolved_toolkit(fresh, current, current_server=[])
         assert diff is not None
         assert {t["name"] for t in diff["server"]} == {"web_search"}
+
+
+# ---------------------------------------------------------------------------
+# _degraded_refresh_state — bounded fast-retry escalation (#146 hardening)
+# ---------------------------------------------------------------------------
+
+class TestDegradedRefreshState:
+    TTL = 60.0
+    RETRY = 10.0
+    MAX_ATTEMPTS = 5
+
+    def _call(self, *, currently_degraded: bool, fetch_empty: bool, streak: int) -> tuple[int, float]:
+        return _degraded_refresh_state(
+            currently_degraded=currently_degraded,
+            fetch_empty=fetch_empty,
+            streak=streak,
+            ttl=self.TTL,
+            retry_interval=self.RETRY,
+            max_attempts=self.MAX_ATTEMPTS,
+        )
+
+    def test_not_degraded_resets_to_normal_ttl(self):
+        # A live toolkit hitting a transient empty fetch (or a successful,
+        # non-empty refresh) always gets the normal cadence — nothing to
+        # escalate, there's a known-good toolkit already.
+        streak, delay = self._call(currently_degraded=False, fetch_empty=True, streak=3)
+        assert (streak, delay) == (0, self.TTL)
+
+    def test_degraded_with_empty_fetch_escalates_to_fast_retry(self):
+        streak, delay = self._call(currently_degraded=True, fetch_empty=True, streak=0)
+        assert (streak, delay) == (1, self.RETRY)
+
+        streak, delay = self._call(currently_degraded=True, fetch_empty=True, streak=streak)
+        assert (streak, delay) == (2, self.RETRY)
+
+    def test_degraded_streak_falls_back_to_normal_ttl_after_max_attempts(self):
+        # Bounded: once the fast-retry budget is exhausted, stop hammering
+        # the backend and fall back to the normal TTL cadence.
+        streak, delay = self._call(
+            currently_degraded=True, fetch_empty=True, streak=self.MAX_ATTEMPTS
+        )
+        assert streak == self.MAX_ATTEMPTS + 1
+        assert delay == self.TTL
+
+    def test_degraded_toolkit_that_heals_resets_streak(self):
+        # Fetch came back non-empty (healed) — reset to normal cadence.
+        streak, delay = self._call(currently_degraded=True, fetch_empty=False, streak=4)
+        assert (streak, delay) == (0, self.TTL)
 
 
 # ---------------------------------------------------------------------------
