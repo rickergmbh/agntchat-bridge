@@ -97,6 +97,16 @@ def main() -> None:
         help="Also make sure the user-scope hooks and MCP server are installed",
     )
 
+    # rekey (desktop, #148): the agent's API key was regenerated — refresh
+    # the local binding credentials so bound sessions keep working
+    rekey_parser = subparsers.add_parser(
+        "rekey", help="Refresh the saved credentials for a session-bound external agent"
+    )
+    rekey_parser.add_argument("--agent-id", required=True)
+    rekey_parser.add_argument("--api-key", required=True)
+    rekey_parser.add_argument("--display-name", default="")
+    rekey_parser.add_argument("--gateway-url", default=DEFAULT_GATEWAY_URL)
+
     # info
     info_parser = subparsers.add_parser("info", help="Show public invite info")
     info_parser.add_argument("code", help="Invite code")
@@ -119,6 +129,8 @@ def main() -> None:
         _cmd_sessions(args)
     elif args.command == "bind":
         _cmd_bind(args)
+    elif args.command == "rekey":
+        _cmd_rekey(args)
     elif args.command == "info":
         asyncio.run(_cmd_info(args))
     elif args.command == "status":
@@ -254,6 +266,40 @@ def _cmd_bind(args: argparse.Namespace) -> None:
     if args.install:
         steps = external.install_claude()
     print(json.dumps({"session": args.session, "binding": entry, "home": str(home), "steps": steps}))
+
+
+def _cmd_rekey(args: argparse.Namespace) -> None:
+    """Regenerating an external agent's key invalidates the credentials the
+    picker saved; rewrite them (agent home + any project binding for this
+    agent + the machine default if it is this agent) so nothing goes stale.
+    Also clears the hook's cached token / backoff for that agent."""
+    from . import external
+    from .invite import ClaimResult, save_credentials
+
+    result = ClaimResult(
+        agent_id=args.agent_id,
+        api_key=args.api_key,
+        gateway_url=args.gateway_url,
+        display_name=args.display_name or args.agent_id,
+    )
+    homes = [external.agent_home(args.agent_id)]
+    default = external._read_credentials_at(external._HOME)
+    if default and default.get("agent_id") == args.agent_id:
+        homes.append(external._HOME)
+    for entry in external.load_session_bindings().values():
+        cwd = entry.get("cwd") if isinstance(entry, dict) else None
+        home = external.find_project_home(cwd) if cwd else None
+        creds = external._read_credentials_at(home) if home else None
+        if creds and creds.get("agent_id") == args.agent_id and home not in homes:
+            homes.append(home)
+    written = []
+    for home in homes:
+        written.append(str(save_credentials(result, home)))
+        try:
+            (home / "hook-token.json").unlink()
+        except FileNotFoundError:
+            pass
+    print(json.dumps({"agent": args.agent_id, "written": written}))
 
 
 async def _cmd_info(args: argparse.Namespace) -> None:

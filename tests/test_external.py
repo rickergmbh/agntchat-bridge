@@ -607,3 +607,30 @@ def test_token_exchange_backs_off_after_failures(monkeypatch, tmp_path):
     assert "failed_at" not in json.loads(hook._TOKEN_CACHE.read_text())
     # The exchange waits longer than an ordinary hook call.
     assert hook._TOKEN_TIMEOUT > hook._TIMEOUT
+
+
+def test_rekey_rewrites_every_home_for_the_agent(tmp_path, monkeypatch, capsys):
+    from agentchat import __main__ as cli  # noqa: PLC0415
+    from agentchat.invite import ClaimResult, save_credentials  # noqa: PLC0415
+
+    machine = tmp_path / "machine"
+    monkeypatch.setattr(external, "_HOME", machine)
+    monkeypatch.setattr(external, "AGENTS_DIR", machine / "agents")
+    monkeypatch.setattr(external, "SESSIONS_FILE", machine / "sessions.json")
+    # machine default is this agent; a project binding too; another agent untouched
+    save_credentials(ClaimResult("a1", "old", "u", "A1"), machine)
+    save_credentials(ClaimResult("a1", "old", "u", "A1"), external.agent_home("a1"))
+    (external.agent_home("a1") / "hook-token.json").write_text("{}")
+    save_credentials(ClaimResult("a2", "keep", "u", "A2"), external.agent_home("a2"))
+    repo = tmp_path / "repo"
+    save_credentials(ClaimResult("a1", "old", "u", "A1"), external.project_home(repo))
+    external.bind_session("s1", "a1", cwd=str(repo))
+
+    import argparse
+    cli._cmd_rekey(argparse.Namespace(agent_id="a1", api_key="new", display_name="A1", gateway_url="u"))
+    out = json.loads(capsys.readouterr().out)
+    assert len(out["written"]) == 3
+    for home in (machine, external.agent_home("a1"), external.project_home(repo)):
+        assert json.loads((home / "credentials.json").read_text())["api_key"] == "new"
+    assert not (external.agent_home("a1") / "hook-token.json").exists()
+    assert json.loads((external.agent_home("a2") / "credentials.json").read_text())["api_key"] == "keep"
