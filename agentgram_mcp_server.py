@@ -88,6 +88,10 @@ TOOL_DEFS_JSON = os.environ.get("AGENTGRAM_TOOL_DEFS", "[]")
 # never inject a pushed message a second time, and when several sessions
 # run as one agent each message reaches exactly one of them.
 _CHANNEL_POLL_SECONDS = 3.0
+# When the backend is unreachable, poll less and less often (doubling per
+# failure, capped) — a few sessions polling a struggling server every 3s
+# with bcrypt-heavy token exchanges made it worse (2026-09-03).
+_CHANNEL_POLL_MAX_SECONDS = 120.0
 _CHANNEL_SEEN_MAX = 500
 _stdout_lock = threading.Lock()
 
@@ -173,9 +177,10 @@ def _channel_poll_loop() -> None:
         logger.warning("Channel: hook module unavailable (%s); no live push", exc)
         return
     seen: set[str] = set()
+    delay = _CHANNEL_POLL_SECONDS
     logger.info("Channel: polling inbox every %ss", _CHANNEL_POLL_SECONDS)
     while True:
-        time.sleep(_CHANNEL_POLL_SECONDS)
+        time.sleep(delay)
         try:
             # Re-resolve every poll: the desktop picker may have re-bound this
             # session to another agent since the last one.
@@ -186,7 +191,11 @@ def _channel_poll_loop() -> None:
                 hook._use_home(Path(creds["_home"]))
             status, data = hook._api(creds, "GET", "/api/agents/me/inbox?claim=true")
             if status != 200 or not isinstance(data, dict):
+                delay = min(delay * 2, _CHANNEL_POLL_MAX_SECONDS)
+                if status in (0, 401, 404):
+                    logger.warning("Channel poll failed (HTTP %s); next in %.0fs", status, delay)
                 continue
+            delay = _CHANNEL_POLL_SECONDS
             notes, _claimed = _channel_events(data, seen)
             for note in notes:
                 _write_out(note)

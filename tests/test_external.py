@@ -577,3 +577,33 @@ def test_mcp_server_switches_agent_when_the_binding_changes(monkeypatch, tmp_pat
     assert server.AGENT_ID == "new" and server.API_KEY == "new-key" and server.API_URL == "https://x"
     assert server.TOOLS == [] and server._tool_executor is None
     assert out == [{"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}]
+
+
+def test_token_exchange_backs_off_after_failures(monkeypatch, tmp_path):
+    hook._use_home(tmp_path / "home")
+    calls = []
+    monkeypatch.setattr(hook, "_request", lambda *a, **k: calls.append(a) or (0, {}))
+    creds = {"agent_id": "a", "api_key": "k", "gateway_url": "u"}
+    assert hook._token(creds) is None
+    assert len(calls) == 1
+    # Cooling down: no second network attempt.
+    assert hook._token(creds) is None
+    assert len(calls) == 1
+    cached = json.loads(hook._TOKEN_CACHE.read_text())
+    assert cached["failures"] == 1 and cached["failed_at"]
+    # Backoff elapsed → one more attempt, failure count grows (doubling wait).
+    cached["failed_at"] -= hook._TOKEN_BACKOFF_BASE + 1
+    hook._TOKEN_CACHE.write_text(json.dumps(cached))
+    assert hook._token(creds) is None
+    assert len(calls) == 2
+    assert json.loads(hook._TOKEN_CACHE.read_text())["failures"] == 2
+    # A success replaces the backoff marker with a cached token.
+    cached = json.loads(hook._TOKEN_CACHE.read_text())
+    cached["failed_at"] -= 10 * hook._TOKEN_BACKOFF_BASE
+    hook._TOKEN_CACHE.write_text(json.dumps(cached))
+    monkeypatch.setattr(hook, "_request", lambda *a, **k: (200, {"token": "jwt"}))
+    assert hook._token(creds) == "jwt"
+    assert hook._token(creds) == "jwt"  # served from cache
+    assert "failed_at" not in json.loads(hook._TOKEN_CACHE.read_text())
+    # The exchange waits longer than an ordinary hook call.
+    assert hook._TOKEN_TIMEOUT > hook._TIMEOUT

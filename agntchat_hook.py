@@ -125,8 +125,18 @@ def _forget_cli_session(session: str) -> None:
     except Exception:  # noqa: BLE001
         pass
 _TIMEOUT = 5
+# The token exchange runs bcrypt server-side and is the one call worth
+# waiting for: a slow-but-working exchange that succeeds gets cached for
+# 12 minutes, one that times out gets retried by every hook and poll.
+_TOKEN_TIMEOUT = 25
 # Agent JWTs live 15 minutes server-side; refresh well inside that.
 _TOKEN_MAX_AGE = 12 * 60
+# After a failed exchange, back off (doubling per failure, capped) instead
+# of letting every hook process and poll re-attempt: N sessions retrying
+# bcrypt-heavy exchanges every few seconds is what starved the backend's
+# CPU on 2026-09-03 and kept every agent offline.
+_TOKEN_BACKOFF_BASE = 30
+_TOKEN_BACKOFF_MAX = 10 * 60
 _HEARTBEAT_SECONDS = 60
 # Mirrored transcript text is capped here and server-side (the text
 # message limit).
@@ -176,7 +186,13 @@ def _load_credentials() -> Optional[dict]:
     return data
 
 
-def _request(method: str, url: str, body: Optional[dict], token: Optional[str]) -> tuple[int, Any]:
+def _request(
+    method: str,
+    url: str,
+    body: Optional[dict],
+    token: Optional[str],
+    timeout: float = _TIMEOUT,
+) -> tuple[int, Any]:
     payload = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(url, data=payload, method=method)
     req.add_header("Content-Type", "application/json")
@@ -184,7 +200,7 @@ def _request(method: str, url: str, body: Optional[dict], token: Optional[str]) 
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:  # noqa: S310
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
             raw = resp.read().decode("utf-8")
             return resp.status, (json.loads(raw) if raw else {})
     except urllib.error.HTTPError as exc:
@@ -198,40 +214,64 @@ def _request(method: str, url: str, body: Optional[dict], token: Optional[str]) 
         return 0, {}
 
 
+def _read_token_cache() -> dict:
+    try:
+        data = json.loads(_TOKEN_CACHE.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _write_token_cache(data: dict) -> None:
+    try:
+        _DIR.mkdir(parents=True, exist_ok=True)
+        _TOKEN_CACHE.write_text(json.dumps(data))
+        os.chmod(_TOKEN_CACHE, 0o600)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _in_backoff(cached: dict, agent_id: str) -> bool:
+    """A recent failed exchange for this agent is still cooling down."""
+    if cached.get("agent_id") != agent_id or not cached.get("failed_at"):
+        return False
+    failures = int(cached.get("failures") or 1)
+    wait = min(_TOKEN_BACKOFF_BASE * (2 ** (failures - 1)), _TOKEN_BACKOFF_MAX)
+    return time.time() - float(cached["failed_at"]) < wait
+
+
 def _exchange_token(creds: dict) -> Optional[str]:
+    cached = _read_token_cache()
+    if _in_backoff(cached, creds["agent_id"]):
+        return None
     status, data = _request(
         "POST",
         f"{creds['gateway_url']}/api/auth/agent-token",
         {"agent_id": creds["agent_id"], "api_key": creds["api_key"]},
         None,
+        timeout=_TOKEN_TIMEOUT,
     )
     token = data.get("token") if status == 200 else None
     if token:
-        try:
-            _DIR.mkdir(parents=True, exist_ok=True)
-            _TOKEN_CACHE.write_text(
-                json.dumps({"agent_id": creds["agent_id"], "token": token, "at": time.time()})
-            )
-            os.chmod(_TOKEN_CACHE, 0o600)
-        except Exception:  # noqa: BLE001
-            pass
+        _write_token_cache({"agent_id": creds["agent_id"], "token": token, "at": time.time()})
     else:
         _log(f"token exchange failed (HTTP {status})")
+        failures = (int(cached.get("failures") or 0) + 1) if cached.get("agent_id") == creds["agent_id"] else 1
+        _write_token_cache(
+            {"agent_id": creds["agent_id"], "failed_at": time.time(), "failures": failures}
+        )
     return token
 
 
 def _token(creds: dict, force: bool = False) -> Optional[str]:
     if not force:
-        try:
-            cached = json.loads(_TOKEN_CACHE.read_text())
-            if (
-                cached.get("agent_id") == creds["agent_id"]
-                and cached.get("token")
-                and time.time() - float(cached.get("at", 0)) < _TOKEN_MAX_AGE
-            ):
-                return cached["token"]
-        except Exception:  # noqa: BLE001
-            pass
+        cached = _read_token_cache()
+        if (
+            cached.get("agent_id") == creds["agent_id"]
+            and cached.get("token")
+            and time.time() - float(cached.get("at", 0)) < _TOKEN_MAX_AGE
+        ):
+            return cached["token"]
     return _exchange_token(creds)
 
 
