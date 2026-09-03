@@ -101,6 +101,9 @@ def main() -> None:
     bind_parser.add_argument("--gateway-url", default=DEFAULT_GATEWAY_URL)
     bind_parser.add_argument("--cwd", default=None, help="The session's working directory")
     bind_parser.add_argument(
+        "--title", default=None, help="Name the session (applied by the hook on its first prompt)"
+    )
+    bind_parser.add_argument(
         "--install",
         action="store_true",
         help="Also make sure the user-scope hooks and MCP server are installed",
@@ -274,9 +277,9 @@ def _cmd_bind(args: argparse.Namespace) -> None:
         if not args.cwd:
             print(json.dumps({"error": "--pending needs --cwd"}))
             sys.exit(2)
-        entry = external.set_pending_binding(args.cwd, args.agent_id)
+        entry = external.set_pending_binding(args.cwd, args.agent_id, title=args.title)
     elif args.session:
-        entry = external.bind_session(args.session, args.agent_id, cwd=args.cwd)
+        entry = external.bind_session(args.session, args.agent_id, cwd=args.cwd, title=args.title)
     else:
         print(json.dumps({"error": "--session or --pending is required"}))
         sys.exit(2)

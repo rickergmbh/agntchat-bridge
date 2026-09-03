@@ -193,7 +193,7 @@ def test_hook_prompt_prints_inbox_digest(monkeypatch, capsys):
         __import__("io").StringIO(json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": "s", "cwd": "/tmp"})),
     )
     hook._handle_hook()
-    out = capsys.readouterr().out
+    out = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
     assert "Fix build" in out
     assert "task_id t1" in out
     assert "James: ping" in out
@@ -278,7 +278,7 @@ def test_hook_prompt_mirrors_text_and_digest_lists_messages(monkeypatch, capsys)
 
     event = calls[0][2]
     assert event["event"] == "prompt" and event["text"] == "fix the build"
-    out = capsys.readouterr().out
+    out = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
     assert "James: how far along?" in out
     assert "your owner's DM" in out and "mirrored there automatically" in out
     assert 'group "Ops"' in out and "send_message" in out
@@ -687,3 +687,23 @@ def test_pending_binding_expires(monkeypatch, tmp_path):
     # Exact folder only — a subfolder is a different session location.
     assert external.take_pending_binding(str(tmp_path / "sub"), path=pending) is None
     assert external.take_pending_binding(str(tmp_path), path=pending) == "ag2"
+
+
+def test_session_title_is_applied_once_on_the_first_prompt(monkeypatch, tmp_path, capsys):
+    machine = tmp_path / "machine"
+    monkeypatch.setattr(hook, "_SESSIONS_FILE", machine / "sessions.json")
+    monkeypatch.setattr(hook, "_AGENTS_DIR", machine / "agents")
+    monkeypatch.setattr(external, "AGENTS_DIR", machine / "agents")
+    monkeypatch.setattr(external, "SESSIONS_FILE", machine / "sessions.json")
+    from agentchat.invite import ClaimResult, save_credentials  # noqa: PLC0415
+    save_credentials(ClaimResult("ag", "k", "u", "Ag"), external.agent_home("ag"))
+    external.bind_session("s1", "ag", cwd="/tmp", title="Docs sprint")
+    monkeypatch.setattr(hook, "_api", lambda creds, method, path, body=None: (200, {}))
+    monkeypatch.setattr(hook, "_git", lambda *a: None)
+    _run_hook(monkeypatch, {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": "/tmp", "prompt": "go"})
+    out = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
+    assert out["sessionTitle"] == "Docs sprint" and out["hookEventName"] == "UserPromptSubmit"
+    assert "title" not in json.loads((machine / "sessions.json").read_text())["s1"]
+    # Second prompt: nothing to say (no inbox, title already applied).
+    _run_hook(monkeypatch, {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": "/tmp", "prompt": "more"})
+    assert capsys.readouterr().out == ""

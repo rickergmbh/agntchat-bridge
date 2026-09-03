@@ -106,6 +106,8 @@ def _claim_pending_binding(session: str, cwd: Optional[str]) -> Optional[Path]:
     except Exception:  # noqa: BLE001
         sessions = {}
     sessions[session] = {"agent_id": entry["agent_id"], "cwd": cwd, "bound_at": time.time()}
+    if entry.get("title"):
+        sessions[session]["title"] = entry["title"]
     pending.pop(key, None)
     try:
         _MACHINE_HOME.mkdir(parents=True, exist_ok=True)
@@ -155,6 +157,27 @@ def _resolve_home(cwd: Optional[str], session: Optional[str] = None, event: Opti
         if (candidate / "credentials.json").is_file():
             _use_home(candidate)
             return
+
+
+def _take_session_title(session: Optional[str]) -> Optional[str]:
+    """The name the picker chose for this session, once: returned on the
+    first call and removed from the binding (Claude Code applies it via the
+    prompt hook's `sessionTitle`)."""
+    if not session:
+        return None
+    try:
+        sessions = json.loads(_SESSIONS_FILE.read_text())
+    except Exception:  # noqa: BLE001
+        return None
+    entry = sessions.get(session) if isinstance(sessions, dict) else None
+    if not isinstance(entry, dict) or not entry.get("title"):
+        return None
+    title = str(entry.pop("title"))
+    try:
+        _SESSIONS_FILE.write_text(json.dumps(sessions, indent=2) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+    return title
 
 
 def _record_cli_session(session: str) -> None:
@@ -748,9 +771,17 @@ def _handle_hook() -> None:
         _forget_cli_session(session)
     elif event == "prompt":
         digest = _inbox_digest(creds)
-        if digest:
-            # stdout of a UserPromptSubmit hook is added to the model's context.
-            sys.stdout.write(digest + "\n")
+        title = _take_session_title(session)
+        if digest or title:
+            # JSON on stdout: `additionalContext` reaches the model like plain
+            # stdout would; `sessionTitle` names the session (the picker's
+            # choice, applied on the first prompt).
+            out: dict[str, Any] = {"hookEventName": "UserPromptSubmit"}
+            if digest:
+                out["additionalContext"] = digest
+            if title:
+                out["sessionTitle"] = title[:100]
+            sys.stdout.write(json.dumps({"hookSpecificOutput": out}) + "\n")
             sys.stdout.flush()
     elif event == "stop":
         decision = _stop_decision(creds)

@@ -89,15 +89,21 @@ def bind_session(
     agent_id: str,
     *,
     cwd: Optional[str] = None,
+    title: Optional[str] = None,
     path: Optional[Path] = None,
 ) -> dict[str, Any]:
     """Point `session_id` at `agent_id` (whose credentials must already be in
-    `agent_home(agent_id)`). Rewrites the bindings file atomically."""
+    `agent_home(agent_id)`). Rewrites the bindings file atomically. `title`
+    is applied by the hook on the session's first prompt (Claude Code's
+    `sessionTitle`), then dropped."""
     target = path or SESSIONS_FILE
     bindings = load_session_bindings(target)
     import time  # noqa: PLC0415
 
-    bindings[session_id] = {"agent_id": agent_id, "cwd": cwd, "bound_at": time.time()}
+    entry: dict[str, Any] = {"agent_id": agent_id, "cwd": cwd, "bound_at": time.time()}
+    if title:
+        entry["title"] = title
+    bindings[session_id] = entry
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(bindings, indent=2) + "\n")
@@ -124,12 +130,16 @@ def _norm_folder(folder: str) -> str:
         return folder
 
 
-def set_pending_binding(folder: str, agent_id: str, path: Optional[Path] = None) -> dict[str, Any]:
+def set_pending_binding(
+    folder: str, agent_id: str, path: Optional[Path] = None, title: Optional[str] = None
+) -> dict[str, Any]:
     import time  # noqa: PLC0415
 
     target = path or PENDING_FILE
     pending = _load_pending(target)
-    entry = {"agent_id": agent_id, "created_at": time.time()}
+    entry: dict[str, Any] = {"agent_id": agent_id, "created_at": time.time()}
+    if title:
+        entry["title"] = title
     pending[_norm_folder(folder)] = entry
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_suffix(".json.tmp")
