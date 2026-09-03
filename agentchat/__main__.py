@@ -85,16 +85,7 @@ def main() -> None:
     bind_parser = subparsers.add_parser(
         "bind", help="Bind a Claude Code session to an external agent (writes local files only)"
     )
-    bind_parser.add_argument(
-        "--session",
-        default=None,
-        help="Claude Code session id; omit with --pending to bind the NEXT session started in --cwd",
-    )
-    bind_parser.add_argument(
-        "--pending",
-        action="store_true",
-        help="Bind the next session that starts in --cwd (the desktop opens the Claude app there)",
-    )
+    bind_parser.add_argument("--session", required=True, help="Claude Code session id")
     bind_parser.add_argument("--agent-id", required=True)
     bind_parser.add_argument("--api-key", required=True)
     bind_parser.add_argument("--display-name", default="")
@@ -273,24 +264,11 @@ def _cmd_bind(args: argparse.Namespace) -> None:
         ),
         home,
     )
-    if args.pending:
-        if not args.cwd:
-            print(json.dumps({"error": "--pending needs --cwd"}))
-            sys.exit(2)
-        entry = external.set_pending_binding(args.cwd, args.agent_id, title=args.title)
-    elif args.session:
-        entry = external.bind_session(args.session, args.agent_id, cwd=args.cwd, title=args.title)
-    else:
-        print(json.dumps({"error": "--session or --pending is required"}))
-        sys.exit(2)
+    entry = external.bind_session(args.session, args.agent_id, cwd=args.cwd, title=args.title)
     steps: list[str] = []
     if args.install:
         steps = external.install_claude()
-    print(
-        json.dumps(
-            {"session": args.session, "pending": bool(args.pending), "binding": entry, "home": str(home), "steps": steps}
-        )
-    )
+    print(json.dumps({"session": args.session, "binding": entry, "home": str(home), "steps": steps}))
 
 
 def _cmd_rekey(args: argparse.Namespace) -> None:

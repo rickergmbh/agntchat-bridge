@@ -65,58 +65,6 @@ _MACHINE_HOME = Path(os.environ.get("AGNTCHAT_HOME", str(Path.home() / ".agentch
 _SESSIONS_FILE = _MACHINE_HOME / "sessions.json"
 _AGENTS_DIR = _MACHINE_HOME / "agents"
 _CLI_PIDS = _MACHINE_HOME / "cli-pids"
-_PENDING_FILE = _MACHINE_HOME / "pending.json"
-_PENDING_TTL = 10 * 60
-
-
-def _agent_home_for(agent_id: str) -> Path:
-    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(agent_id))[:80]
-    return _AGENTS_DIR / safe
-
-
-def _claim_pending_binding(session: str, cwd: Optional[str]) -> Optional[Path]:
-    """SessionStart only: the desktop picker may have declared "the next
-    session started in this folder is agent X" (it opened the Claude app on
-    the folder, which yields no session id up front). Claim it: bind this
-    session id to the agent and drop the pending entry."""
-    if not cwd:
-        return None
-    try:
-        pending = json.loads(_PENDING_FILE.read_text())
-    except Exception:  # noqa: BLE001
-        return None
-    if not isinstance(pending, dict):
-        return None
-    try:
-        key = str(Path(cwd).resolve())
-    except Exception:  # noqa: BLE001
-        key = cwd
-    entry = pending.get(key)
-    if not isinstance(entry, dict) or not entry.get("agent_id"):
-        return None
-    if time.time() - float(entry.get("created_at") or 0) > _PENDING_TTL:
-        return None
-    home = _agent_home_for(entry["agent_id"])
-    if not (home / "credentials.json").is_file():
-        return None
-    try:
-        sessions = json.loads(_SESSIONS_FILE.read_text())
-        if not isinstance(sessions, dict):
-            sessions = {}
-    except Exception:  # noqa: BLE001
-        sessions = {}
-    sessions[session] = {"agent_id": entry["agent_id"], "cwd": cwd, "bound_at": time.time()}
-    if entry.get("title"):
-        sessions[session]["title"] = entry["title"]
-    pending.pop(key, None)
-    try:
-        _MACHINE_HOME.mkdir(parents=True, exist_ok=True)
-        _SESSIONS_FILE.write_text(json.dumps(sessions, indent=2) + "\n")
-        _PENDING_FILE.write_text(json.dumps(pending, indent=2) + "\n")
-    except Exception as exc:  # noqa: BLE001
-        _log(f"could not claim pending binding: {exc}")
-        return None
-    return home
 
 
 def _session_binding(session: Optional[str]) -> Optional[Path]:
@@ -137,12 +85,9 @@ def _session_binding(session: Optional[str]) -> Optional[Path]:
 
 def _resolve_home(cwd: Optional[str], session: Optional[str] = None, event: Optional[str] = None) -> None:
     """Pick the agent for this hook run, most specific first: the session's
-    own binding (or, on session start, a pending binding for its folder that
-    becomes one), then the nearest project binding above `cwd`, else the
+    own binding, then the nearest project binding above `cwd`, else the
     environment / machine default already loaded."""
     bound = _session_binding(session)
-    if not bound and event == "session_start" and session:
-        bound = _claim_pending_binding(session, cwd)
     if bound:
         _use_home(bound)
         return

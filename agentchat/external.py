@@ -61,12 +61,6 @@ PROJECT_BINDING_SUBDIR = Path(".claude") / "agntchat"
 AGENTS_DIR = _HOME / "agents"
 SESSIONS_FILE = _HOME / "sessions.json"
 CLI_PIDS_DIR = _HOME / "cli-pids"
-# "The next session started in <folder> belongs to <agent>": written by the
-# desktop picker right before it opens the Claude app on that folder
-# (claude://code/new gives no session id up front); claimed by the
-# SessionStart hook, which binds the real session id. Expires unclaimed.
-PENDING_FILE = _HOME / "pending.json"
-PENDING_TTL_SECONDS = 10 * 60
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
 
 
@@ -121,67 +115,6 @@ def session_binding_home(session_id: Optional[str], path: Optional[Path] = None)
         return None
     home = agent_home(str(entry["agent_id"]))
     return home if (home / "credentials.json").is_file() else None
-
-
-def _norm_folder(folder: str) -> str:
-    try:
-        return str(Path(folder).resolve())
-    except Exception:  # noqa: BLE001
-        return folder
-
-
-def set_pending_binding(
-    folder: str, agent_id: str, path: Optional[Path] = None, title: Optional[str] = None
-) -> dict[str, Any]:
-    import time  # noqa: PLC0415
-
-    target = path or PENDING_FILE
-    pending = _load_pending(target)
-    entry: dict[str, Any] = {"agent_id": agent_id, "created_at": time.time()}
-    if title:
-        entry["title"] = title
-    pending[_norm_folder(folder)] = entry
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(pending, indent=2) + "\n")
-    os.replace(tmp, target)
-    return entry
-
-
-def take_pending_binding(cwd: Optional[str], path: Optional[Path] = None) -> Optional[str]:
-    """Consume the pending binding for exactly this folder (not parents —
-    a new session opens IN the folder the picker named). Returns the agent
-    id, or None. Expired entries are dropped along the way."""
-    import time  # noqa: PLC0415
-
-    if not cwd:
-        return None
-    target = path or PENDING_FILE
-    pending = _load_pending(target)
-    now = time.time()
-    live = {
-        k: v
-        for k, v in pending.items()
-        if isinstance(v, dict) and now - float(v.get("created_at") or 0) < PENDING_TTL_SECONDS
-    }
-    key = _norm_folder(cwd)
-    entry = live.pop(key, None)
-    if live != pending:
-        try:
-            tmp = target.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(live, indent=2) + "\n")
-            os.replace(tmp, target)
-        except Exception:  # noqa: BLE001
-            pass
-    return str(entry["agent_id"]) if entry and entry.get("agent_id") else None
-
-
-def _load_pending(path: Path) -> dict[str, Any]:
-    try:
-        data = json.loads(path.read_text())
-        return data if isinstance(data, dict) else {}
-    except Exception:  # noqa: BLE001
-        return {}
 
 
 def record_cli_session(cli_pid: int, session_id: str) -> None:
