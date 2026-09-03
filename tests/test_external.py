@@ -167,11 +167,20 @@ def test_hook_ignores_unlisted_and_non_waiting_notifications(monkeypatch, capsys
 def test_hook_prompt_prints_inbox_digest(monkeypatch, capsys):
     responses = {
         "/api/agents/me/sessions/events": (200, {}),
-        "/api/agents/me/inbox": (
+        "/api/agents/me/inbox?claim=true": (
             200,
             {
                 "tasks": [{"id": "t1", "title": "Fix build", "status": "pending"}],
-                "unread": [{"conversationId": "c1", "type": "direct", "title": None, "count": 2}],
+                "unread": [
+                    {
+                        "conversationId": "c1",
+                        "type": "direct",
+                        "title": None,
+                        "count": 2,
+                        "ownerDm": True,
+                        "messages": [{"id": "m1", "senderName": "James", "content": "ping"}],
+                    }
+                ],
             },
         ),
     }
@@ -187,7 +196,7 @@ def test_hook_prompt_prints_inbox_digest(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Fix build" in out
     assert "task_id t1" in out
-    assert "2 unread" in out
+    assert "James: ping" in out
 
 
 @pytest.mark.parametrize(
@@ -258,7 +267,7 @@ def test_hook_prompt_mirrors_text_and_digest_lists_messages(monkeypatch, capsys)
 
     def api(creds, method, path, body=None):
         calls.append((method, path, body))
-        if path == "/api/agents/me/inbox":
+        if path == "/api/agents/me/inbox?claim=true":
             return 200, inbox
         return 200, {}
 
@@ -273,9 +282,18 @@ def test_hook_prompt_mirrors_text_and_digest_lists_messages(monkeypatch, capsys)
     assert "James: how far along?" in out
     assert "your owner's DM" in out and "mirrored there automatically" in out
     assert 'group "Ops"' in out and "send_message" in out
-    # Rendered conversations are marked read so nothing is injected twice.
-    assert ("POST", "/api/conversations/c1/read", None) in calls
-    assert ("POST", "/api/conversations/c2/read", None) in calls
+    # The inbox is claimed (marked read server-side in the same statement);
+    # no separate read call.
+    assert ("GET", "/api/agents/me/inbox?claim=true", None) in calls
+    assert not any(p.endswith("/read") for _, p, _ in calls)
+
+    # A channel event Claude Code raised as a prompt is never mirrored back —
+    # it came FROM agntchat (mirroring it produced an echo loop between
+    # sessions).
+    calls.clear()
+    _run_hook(monkeypatch, {"hook_event_name": "UserPromptSubmit", "session_id": "s", "cwd": "/tmp",
+                            "prompt": '<channel source="agntchat" conversation_id="c1">hi</channel>'})
+    assert calls[0][2]["event"] == "prompt" and "text" not in calls[0][2]
 
 
 def test_hook_stop_mirrors_final_text_and_blocks_on_unread(monkeypatch, capsys):
@@ -295,7 +313,7 @@ def test_hook_stop_mirrors_final_text_and_blocks_on_unread(monkeypatch, capsys):
 
     def api(creds, method, path, body=None):
         calls.append((method, path, body))
-        return (200, inbox) if path == "/api/agents/me/inbox" else (200, {})
+        return (200, inbox) if path == "/api/agents/me/inbox?claim=true" else (200, {})
 
     monkeypatch.setattr(hook, "_api", api)
     monkeypatch.setattr(hook, "_load_credentials", _creds)
@@ -309,10 +327,11 @@ def test_hook_stop_mirrors_final_text_and_blocks_on_unread(monkeypatch, capsys):
     assert "James: and the tests?" in decision["reason"]
     # Tasks never block a stop — they would block every stop until done.
     assert "Fix build" not in decision["reason"]
-    assert ("POST", "/api/conversations/c1/read", None) in calls
+    assert ("GET", "/api/agents/me/inbox?claim=true", None) in calls
 
-    # Nothing unread → no decision, the turn ends.
-    inbox["unread"] = []
+    # A conversation whose messages another session claimed is not a reason
+    # to continue either.
+    inbox["unread"] = [{"conversationId": "c1", "type": "direct", "count": 2, "ownerDm": True, "messages": []}]
     _run_hook(monkeypatch, {"hook_event_name": "Stop", "session_id": "s", "cwd": "/tmp"})
     assert capsys.readouterr().out == ""
 

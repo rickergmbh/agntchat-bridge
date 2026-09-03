@@ -353,8 +353,19 @@ def _heartbeat_loop(session: str, cli_pid: int) -> None:
 
 
 def _fetch_inbox(creds: dict) -> Optional[dict]:
-    status, data = _api(creds, "GET", "/api/agents/me/inbox")
+    """Claim the inbox: the server marks what it returns as read in the same
+    statement, so with several sessions running as one agent each message
+    reaches exactly one of them."""
+    status, data = _api(creds, "GET", "/api/agents/me/inbox?claim=true")
     return data if status == 200 and isinstance(data, dict) else None
+
+
+def _is_channel_event(text: str) -> bool:
+    """A prompt Claude Code raised for an inbound channel event (it fires
+    UserPromptSubmit for those too). Already in agntchat — mirroring it
+    back produced a channel-tag echo loop between sessions."""
+    stripped = text.lstrip()
+    return stripped.startswith("<channel ") or stripped.startswith("<channel>")
 
 
 def _safe_key(value: str) -> str:
@@ -381,11 +392,12 @@ def _message_line(msg: dict) -> str:
 
 
 def _render_inbox(data: dict, *, with_tasks: bool) -> tuple[Optional[str], list[str]]:
-    """Render the inbox for the model. Returns `(digest, conversation_ids)`
-    where the ids are the conversations whose messages were rendered — the
-    caller marks those read so nothing is injected twice."""
+    """Render a claimed inbox for the model. Returns `(digest,
+    conversation_ids)` — the conversations whose messages were rendered.
+    Conversations with no claimed messages are skipped: their unread count
+    is cards or something another session already took."""
     tasks = (data.get("tasks") or []) if with_tasks else []
-    unread = data.get("unread") or []
+    unread = [u for u in (data.get("unread") or []) if u.get("messages")]
     lines: list[str] = []
     rendered: list[str] = []
     for t in tasks[:5]:
@@ -400,13 +412,10 @@ def _render_inbox(data: dict, *, with_tasks: bool) -> tuple[Optional[str], list[
             how = "reply in your normal response — it is mirrored there automatically"
         else:
             how = "reply with the send_message tool, passing this conversation_id"
-        if msgs:
-            lines.append(f"- {label} (conversation_id {conv_id}; {how}):")
-            lines.extend(_message_line(m) for m in msgs)
-            if conv_id:
-                rendered.append(conv_id)
-        else:
-            lines.append(f"- {u.get('count')} unread in {label} (conversation_id {conv_id}; {how})")
+        lines.append(f"- {label} (conversation_id {conv_id}; {how}):")
+        lines.extend(_message_line(m) for m in msgs)
+        if conv_id:
+            rendered.append(conv_id)
     if len(unread) > 5:
         lines.append(f"- …and {len(unread) - 5} more conversations with unread messages")
     if not lines:
@@ -415,26 +424,19 @@ def _render_inbox(data: dict, *, with_tasks: bool) -> tuple[Optional[str], list[
     return "\n".join([header, *lines]), rendered
 
 
-def _mark_read(creds: dict, conversation_ids: list[str]) -> None:
-    for conv_id in conversation_ids:
-        _api(creds, "POST", f"/api/conversations/{conv_id}/read")
-
-
 def _inbox_digest(creds: dict) -> Optional[str]:
-    """Prompt-time digest: tasks + unread messages; marks the rendered
-    conversations read since the model now has them."""
+    """Prompt-time digest: tasks + the messages this call claimed."""
     data = _fetch_inbox(creds)
     if not data:
         return None
-    digest, rendered = _render_inbox(data, with_tasks=True)
-    _mark_read(creds, rendered)
+    digest, _rendered = _render_inbox(data, with_tasks=True)
     return digest
 
 
 def _stop_decision(creds: dict) -> Optional[dict]:
     """End of turn: if agntchat messages arrived while the session worked,
     keep the turn going so it answers them (Claude Code caps consecutive
-    continuations, and the messages are marked read here, so this cannot
+    continuations, and the claim marks the messages read, so this cannot
     loop on the same content). Tasks never block a stop — they would block
     every stop until done."""
     data = _fetch_inbox(creds)
@@ -443,7 +445,6 @@ def _stop_decision(creds: dict) -> Optional[dict]:
     digest, rendered = _render_inbox(data, with_tasks=False)
     if not rendered or not digest:
         return None
-    _mark_read(creds, rendered)
     return {
         "decision": "block",
         "reason": (
@@ -556,7 +557,8 @@ def _handle_hook() -> None:
             return
         body["text"] = text[:_TEXT_MAX_CHARS]
     elif event == "prompt" and isinstance(payload.get("prompt"), str):
-        body["text"] = payload["prompt"][:_TEXT_MAX_CHARS]
+        if not _is_channel_event(payload["prompt"]):
+            body["text"] = payload["prompt"][:_TEXT_MAX_CHARS]
 
     status, _ = _api(creds, "POST", "/api/agents/me/sessions/events", body)
     if status == 404:

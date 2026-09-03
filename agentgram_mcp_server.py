@@ -81,9 +81,11 @@ TOOL_DEFS_JSON = os.environ.get("AGENTGRAM_TOOL_DEFS", "[]")
 # flag (`external.claude_channels_command()`); otherwise they are dropped
 # silently and the hooks' prompt/stop injection carries the traffic.
 #
-# Inbound is a poll of `GET /api/agents/me/inbox` (nothing on the agent's
-# user channel signals new messages without an executor). Every pushed
-# conversation is marked read so the hooks never inject it a second time.
+# Inbound is a poll of `GET /api/agents/me/inbox?claim=true` (nothing on
+# the agent's user channel signals new messages without an executor). The
+# claim marks what it returns as read in the same statement, so the hooks
+# never inject a pushed message a second time, and when several sessions
+# run as one agent each message reaches exactly one of them.
 _CHANNEL_POLL_SECONDS = 3.0
 _CHANNEL_SEEN_MAX = 500
 _stdout_lock = threading.Lock()
@@ -107,8 +109,8 @@ def _write_out(obj: dict[str, Any]) -> None:
 
 
 def _channel_events(data: dict[str, Any], seen: set[str]) -> tuple[list[dict[str, Any]], list[str]]:
-    """Turn one inbox payload into channel notifications for everything not
-    yet pushed. Returns `(notifications, conversation_ids_to_mark_read)`.
+    """Turn one claimed inbox payload into channel notifications for
+    everything not yet pushed. Returns `(notifications, conversation_ids)`.
     Pure — the poll loop does the I/O."""
     notes: list[dict[str, Any]] = []
     to_read: list[str] = []
@@ -177,14 +179,12 @@ def _channel_poll_loop() -> None:
     while True:
         time.sleep(_CHANNEL_POLL_SECONDS)
         try:
-            status, data = hook._api(creds, "GET", "/api/agents/me/inbox")
+            status, data = hook._api(creds, "GET", "/api/agents/me/inbox?claim=true")
             if status != 200 or not isinstance(data, dict):
                 continue
-            notes, to_read = _channel_events(data, seen)
+            notes, _claimed = _channel_events(data, seen)
             for note in notes:
                 _write_out(note)
-            for conv_id in to_read:
-                hook._api(creds, "POST", f"/api/conversations/{conv_id}/read")
             if len(seen) > _CHANNEL_SEEN_MAX:
                 seen.clear()
         except Exception as exc:  # noqa: BLE001
