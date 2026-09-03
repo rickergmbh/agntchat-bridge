@@ -61,9 +61,36 @@ def _use_home(home: Path) -> None:
     _DISPLAY = _DIR / "display"
 
 
-def _resolve_home(cwd: Optional[str]) -> None:
-    """Pick the agent for this hook run: the nearest project binding above
-    `cwd` wins; otherwise the environment / machine default already loaded."""
+_MACHINE_HOME = Path(os.environ.get("AGNTCHAT_HOME", str(Path.home() / ".agentchat")))
+_SESSIONS_FILE = _MACHINE_HOME / "sessions.json"
+_AGENTS_DIR = _MACHINE_HOME / "agents"
+_CLI_PIDS = _MACHINE_HOME / "cli-pids"
+
+
+def _session_binding(session: Optional[str]) -> Optional[Path]:
+    """`~/.agentchat/sessions.json` → the bound agent's home, if its
+    credentials exist (written by the desktop picker, `agentchat bind`)."""
+    if not session:
+        return None
+    try:
+        entry = json.loads(_SESSIONS_FILE.read_text()).get(session)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(entry, dict) or not entry.get("agent_id"):
+        return None
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(entry["agent_id"]))[:80]
+    home = _AGENTS_DIR / safe
+    return home if (home / "credentials.json").is_file() else None
+
+
+def _resolve_home(cwd: Optional[str], session: Optional[str] = None) -> None:
+    """Pick the agent for this hook run, most specific first: the session's
+    own binding, then the nearest project binding above `cwd`, else the
+    environment / machine default already loaded."""
+    bound = _session_binding(session)
+    if bound:
+        _use_home(bound)
+        return
     if not cwd:
         return
     try:
@@ -75,6 +102,28 @@ def _resolve_home(cwd: Optional[str]) -> None:
         if (candidate / "credentials.json").is_file():
             _use_home(candidate)
             return
+
+
+def _record_cli_session(session: str) -> None:
+    """Map the Claude Code process to its session id so the MCP server (its
+    child) can find the session's binding."""
+    pid = _cli_pid()
+    if not pid:
+        return
+    try:
+        _CLI_PIDS.mkdir(parents=True, exist_ok=True)
+        (_CLI_PIDS / str(pid)).write_text(session)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _forget_cli_session(session: str) -> None:
+    try:
+        for p in _CLI_PIDS.iterdir():
+            if p.read_text().strip() == session:
+                p.unlink()
+    except Exception:  # noqa: BLE001
+        pass
 _TIMEOUT = 5
 # Agent JWTs live 15 minutes server-side; refresh well inside that.
 _TOKEN_MAX_AGE = 12 * 60
@@ -565,7 +614,7 @@ def _handle_hook() -> None:
     session = payload.get("session_id")
     if not session:
         return
-    _resolve_home(payload.get("cwd"))
+    _resolve_home(payload.get("cwd"), session)
     creds = _load_credentials()
     if not creds:
         _log(f"no credentials at {_CREDENTIALS}; run `python -m agentchat connect <code>`")
@@ -599,9 +648,11 @@ def _handle_hook() -> None:
         return
 
     if event == "session_start":
+        _record_cli_session(session)
         _spawn_heartbeat(session)
     elif event == "session_end":
         _rm_tree(_DISPLAY / _safe_key(session))
+        _forget_cli_session(session)
     elif event == "prompt":
         digest = _inbox_digest(creds)
         if digest:

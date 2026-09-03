@@ -486,3 +486,94 @@ def test_save_credentials_to_a_project_home(tmp_path):
     path = save_credentials(ClaimResult("a", "k", "u", "n"), home)
     assert path == home / "credentials.json"
     assert json.loads(path.read_text())["agent_id"] == "a"
+
+
+def _fake_transcript(path, cwd, title=None, last=None):
+    rows = [{"type": "user", "cwd": cwd, "sessionId": path.stem, "message": {"role": "user", "content": "hi"}}]
+    if title:
+        rows.append({"type": "custom-title", "customTitle": title, "sessionId": path.stem})
+    if last:
+        rows.append({"type": "last-prompt", "lastPrompt": last, "sessionId": path.stem})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+
+def test_list_claude_sessions_reports_bindings(tmp_path, monkeypatch):
+    claude = tmp_path / ".claude"
+    repo = tmp_path / "repo"
+    other = tmp_path / "other"
+    _fake_transcript(claude / "projects" / "-repo" / "s-bound.jsonl", str(repo), title="Bound", last="fix it")
+    _fake_transcript(claude / "projects" / "-repo" / "s-project.jsonl", str(repo), last="plan")
+    _fake_transcript(claude / "projects" / "-other" / "s-default.jsonl", str(other))
+    import os, time
+    now = time.time()
+    os.utime(claude / "projects" / "-repo" / "s-bound.jsonl", (now, now))
+    os.utime(claude / "projects" / "-repo" / "s-project.jsonl", (now - 3600, now - 3600))
+
+    machine = tmp_path / "machine"
+    monkeypatch.setattr(external, "_HOME", machine)
+    monkeypatch.setattr(external, "AGENTS_DIR", machine / "agents")
+    monkeypatch.setattr(external, "SESSIONS_FILE", machine / "sessions.json")
+    # machine default + project binding + session binding
+    (machine).mkdir()
+    (machine / "credentials.json").write_text(json.dumps({"agent_id": "default", "api_key": "k", "display_name": "Default"}))
+    proj_home = external.project_home(repo)
+    proj_home.mkdir(parents=True)
+    (proj_home / "credentials.json").write_text(json.dumps({"agent_id": "proj", "api_key": "k", "display_name": "Proj"}))
+    from agentchat.invite import ClaimResult, save_credentials  # noqa: PLC0415
+    save_credentials(ClaimResult("sess-agent", "k", "u", "Sessy"), external.agent_home("sess-agent"))
+    external.bind_session("s-bound", "sess-agent", cwd=str(repo))
+
+    sessions = external.list_claude_sessions(claude, live_cwds={str(repo)})
+    by_id = {s["sessionId"]: s for s in sessions}
+    assert [s["sessionId"] for s in sessions][0] == "s-bound"  # newest first
+    b = by_id["s-bound"]
+    assert b["boundBy"] == "session" and b["agentName"] == "Sessy" and b["title"] == "Bound"
+    assert b["lastPrompt"] == "fix it" and b["running"] is True
+    p = by_id["s-project"]
+    assert p["boundBy"] == "project" and p["agentName"] == "Proj"
+    assert p["running"] is False  # live cwd, but not recent
+    d = by_id["s-default"]
+    assert d["boundBy"] == "default" and d["agentName"] == "Default" and d["running"] is False
+    # Unknown liveness (Windows) → None, never a false "idle".
+    assert external.list_claude_sessions(claude, live_cwds=None)[0]["running"] is None
+    assert external.session_binding_home("s-bound") == external.agent_home("sess-agent")
+    assert external.session_binding_home("nope") is None
+
+
+def test_hook_session_binding_beats_project_binding(monkeypatch, tmp_path):
+    machine = tmp_path / "machine"
+    monkeypatch.setattr(hook, "_SESSIONS_FILE", machine / "sessions.json")
+    monkeypatch.setattr(hook, "_AGENTS_DIR", machine / "agents")
+    repo = tmp_path / "repo"
+    proj_home = repo / ".claude" / "agntchat"
+    proj_home.mkdir(parents=True)
+    (proj_home / "credentials.json").write_text('{"agent_id": "proj", "api_key": "k"}')
+    agent_home = machine / "agents" / "sess-agent"
+    agent_home.mkdir(parents=True)
+    (agent_home / "credentials.json").write_text('{"agent_id": "sess-agent", "api_key": "k"}')
+    machine.joinpath("sessions.json").write_text(json.dumps({"s1": {"agent_id": "sess-agent"}}))
+
+    hook._use_home(tmp_path / "default")
+    hook._resolve_home(str(repo / "src"), "s1")
+    assert hook._DIR == agent_home
+    hook._resolve_home(str(repo / "src"), "s2")  # unbound session → project binding
+    assert hook._DIR == proj_home
+    hook._use_home(tmp_path / "default")
+
+
+def test_mcp_server_switches_agent_when_the_binding_changes(monkeypatch, tmp_path, capsys):
+    monkeypatch.delenv("AGENTGRAM_TOOL_DEFS", raising=False)
+    import agentgram_mcp_server as server  # noqa: PLC0415
+
+    monkeypatch.setattr(server, "AGENT_ID", "old")
+    monkeypatch.setattr(server, "API_KEY", "old-key")
+    monkeypatch.setattr(server, "TOOLS", [{"name": "x"}])
+    out = []
+    monkeypatch.setattr(server, "_write_out", lambda obj: out.append(obj))
+    assert server._apply_binding({"agent_id": "old", "api_key": "old-key"}) is False
+    assert out == []
+    assert server._apply_binding({"agent_id": "new", "api_key": "new-key", "gateway_url": "https://x"}) is True
+    assert server.AGENT_ID == "new" and server.API_KEY == "new-key" and server.API_URL == "https://x"
+    assert server.TOOLS == [] and server._tool_executor is None
+    assert out == [{"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}]

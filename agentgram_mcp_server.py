@@ -19,6 +19,7 @@ import os
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 # agentchat SDK is co-located in this directory — Python adds the script's
@@ -171,14 +172,18 @@ def _channel_poll_loop() -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Channel: hook module unavailable (%s); no live push", exc)
         return
-    creds = hook._load_credentials()
-    if not creds:
-        return
     seen: set[str] = set()
     logger.info("Channel: polling inbox every %ss", _CHANNEL_POLL_SECONDS)
     while True:
         time.sleep(_CHANNEL_POLL_SECONDS)
         try:
+            # Re-resolve every poll: the desktop picker may have re-bound this
+            # session to another agent since the last one.
+            creds = _sync_binding()
+            if not creds:
+                continue
+            if creds.get("_home"):
+                hook._use_home(Path(creds["_home"]))
             status, data = hook._api(creds, "GET", "/api/agents/me/inbox?claim=true")
             if status != 200 or not isinstance(data, dict):
                 continue
@@ -189,6 +194,74 @@ def _channel_poll_loop() -> None:
                 seen.clear()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Channel poll failed: %s", exc)
+
+
+# --- Session binding (desktop picker, #148) ---
+#
+# The server can be re-pointed at another agent while the session runs: the
+# SessionStart hook records `~/.agentchat/cli-pids/<claude pid>` → session
+# id, we walk up to that pid, and on every poll (and every tool call) we
+# re-read `~/.agentchat/sessions.json`. A change swaps the credentials the
+# poller and the tool executor use and tells Claude Code the tool catalog
+# changed.
+_binding_lock = threading.Lock()
+_session_id: str | None = None
+
+
+def _current_binding() -> dict[str, Any] | None:
+    """Credentials for the agent this session is bound to right now:
+    session binding → environment / machine default (`load_credentials`)."""
+    global _session_id
+    if not STANDALONE:
+        return None
+    try:
+        import agntchat_hook as hook  # noqa: PLC0415
+        from agentchat import external  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return None
+    if _session_id is None:
+        _session_id = external.session_for_cli_pid(hook._cli_pid())
+    home = external.session_binding_home(_session_id)
+    if home:
+        creds = external._read_credentials_at(home)
+        if creds:
+            creds = dict(creds)
+            creds["gateway_url"] = external.api_base_url(
+                os.environ.get("AGNTCHAT_API_URL") or creds.get("gateway_url") or API_URL
+            )
+            creds["_home"] = str(home)
+            return creds
+    creds = load_credentials()
+    if creds:
+        creds = dict(creds)
+        creds["_home"] = None
+    return creds
+
+
+def _apply_binding(creds: dict[str, Any]) -> bool:
+    """Switch the process to `creds` if they name a different agent. Returns
+    True when a switch happened. Resets the executor + catalog so the next
+    tools/list rebuilds for the new agent, and announces the change."""
+    global AGENT_ID, API_KEY, API_URL, TOOLS, TOOL_MAP, CONVERSATION_ID, OWNER_ID
+    global _executor, _tool_executor
+    with _binding_lock:
+        if creds.get("agent_id") == AGENT_ID:
+            return False
+        logger.info("Binding: switching agent %s → %s", AGENT_ID[:8], str(creds["agent_id"])[:8])
+        AGENT_ID = str(creds["agent_id"])
+        API_KEY = str(creds["api_key"])
+        API_URL = str(creds.get("gateway_url") or API_URL)
+        TOOLS, TOOL_MAP, CONVERSATION_ID, OWNER_ID = [], {}, "", ""
+        _executor, _tool_executor = None, None
+    _write_out({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+    return True
+
+
+def _sync_binding() -> dict[str, Any] | None:
+    creds = _current_binding()
+    if creds:
+        _apply_binding(creds)
+    return creds
 
 
 _channel_thread: threading.Thread | None = None
@@ -347,6 +420,7 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     if method == "tools/list":
+        _sync_binding()
         _ensure_standalone_context()
         mcp_tools = []
         for t in TOOLS:
@@ -395,6 +469,7 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
                 "result": {"content": [{"type": "text", "text": json.dumps(decision)}]},
             }
 
+        _sync_binding()
         _ensure_standalone_context()
         logger.info("Executing tool: %s | args=%s | ctx_conv=%s | ctx_task=%s | source=%s",
                      tool_name, json.dumps(arguments, default=str)[:200],

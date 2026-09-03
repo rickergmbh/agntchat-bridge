@@ -16,12 +16,19 @@ Which agent a session is
 ------------------------
 Credentials resolve per session, most specific first:
 
-1. **Project binding** — `<repo>/.claude/agntchat/credentials.json`, found
+1. **Session binding** — `~/.agentchat/sessions.json` maps a Claude Code
+   session id to an agent whose credentials live in
+   `~/.agentchat/agents/<agent_id>/`. Written by the desktop session picker
+   (`python -m agentchat bind`). Hooks know their session id; the MCP
+   server learns it from `~/.agentchat/cli-pids/<claude pid>`, which the
+   SessionStart hook writes, and re-resolves on every poll — so a running
+   session can be re-bound live.
+2. **Project binding** — `<repo>/.claude/agntchat/credentials.json`, found
    by walking up from the session's cwd (hooks) or named by
    `AGNTCHAT_HOME` (the MCP server, which `connect --project` registers
    in Claude Code's *local* scope with that env var). One repo, one agent.
-2. `AGNTCHAT_HOME` / `AGNTCHAT_CREDENTIALS` in the environment.
-3. `~/.agentchat/credentials.json` — this machine's default agent.
+3. `AGNTCHAT_HOME` / `AGNTCHAT_CREDENTIALS` in the environment.
+4. `~/.agentchat/credentials.json` — this machine's default agent.
 
 The hooks are installed once, user-scoped; only the credentials differ per
 project, so no session ever fires two copies of a hook.
@@ -48,6 +55,263 @@ HOOK_SCRIPT = _BRIDGE_DIR / "agntchat_hook.py"
 
 # Per-project binding lives here, inside the repo, self-ignored.
 PROJECT_BINDING_SUBDIR = Path(".claude") / "agntchat"
+
+# Per-session bindings (desktop picker). All under the machine home, never
+# under a project: the MCP server has to find them before it knows its agent.
+AGENTS_DIR = _HOME / "agents"
+SESSIONS_FILE = _HOME / "sessions.json"
+CLI_PIDS_DIR = _HOME / "cli-pids"
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+
+
+def agent_home(agent_id: str) -> Path:
+    """Credentials folder for one agent bound by session."""
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in agent_id)[:80]
+    return AGENTS_DIR / safe
+
+
+def load_session_bindings(path: Optional[Path] = None) -> dict[str, dict[str, Any]]:
+    try:
+        data = json.loads((path or SESSIONS_FILE).read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def bind_session(
+    session_id: str,
+    agent_id: str,
+    *,
+    cwd: Optional[str] = None,
+    path: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Point `session_id` at `agent_id` (whose credentials must already be in
+    `agent_home(agent_id)`). Rewrites the bindings file atomically."""
+    target = path or SESSIONS_FILE
+    bindings = load_session_bindings(target)
+    import time  # noqa: PLC0415
+
+    bindings[session_id] = {"agent_id": agent_id, "cwd": cwd, "bound_at": time.time()}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(bindings, indent=2) + "\n")
+    os.replace(tmp, target)
+    return bindings[session_id]
+
+
+def session_binding_home(session_id: Optional[str], path: Optional[Path] = None) -> Optional[Path]:
+    """The agent home a session is bound to, or None (unbound, or the
+    binding's credentials are gone)."""
+    if not session_id:
+        return None
+    entry = load_session_bindings(path).get(session_id)
+    if not isinstance(entry, dict) or not entry.get("agent_id"):
+        return None
+    home = agent_home(str(entry["agent_id"]))
+    return home if (home / "credentials.json").is_file() else None
+
+
+def record_cli_session(cli_pid: int, session_id: str) -> None:
+    """SessionStart hook: remember which Claude Code process runs which
+    session, so the MCP server (a child of that process) can find its own
+    session id."""
+    try:
+        CLI_PIDS_DIR.mkdir(parents=True, exist_ok=True)
+        (CLI_PIDS_DIR / str(cli_pid)).write_text(session_id)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def forget_cli_session(session_id: str) -> None:
+    try:
+        for p in CLI_PIDS_DIR.iterdir():
+            if p.read_text().strip() == session_id:
+                p.unlink()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def session_for_cli_pid(cli_pid: Optional[int]) -> Optional[str]:
+    if not cli_pid:
+        return None
+    try:
+        value = (CLI_PIDS_DIR / str(cli_pid)).read_text().strip()
+        return value or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# --- Claude Code session discovery (desktop picker) -----------------------
+
+_HEAD_BYTES = 64 * 1024
+_TAIL_BYTES = 256 * 1024
+
+
+def _read_credentials_at(home: Path) -> Optional[dict[str, Any]]:
+    try:
+        data = json.loads((home / "credentials.json").read_text())
+        return data if isinstance(data, dict) and data.get("agent_id") else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _scan_transcript(path: Path) -> dict[str, Any]:
+    """Pull cwd / title / last prompt out of a transcript without reading a
+    whole multi-megabyte file: the head carries the first `cwd`, the tail
+    carries the latest `last-prompt` / title records."""
+    info: dict[str, Any] = {"cwd": None, "title": None, "lastPrompt": None}
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            head = fh.read(_HEAD_BYTES).decode("utf-8", "replace")
+            if size > _HEAD_BYTES:
+                fh.seek(max(size - _TAIL_BYTES, 0))
+                tail = fh.read().decode("utf-8", "replace")
+            else:
+                tail = head
+    except Exception:  # noqa: BLE001
+        return info
+    for line in head.splitlines():
+        try:
+            r = json.loads(line)
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(r, dict) and r.get("cwd"):
+            info["cwd"] = r["cwd"]
+            break
+    for line in tail.splitlines():
+        try:
+            r = json.loads(line)
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(r, dict):
+            continue
+        t = r.get("type")
+        if t == "custom-title" and r.get("customTitle"):
+            info["title"] = r["customTitle"]
+        elif t == "ai-title" and r.get("aiTitle") and not info["title"]:
+            info["title"] = r["aiTitle"]
+        elif t == "last-prompt" and r.get("lastPrompt"):
+            info["lastPrompt"] = r["lastPrompt"]
+        if r.get("cwd") and not info["cwd"]:
+            info["cwd"] = r["cwd"]
+    return info
+
+
+def _live_claude_cwds() -> Optional[set[str]]:
+    """Working directories of running Claude Code processes (macOS/Linux).
+    None when undeterminable (Windows), so callers show "unknown", not
+    "idle"."""
+    if os.name == "nt":
+        return None
+    try:
+        out = subprocess.run(
+            ["ps", "-axo", "pid=,args="], capture_output=True, text=True, timeout=5, check=False
+        ).stdout
+    except Exception:  # noqa: BLE001
+        return None
+    pids: list[str] = []
+    for line in out.splitlines():
+        pid, _, args = line.strip().partition(" ")
+        tokens = args.split()
+        if not tokens:
+            continue
+        program = os.path.basename(tokens[0])
+        head = " ".join(tokens[:2]).lower()
+        if program == "claude" or "claude-code" in head:
+            pids.append(pid)
+    cwds: set[str] = set()
+    for pid in pids[:64]:
+        try:
+            out = subprocess.run(
+                ["lsof", "-a", "-p", pid, "-d", "cwd", "-Fn"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            ).stdout
+        except Exception:  # noqa: BLE001
+            continue
+        for line in out.splitlines():
+            if line.startswith("n"):
+                cwds.add(line[1:])
+    return cwds
+
+
+def list_claude_sessions(
+    claude_dir: Optional[Path] = None,
+    *,
+    limit: int = 30,
+    bindings_path: Optional[Path] = None,
+    live_cwds: Optional[set[str]] = "auto",  # type: ignore[assignment]
+    recent_seconds: int = 30 * 60,
+) -> list[dict[str, Any]]:
+    """Claude Code sessions on this machine, newest first, with what each is
+    currently bound to. Reads `<claude_dir>/projects/*/*.jsonl`."""
+    import time  # noqa: PLC0415
+
+    root = (claude_dir or CLAUDE_DIR) / "projects"
+    files: list[tuple[float, Path]] = []
+    try:
+        for project in root.iterdir():
+            if not project.is_dir():
+                continue
+            for f in project.glob("*.jsonl"):
+                try:
+                    files.append((f.stat().st_mtime, f))
+                except OSError:
+                    continue
+    except OSError:
+        return []
+    files.sort(key=lambda t: t[0], reverse=True)
+    files = files[:limit]
+
+    if live_cwds == "auto":
+        live_cwds = _live_claude_cwds()
+    bindings = load_session_bindings(bindings_path)
+    default = _read_credentials_at(_HOME)
+    now = time.time()
+
+    sessions: list[dict[str, Any]] = []
+    for mtime, f in files:
+        session_id = f.stem
+        info = _scan_transcript(f)
+        cwd = info["cwd"]
+        bound_by = None
+        agent: Optional[dict[str, Any]] = None
+        entry = bindings.get(session_id)
+        if isinstance(entry, dict) and entry.get("agent_id"):
+            creds = _read_credentials_at(agent_home(str(entry["agent_id"])))
+            if creds:
+                agent, bound_by = creds, "session"
+        if agent is None and cwd:
+            home = find_project_home(cwd)
+            if home:
+                creds = _read_credentials_at(home)
+                if creds:
+                    agent, bound_by = creds, "project"
+        if agent is None and default:
+            agent, bound_by = default, "default"
+        recent = (now - mtime) < recent_seconds
+        running: Optional[bool]
+        if live_cwds is None:
+            running = None
+        else:
+            running = bool(cwd and cwd in live_cwds and recent)
+        sessions.append(
+            {
+                "sessionId": session_id,
+                "cwd": cwd,
+                "title": info["title"],
+                "lastPrompt": info["lastPrompt"],
+                "lastActiveAt": mtime,
+                "running": running,
+                "boundBy": bound_by,
+                "agentId": agent.get("agent_id") if agent else None,
+                "agentName": agent.get("display_name") if agent else None,
+            }
+        )
+    return sessions
 
 
 def project_home(project: Path | str) -> Path:

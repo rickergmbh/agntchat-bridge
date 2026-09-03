@@ -75,6 +75,28 @@ def main() -> None:
         ),
     )
 
+    # sessions (desktop picker, #148): Claude Code sessions on this machine
+    sessions_parser = subparsers.add_parser(
+        "sessions", help="List Claude Code sessions on this machine as JSON (external agents)"
+    )
+    sessions_parser.add_argument("--limit", type=int, default=30)
+
+    # bind (desktop picker, #148): point one Claude Code session at one agent
+    bind_parser = subparsers.add_parser(
+        "bind", help="Bind a Claude Code session to an external agent (writes local files only)"
+    )
+    bind_parser.add_argument("--session", required=True, help="Claude Code session id")
+    bind_parser.add_argument("--agent-id", required=True)
+    bind_parser.add_argument("--api-key", required=True)
+    bind_parser.add_argument("--display-name", default="")
+    bind_parser.add_argument("--gateway-url", default=DEFAULT_GATEWAY_URL)
+    bind_parser.add_argument("--cwd", default=None, help="The session's working directory")
+    bind_parser.add_argument(
+        "--install",
+        action="store_true",
+        help="Also make sure the user-scope hooks and MCP server are installed",
+    )
+
     # info
     info_parser = subparsers.add_parser("info", help="Show public invite info")
     info_parser.add_argument("code", help="Invite code")
@@ -93,6 +115,10 @@ def main() -> None:
         asyncio.run(_cmd_join(args))
     elif args.command == "connect":
         asyncio.run(_cmd_connect(args))
+    elif args.command == "sessions":
+        _cmd_sessions(args)
+    elif args.command == "bind":
+        _cmd_bind(args)
     elif args.command == "info":
         asyncio.run(_cmd_info(args))
     elif args.command == "status":
@@ -196,6 +222,38 @@ async def _cmd_connect(args: argparse.Namespace) -> None:
     else:
         print(external.render_instructions(tool, project=project))
     print()
+
+
+def _cmd_sessions(args: argparse.Namespace) -> None:
+    """JSON for the desktop session picker."""
+    from . import external
+
+    print(json.dumps(external.list_claude_sessions(limit=args.limit)))
+
+
+def _cmd_bind(args: argparse.Namespace) -> None:
+    """Bind one Claude Code session to one agent. The desktop app already
+    holds the agent's fresh API key (it asked the backend), so this only
+    writes local files: the agent's credentials folder, the session map,
+    and — with --install — the user-scope hooks/MCP registration."""
+    from . import external
+    from .invite import ClaimResult, save_credentials
+
+    home = external.agent_home(args.agent_id)
+    save_credentials(
+        ClaimResult(
+            agent_id=args.agent_id,
+            api_key=args.api_key,
+            gateway_url=args.gateway_url,
+            display_name=args.display_name or args.agent_id,
+        ),
+        home,
+    )
+    entry = external.bind_session(args.session, args.agent_id, cwd=args.cwd)
+    steps: list[str] = []
+    if args.install:
+        steps = external.install_claude()
+    print(json.dumps({"session": args.session, "binding": entry, "home": str(home), "steps": steps}))
 
 
 async def _cmd_info(args: argparse.Namespace) -> None:
