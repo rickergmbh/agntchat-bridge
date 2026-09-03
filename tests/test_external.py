@@ -634,3 +634,56 @@ def test_rekey_rewrites_every_home_for_the_agent(tmp_path, monkeypatch, capsys):
         assert json.loads((home / "credentials.json").read_text())["api_key"] == "new"
     assert not (external.agent_home("a1") / "hook-token.json").exists()
     assert json.loads((external.agent_home("a2") / "credentials.json").read_text())["api_key"] == "keep"
+
+
+def test_pending_binding_is_claimed_by_the_next_session_start(monkeypatch, tmp_path):
+    machine = tmp_path / "machine"
+    monkeypatch.setattr(hook, "_MACHINE_HOME", machine)
+    monkeypatch.setattr(hook, "_SESSIONS_FILE", machine / "sessions.json")
+    monkeypatch.setattr(hook, "_AGENTS_DIR", machine / "agents")
+    monkeypatch.setattr(hook, "_PENDING_FILE", machine / "pending.json")
+    monkeypatch.setattr(external, "_HOME", machine)
+    monkeypatch.setattr(external, "AGENTS_DIR", machine / "agents")
+    monkeypatch.setattr(external, "SESSIONS_FILE", machine / "sessions.json")
+    monkeypatch.setattr(external, "PENDING_FILE", machine / "pending.json")
+    from agentchat.invite import ClaimResult, save_credentials  # noqa: PLC0415
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    save_credentials(ClaimResult("ag", "k", "u", "Ag"), external.agent_home("ag"))
+    external.set_pending_binding(str(repo), "ag")
+
+    default = tmp_path / "default"
+    # A tool event from some other session in that folder must not steal it.
+    hook._use_home(default)
+    hook._resolve_home(str(repo), "old-session", "tool_start")
+    assert hook._DIR == default
+    # The next session START in the folder claims it and is bound from then on.
+    hook._resolve_home(str(repo), "new-session", "session_start")
+    assert hook._DIR == external.agent_home("ag")
+    assert json.loads((machine / "sessions.json").read_text())["new-session"]["agent_id"] == "ag"
+    assert json.loads((machine / "pending.json").read_text()) == {}
+    # Later events of that session resolve via the session binding.
+    hook._use_home(default)
+    hook._resolve_home(str(repo), "new-session", "prompt")
+    assert hook._DIR == external.agent_home("ag")
+    # A second session start in the folder gets nothing (already consumed).
+    hook._use_home(default)
+    hook._resolve_home(str(repo), "another", "session_start")
+    assert hook._DIR == default
+    hook._use_home(default)
+
+
+def test_pending_binding_expires(monkeypatch, tmp_path):
+    pending = tmp_path / "pending.json"
+    external.set_pending_binding(str(tmp_path), "ag", path=pending)
+    data = json.loads(pending.read_text())
+    key = next(iter(data))
+    data[key]["created_at"] -= external.PENDING_TTL_SECONDS + 1
+    pending.write_text(json.dumps(data))
+    assert external.take_pending_binding(str(tmp_path), path=pending) is None
+    assert json.loads(pending.read_text()) == {}
+    external.set_pending_binding(str(tmp_path), "ag2", path=pending)
+    # Exact folder only — a subfolder is a different session location.
+    assert external.take_pending_binding(str(tmp_path / "sub"), path=pending) is None
+    assert external.take_pending_binding(str(tmp_path), path=pending) == "ag2"
