@@ -11,6 +11,20 @@ themselves. agntchat never spawns or wakes it; two thin pipes connect it:
 This module holds what both share: the credentials file written by
 `python -m agentchat connect`, and the rendering of the CLI configuration
 the user pastes (or lets `connect --install` write).
+
+Which agent a session is
+------------------------
+Credentials resolve per session, most specific first:
+
+1. **Project binding** — `<repo>/.claude/agntchat/credentials.json`, found
+   by walking up from the session's cwd (hooks) or named by
+   `AGNTCHAT_HOME` (the MCP server, which `connect --project` registers
+   in Claude Code's *local* scope with that env var). One repo, one agent.
+2. `AGNTCHAT_HOME` / `AGNTCHAT_CREDENTIALS` in the environment.
+3. `~/.agentchat/credentials.json` — this machine's default agent.
+
+The hooks are installed once, user-scoped; only the credentials differ per
+project, so no session ever fires two copies of a hook.
 """
 
 from __future__ import annotations
@@ -31,6 +45,29 @@ CREDENTIALS_FILE = Path(os.environ.get("AGNTCHAT_CREDENTIALS", str(_HOME / "cred
 _BRIDGE_DIR = Path(__file__).resolve().parent.parent
 MCP_SERVER_SCRIPT = _BRIDGE_DIR / "agentgram_mcp_server.py"
 HOOK_SCRIPT = _BRIDGE_DIR / "agntchat_hook.py"
+
+# Per-project binding lives here, inside the repo, self-ignored.
+PROJECT_BINDING_SUBDIR = Path(".claude") / "agntchat"
+
+
+def project_home(project: Path | str) -> Path:
+    """The credentials folder that binds `project` to one agent."""
+    return Path(project).resolve() / PROJECT_BINDING_SUBDIR
+
+
+def find_project_home(start: Path | str | None) -> Optional[Path]:
+    """Walk up from `start` to the nearest project binding, or None."""
+    if not start:
+        return None
+    try:
+        current = Path(start).resolve()
+    except Exception:  # noqa: BLE001
+        return None
+    for folder in (current, *current.parents):
+        candidate = folder / PROJECT_BINDING_SUBDIR
+        if (candidate / "credentials.json").is_file():
+            return candidate
+    return None
 
 # Claude Code hook events we report, and whether the hook may run detached.
 # Two stay synchronous because their stdout is a decision channel:
@@ -88,9 +125,18 @@ def python_executable() -> str:
     return sys.executable or "python3"
 
 
-def claude_mcp_add_command(python: Optional[str] = None) -> str:
-    """The `claude mcp add` line that registers the agntchat MCP server."""
+def claude_mcp_add_command(python: Optional[str] = None, project: Optional[Path] = None) -> str:
+    """The `claude mcp add` line that registers the agntchat MCP server —
+    user scope for the machine default, *local* scope (this repo only, kept
+    in the user's own config, never committed) with the binding folder in
+    `AGNTCHAT_HOME` for a project binding. Local wins over user for the same
+    server name, which is how a bound repo overrides the machine default."""
     py = python or python_executable()
+    if project:
+        return (
+            f"claude mcp add --scope local -e AGNTCHAT_HOME={_quote(str(project_home(project)))} "
+            f"{MCP_SERVER_NAME} -- {_quote(py)} {_quote(str(MCP_SERVER_SCRIPT))}"
+        )
     return (
         f"claude mcp add --scope user {MCP_SERVER_NAME} -- "
         f"{_quote(py)} {_quote(str(MCP_SERVER_SCRIPT))}"
@@ -131,7 +177,9 @@ def codex_notify_config(python: Optional[str] = None) -> str:
     return f'notify = [{json.dumps(py)}, {json.dumps(str(HOOK_SCRIPT))}, "codex-notify"]'
 
 
-def render_instructions(tool: str, python: Optional[str] = None) -> str:
+def render_instructions(
+    tool: str, python: Optional[str] = None, project: Optional[Path] = None
+) -> str:
     """Human-readable setup steps for the given CLI (`claude_code` | `codex`)."""
     if tool == "codex":
         return "\n".join(
@@ -150,14 +198,20 @@ def render_instructions(tool: str, python: Optional[str] = None) -> str:
         )
 
     hooks = json.dumps({"hooks": claude_hooks_config(python)}, indent=2)
+    where = (
+        f"1. Register the agntchat MCP server for this project (run it inside {project}):"
+        if project
+        else "1. Register the agntchat MCP server (tools the session can call):"
+    )
     return "\n".join(
         [
-            "1. Register the agntchat MCP server (tools the session can call):",
+            where,
             "",
-            f"   {claude_mcp_add_command(python)}",
+            f"   {claude_mcp_add_command(python, project)}",
             "",
-            "2. Merge this into ~/.claude/settings.json (or .claude/settings.json in one",
-            "   project) so agntchat can see the session — or rerun with --install:",
+            "2. Merge this into ~/.claude/settings.json so agntchat can see the session",
+            "   (installed once per machine; hooks pick the agent from the folder they",
+            "   run in) — or rerun with --install:",
             "",
             _indent(hooks, 3),
             "",
@@ -175,27 +229,51 @@ def render_instructions(tool: str, python: Optional[str] = None) -> str:
     )
 
 
-def install_claude(python: Optional[str] = None, settings_path: Optional[Path] = None) -> list[str]:
-    """Write the configuration for Claude Code: run `claude mcp add` and merge
-    the hooks into the user settings file (backup kept). Returns the steps
-    performed, for display."""
+def install_claude(
+    python: Optional[str] = None,
+    settings_path: Optional[Path] = None,
+    project: Optional[Path] = None,
+) -> list[str]:
+    """Write the configuration for Claude Code: run `claude mcp add` (user
+    scope, or local scope inside `project` with the binding folder in
+    `AGNTCHAT_HOME`) and merge the hooks into the user settings file (backup
+    kept). Returns the steps performed, for display."""
     done: list[str] = []
     claude = shutil.which("claude")
     if claude:
-        cmd = [
-            claude,
-            "mcp",
-            "add",
-            "--scope",
-            "user",
-            "agntchat",
-            "--",
-            python or python_executable(),
-            str(MCP_SERVER_SCRIPT),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if project:
+            home = project_home(project)
+            cmd = [
+                claude,
+                "mcp",
+                "add",
+                "--scope",
+                "local",
+                "-e",
+                f"AGNTCHAT_HOME={home}",
+                MCP_SERVER_NAME,
+                "--",
+                python or python_executable(),
+                str(MCP_SERVER_SCRIPT),
+            ]
+            cwd: Optional[str] = str(Path(project).resolve())
+        else:
+            cmd = [
+                claude,
+                "mcp",
+                "add",
+                "--scope",
+                "user",
+                MCP_SERVER_NAME,
+                "--",
+                python or python_executable(),
+                str(MCP_SERVER_SCRIPT),
+            ]
+            cwd = None
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, cwd=cwd)
         if result.returncode == 0:
-            done.append("registered MCP server `agntchat` (user scope)")
+            scope = f"local scope, {project}" if project else "user scope"
+            done.append(f"registered MCP server `{MCP_SERVER_NAME}` ({scope})")
         else:
             done.append(
                 "could not register the MCP server automatically: "
@@ -227,6 +305,14 @@ def install_claude(python: Optional[str] = None, settings_path: Optional[Path] =
     path.write_text(json.dumps(settings, indent=2) + "\n")
     done.append(f"wrote agntchat hooks to {path}")
     return done
+
+
+def write_project_binding_ignore(home: Path) -> None:
+    """Make the binding folder ignore itself so credentials never get committed."""
+    home.mkdir(parents=True, exist_ok=True)
+    ignore = home / ".gitignore"
+    if not ignore.exists():
+        ignore.write_text("*\n")
 
 
 def _is_ours(group: Any) -> bool:

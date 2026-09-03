@@ -22,10 +22,12 @@ Modes:
                                      beats every minute while the CLI process
                                      lives, then reports session_end
 
-Credentials come from ``~/.agentchat/credentials.json`` (written by the
-``connect`` command), overridable with ``AGNTCHAT_CREDENTIALS``. The agent
-JWT is cached in ``~/.agentchat/hook-token.json`` so a burst of tool hooks
-does not burst the token exchange.
+Credentials resolve per session (see ``agentchat.external``): a project
+binding ``<repo>/.claude/agntchat/`` found by walking up from the hook's
+``cwd``, else ``AGNTCHAT_HOME`` / ``AGNTCHAT_CREDENTIALS``, else
+``~/.agentchat`` (this machine's default agent). Everything the hook
+persists — the cached agent JWT, heartbeat pidfiles, MessageDisplay
+buffers — lives next to the credentials it used.
 """
 
 from __future__ import annotations
@@ -46,6 +48,33 @@ _CREDENTIALS = Path(os.environ.get("AGNTCHAT_CREDENTIALS", str(_DIR / "credentia
 _TOKEN_CACHE = _DIR / "hook-token.json"
 _PIDS = _DIR / "hooks"
 _DISPLAY = _DIR / "display"
+_PROJECT_BINDING = Path(".claude") / "agntchat"
+
+
+def _use_home(home: Path) -> None:
+    """Point every per-agent path at `home` (a binding folder)."""
+    global _DIR, _CREDENTIALS, _TOKEN_CACHE, _PIDS, _DISPLAY
+    _DIR = Path(home)
+    _CREDENTIALS = _DIR / "credentials.json"
+    _TOKEN_CACHE = _DIR / "hook-token.json"
+    _PIDS = _DIR / "hooks"
+    _DISPLAY = _DIR / "display"
+
+
+def _resolve_home(cwd: Optional[str]) -> None:
+    """Pick the agent for this hook run: the nearest project binding above
+    `cwd` wins; otherwise the environment / machine default already loaded."""
+    if not cwd:
+        return
+    try:
+        current = Path(cwd).resolve()
+    except Exception:  # noqa: BLE001
+        return
+    for folder in (current, *current.parents):
+        candidate = folder / _PROJECT_BINDING
+        if (candidate / "credentials.json").is_file():
+            _use_home(candidate)
+            return
 _TIMEOUT = 5
 # Agent JWTs live 15 minutes server-side; refresh well inside that.
 _TOKEN_MAX_AGE = 12 * 60
@@ -308,6 +337,8 @@ def _spawn_heartbeat(session: str) -> None:
         pass
     try:
         _PIDS.mkdir(parents=True, exist_ok=True)
+        # The detached loop has no cwd to resolve from — hand it the binding.
+        env = dict(os.environ, AGNTCHAT_HOME=str(_DIR))
         proc = subprocess.Popen(  # noqa: S603
             [sys.executable, os.path.abspath(__file__), "heartbeat", session, str(cli_pid)],
             stdin=subprocess.DEVNULL,
@@ -315,6 +346,7 @@ def _spawn_heartbeat(session: str) -> None:
             stderr=subprocess.DEVNULL,
             start_new_session=True,
             close_fds=True,
+            env=env,
         )
         pidfile.write_text(str(proc.pid))
     except Exception as exc:  # noqa: BLE001
@@ -533,6 +565,7 @@ def _handle_hook() -> None:
     session = payload.get("session_id")
     if not session:
         return
+    _resolve_home(payload.get("cwd"))
     creds = _load_credentials()
     if not creds:
         _log(f"no credentials at {_CREDENTIALS}; run `python -m agentchat connect <code>`")
@@ -601,6 +634,7 @@ def _handle_codex_notify(raw: str) -> None:
         or payload.get("session_id")
         or f"codex-{_cli_pid() or os.getppid()}"
     )
+    _resolve_home(os.getcwd())
     creds = _load_credentials()
     if not creds:
         return

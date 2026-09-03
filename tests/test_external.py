@@ -420,3 +420,69 @@ def test_mcp_server_channel_events(monkeypatch):
     # Already-seen messages and tasks are not pushed again.
     again, to_read_again = server._channel_events(data, seen)
     assert again == [] and to_read_again == []
+
+
+def test_project_binding_lookup_walks_up(tmp_path):
+    repo = tmp_path / "repo"
+    home = external.project_home(repo)
+    assert home == (repo / ".claude" / "agntchat").resolve()
+    assert external.find_project_home(repo / "src" / "deep") is None
+    external.write_project_binding_ignore(home)
+    (home / "credentials.json").write_text('{"agent_id": "a", "api_key": "k"}')
+    assert (home / ".gitignore").read_text() == "*\n"
+    assert external.find_project_home(repo / "src" / "deep") == home
+    assert external.find_project_home(tmp_path) is None
+    assert "--scope local" in external.claude_mcp_add_command("/py", repo)
+    assert f"AGNTCHAT_HOME={home}" in external.claude_mcp_add_command("/py", repo)
+    assert "--scope user" in external.claude_mcp_add_command("/py")
+
+
+def test_hook_resolves_the_project_binding_from_cwd(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    home = repo / ".claude" / "agntchat"
+    home.mkdir(parents=True)
+    home.joinpath("credentials.json").write_text(
+        json.dumps({"agent_id": "proj", "api_key": "k", "gateway_url": "u"})
+    )
+    default = tmp_path / "default"
+    hook._use_home(default)
+    # No binding above cwd → the default stays.
+    hook._resolve_home(str(tmp_path / "elsewhere"))
+    assert hook._DIR == default
+    # A binding above cwd wins, and every per-agent path moves with it.
+    hook._resolve_home(str(repo / "src"))
+    assert hook._CREDENTIALS == home / "credentials.json"
+    assert hook._DISPLAY == home / "display" and hook._PIDS == home / "hooks"
+    assert hook._load_credentials()["agent_id"] == "proj"
+    hook._use_home(default)
+
+
+def test_install_claude_project_mode_registers_local_scope(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(external.shutil, "which", lambda name: "/usr/bin/claude")
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs.get("cwd")))
+        return __import__("subprocess").CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(external.subprocess, "run", fake_run)
+    settings = tmp_path / "settings.json"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    steps = external.install_claude("/py", settings_path=settings, project=repo)
+    cmd, cwd = calls[0]
+    assert cmd[3:5] == ["--scope", "local"]
+    assert f"AGNTCHAT_HOME={external.project_home(repo)}" in cmd
+    assert cwd == str(repo.resolve())
+    assert any("local scope" in s for s in steps)
+    # Hooks are still installed user-scoped: one copy per machine.
+    assert "hooks" in json.loads(settings.read_text())
+
+
+def test_save_credentials_to_a_project_home(tmp_path):
+    from agentchat.invite import ClaimResult, save_credentials  # noqa: PLC0415
+
+    home = tmp_path / "repo" / ".claude" / "agntchat"
+    path = save_credentials(ClaimResult("a", "k", "u", "n"), home)
+    assert path == home / "credentials.json"
+    assert json.loads(path.read_text())["agent_id"] == "a"

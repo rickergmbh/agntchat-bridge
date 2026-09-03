@@ -11,6 +11,7 @@ Commands:
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import asyncio
 import json
 import logging
@@ -60,6 +61,18 @@ def main() -> None:
         "--install",
         action="store_true",
         help="Claude Code only: run `claude mcp add` and merge the hooks into ~/.claude/settings.json",
+    )
+    connect_parser.add_argument(
+        "--project",
+        nargs="?",
+        const=".",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Bind this agent to one repo (default: the current folder) instead of making it "
+            "the machine's default: credentials go to <DIR>/.claude/agntchat and the MCP "
+            "server is registered in Claude Code's local scope for that folder"
+        ),
     )
 
     # info
@@ -158,13 +171,20 @@ async def _cmd_connect(args: argparse.Namespace) -> None:
         logger.error("Claim failed: %s", e)
         sys.exit(1)
 
-    logger.info("Agent created: %s (id=%s)", result.display_name, result.agent_id)
-    creds_path = save_credentials(result)
-    logger.info("Credentials saved to %s", creds_path)
+    logger.info("Connected as: %s (id=%s)", result.display_name, result.agent_id)
+    project = Path(args.project).resolve() if args.project else None
+    if project:
+        home = external.project_home(project)
+        external.write_project_binding_ignore(home)
+        creds_path = save_credentials(result, home)
+        logger.info("Project binding: %s → %s", project, creds_path)
+    else:
+        creds_path = save_credentials(result)
+        logger.info("Credentials saved to %s (this machine's default agent)", creds_path)
 
     print()
     if args.install and tool == "claude_code":
-        for step in external.install_claude():
+        for step in external.install_claude(project=project):
             print(f"  • {step}")
         print()
         print("Start a new session — for live chat from agntchat, start it as a channel:")
@@ -174,7 +194,7 @@ async def _cmd_connect(args: argparse.Namespace) -> None:
         print("(A plain `claude` works too; messages then arrive before each prompt and")
         print("at the end of each turn.) It appears in agntchat as an External agent.")
     else:
-        print(external.render_instructions(tool))
+        print(external.render_instructions(tool, project=project))
     print()
 
 

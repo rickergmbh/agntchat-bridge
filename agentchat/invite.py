@@ -143,19 +143,23 @@ async def get_invite_info(gateway_url: str, code: str) -> dict:
     return resp.json()
 
 
-def save_credentials(result: ClaimResult) -> Path:
-    """Save claim result to ~/.agentchat/credentials.json.
+def save_credentials(result: ClaimResult, home: Optional[Path] = None) -> Path:
+    """Save claim result to `<home>/credentials.json` — `~/.agentchat` (this
+    machine's default agent) unless `home` names a project binding
+    (`<repo>/.claude/agntchat`, see `external.project_home`).
 
     Returns the path to the saved file.
     """
-    _CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
+    directory = Path(home) if home else _CREDENTIALS_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "credentials.json"
 
     data = asdict(result)
-    _CREDENTIALS_FILE.write_text(json.dumps(data, indent=2) + "\n")
-    os.chmod(_CREDENTIALS_FILE, 0o600)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    os.chmod(path, 0o600)
 
-    logger.info("Credentials saved to %s", _CREDENTIALS_FILE)
-    return _CREDENTIALS_FILE
+    logger.info("Credentials saved to %s", path)
+    return path
 
 
 def load_credentials() -> Optional[ClaimResult]:
