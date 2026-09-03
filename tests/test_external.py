@@ -301,7 +301,9 @@ def test_hook_stop_mirrors_final_text_and_blocks_on_unread(monkeypatch, capsys):
     monkeypatch.setattr(hook, "_load_credentials", _creds)
     _run_hook(monkeypatch, {"hook_event_name": "Stop", "session_id": "s", "cwd": "/tmp", "last_assistant_message": "Done."})
 
-    assert calls[0][2]["event"] == "stop" and calls[0][2]["text"] == "Done."
+    # Stop carries no text: MessageDisplay already mirrored the reply, and a
+    # Stop-side copy raced it into a duplicate (seen live 2026-09-03).
+    assert calls[0][2]["event"] == "stop" and "text" not in calls[0][2]
     decision = json.loads(capsys.readouterr().out)
     assert decision["decision"] == "block"
     assert "James: and the tests?" in decision["reason"]

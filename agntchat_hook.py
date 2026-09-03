@@ -542,8 +542,12 @@ def _handle_hook() -> None:
     if event in ("tool_start", "tool_end") and payload.get("tool_name"):
         body["toolName"] = str(payload["tool_name"])[:60]
 
-    # Transcript mirror: what the user typed, each finished assistant
-    # message, and (fallback, deduped server-side) the turn's final text.
+    # Transcript mirror: what the user typed and each finished assistant
+    # message. Stop deliberately carries NO text: MessageDisplay already
+    # mirrors the final message, and the two hooks fire within the same
+    # millisecond, so a Stop-side copy raced the server's dedupe and posted
+    # the reply twice. (Codex, which has no MessageDisplay, mirrors its
+    # reply through `stop` in `_handle_codex_notify`.)
     if event == "assistant_message":
         if payload.get("agent_id"):
             return  # a subagent's output is not the conversation
@@ -553,8 +557,6 @@ def _handle_hook() -> None:
         body["text"] = text[:_TEXT_MAX_CHARS]
     elif event == "prompt" and isinstance(payload.get("prompt"), str):
         body["text"] = payload["prompt"][:_TEXT_MAX_CHARS]
-    elif event == "stop" and isinstance(payload.get("last_assistant_message"), str):
-        body["text"] = payload["last_assistant_message"][:_TEXT_MAX_CHARS]
 
     status, _ = _api(creds, "POST", "/api/agents/me/sessions/events", body)
     if status == 404:
