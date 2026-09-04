@@ -70,6 +70,7 @@ def test_claude_hooks_config_shape():
         "MessageDisplay",
         "Stop",
         "Notification",
+        "PostModelSwitch",
     }
     for event, groups in hooks.items():
         entry = groups[0]["hooks"][0]
@@ -390,7 +391,10 @@ def test_mcp_server_channel_events(monkeypatch):
     import agentgram_mcp_server as server  # noqa: PLC0415
 
     init = server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
-    assert init["result"]["capabilities"]["experimental"] == {"claude/channel": {}}
+    assert init["result"]["capabilities"]["experimental"] == {
+        "claude/channel": {},
+        "claude/channel/permission": {},
+    }
     assert "send_message" in init["result"]["instructions"]
 
     seen: set[str] = set()
@@ -788,3 +792,74 @@ def test_backoff_ignores_cache_entries_without_a_key_fingerprint(tmp_path):
     hook._write_token_cache({"agent_id": "a", "failed_at": time.time(), "failures": 9})
     creds = {"agent_id": "a", "api_key": "k", "gateway_url": "u"}
     assert not hook._in_backoff(hook._read_token_cache(), "a", hook._key_fp(creds))
+
+
+def test_session_wrapper_control_socket_types_into_the_pty(tmp_path, monkeypatch):
+    import os, socket, threading, time  # noqa: PLC0415
+    import agntchat_session as wrapper  # noqa: PLC0415
+
+    assert wrapper.session_id_from_argv(["claude", "--session-id", "abcdef12-3456"]) == "abcdef12-3456"
+    assert wrapper.session_id_from_argv(["claude", "--resume", "abcdef12"]) == "abcdef12"
+    assert wrapper.session_id_from_argv(["claude", "--session-id", "nope!"]) is None
+
+    # pytest's tmp_path is longer than AF_UNIX allows on macOS: the wrapper
+    # must skip it and use its short fallback directory.
+    monkeypatch.setattr(wrapper, "SOCKET_DIR", str(tmp_path / "socks"))
+    monkeypatch.setattr(wrapper, "SOCKET_FALLBACK_DIR", f"/tmp/agntchat-test-{os.getpid()}")
+    srv, path = wrapper._open_control_socket("abcdef12-3456")
+    assert srv is not None and path and os.path.exists(path)
+    assert path.startswith("/tmp/agntchat-test-")
+    assert os.environ.get(wrapper.SOCKET_ENV) is None  # only the child sees it
+    r, w = os.pipe()
+    served = threading.Thread(target=lambda: (srv in __import__("select").select([srv], [], [], 5)[0]) and wrapper._serve_control(srv, w))
+    served.start()
+    time.sleep(0.05)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+        c.connect(path)
+        c.sendall(b'{"keys": "/model opus\\r"}\n')
+        assert b'"ok": true' in c.recv(64)
+    served.join(5)
+    assert os.read(r, 64) == b"/model opus\r"
+    srv.close()
+    os.unlink(path)
+    os.rmdir(os.path.dirname(path))
+
+
+def test_hook_session_context_reports_model_effort_and_notification():
+    ctx = hook._session_context("session_start", {"model": "claude-opus-5", "effort": {"level": "high"}})
+    assert ctx == {"model": "claude-opus-5", "effort": "high"}
+    assert hook._session_context("model_switch", {"from_model": "a", "to_model": "claude-sonnet-5"}) == {
+        "model": "claude-sonnet-5"
+    }
+    assert hook._session_context("waiting", {"notification_type": "permission_prompt", "effort": "low"}) == {
+        "effort": "low",
+        "notificationType": "permission_prompt",
+    }
+    assert hook._EVENT_FOR["PostModelSwitch"] == "model_switch"
+
+
+def test_mcp_poller_types_commands_only_when_typeable(monkeypatch):
+    import agentgram_mcp_server as mcp  # noqa: PLC0415
+
+    typed: list[str] = []
+    acked: list[dict] = []
+    monkeypatch.setattr(mcp, "_type_keys", lambda keys: typed.append(keys) or True)
+    fake_hook = type("H", (), {"_api": staticmethod(lambda creds, method, path, body=None: acked.append({"path": path, **(body or {})}) or (200, {}))})
+    msgs = [
+        {"id": "m2", "content": "/effort high", "command": "effort", "insertedAt": "2026-09-04T10:00:02Z"},
+        {"id": "m1", "content": "/model opus", "command": "model", "insertedAt": "2026-09-04T10:00:01Z"},
+        {"id": "m0", "content": "plain text", "insertedAt": "2026-09-04T10:00:00Z"},
+    ]
+    data = {"commandsTypeable": False, "unread": [{"conversationId": "c", "messages": msgs}]}
+    mcp._type_session_commands(fake_hook, {}, data)
+    assert typed == [] and acked == []
+
+    data["commandsTypeable"] = True
+    mcp._type_session_commands(fake_hook, {}, data)
+    assert typed == ["/model opus\r"]  # oldest first, one per poll
+    assert acked == [{"path": "/api/agents/me/inbox/ack", "messageIds": ["m1"]}]
+
+    # Commands are never pushed over the channel.
+    notes, pushed = mcp._channel_events(data, set())
+    assert [n["params"]["content"] for n in notes] == ["plain text"]
+    assert pushed == ["m0"]

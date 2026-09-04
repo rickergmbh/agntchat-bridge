@@ -137,6 +137,8 @@ def _channel_events(data: dict[str, Any], seen: set[str]) -> tuple[list[dict[str
             continue
         label = conv.get("title") or conv.get("type") or "conversation"
         for m in fresh:
+            if m.get("command"):
+                continue  # typed into the session by the poll loop, never pushed
             seen.add(str(m.get("id")))
             content = (m.get("content") or "").strip()
             if m.get("contentType") not in (None, "text"):
@@ -215,10 +217,130 @@ def _channel_poll_loop() -> None:
                 _write_out(note)
             if pushed:
                 hook._record_pushed(_session_id, pushed)
+            _type_session_commands(hook, creds, data)
             if len(seen) > _CHANNEL_SEEN_MAX:
                 seen.clear()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Channel poll failed: %s", exc)
+
+
+# --- Session commands (#148) ---
+#
+# A message in the session conversation that is one of the backend's
+# `session_commands` (`/model opus`, `/effort high`, `/compact`, `/clear`)
+# arrives flagged `command`. There is no API for slash commands, so it is
+# typed into the session's pty through the wrapper's control socket
+# (`agntchat_session.py`, path in AGNTCHAT_SESSION_SOCK) — but only while the
+# backend says `commandsTypeable` (between turns, no dialog open), then
+# acknowledged so nothing types it twice.
+_SOCKET_ENV = "AGNTCHAT_SESSION_SOCK"
+
+
+def _type_keys(keys: str) -> bool:
+    import socket  # noqa: PLC0415
+
+    path = os.environ.get(_SOCKET_ENV)
+    if not path:
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(3.0)
+            sock.connect(path)
+            sock.sendall(json.dumps({"keys": keys}).encode("utf-8") + b"\n")
+            reply = sock.recv(256)
+        return b'"ok": true' in reply
+    except OSError as exc:
+        logger.warning("Session command: control socket unavailable (%s)", exc)
+        return False
+
+
+def _type_session_commands(hook: Any, creds: dict[str, Any], data: dict[str, Any]) -> None:
+    commands = [
+        m
+        for conv in (data.get("unread") or [])
+        for m in (conv.get("messages") or [])
+        if m.get("command")
+    ]
+    if not commands:
+        return
+    if not data.get("commandsTypeable"):
+        return  # mid-turn or a dialog is open: try again next poll
+    # Oldest first; one command per poll so a model switch settles before
+    # the next lands (the inbox lists newest first).
+    m = sorted(commands, key=lambda x: str(x.get("insertedAt") or ""))[0]
+    text = (m.get("content") or "").strip()
+    if not _type_keys(text + "\r"):
+        return
+    logger.info("Session command typed: %s", text[:60])
+    hook._api(creds, "POST", "/api/agents/me/inbox/ack", {"messageIds": [m.get("id")]})
+
+
+# --- Permission relay (#148) ---
+#
+# Claude Code forwards each tool approval to us as
+# `notifications/claude/channel/permission_request` (request_id, tool_name,
+# description, input_preview). It becomes an agntchat permission request —
+# the same row the bridge's permission-prompt tool creates, so the desktop's
+# toast, standing grants and expiry apply unchanged — and its verdict goes
+# back as `notifications/claude/channel/permission`. The terminal dialog
+# stays open in parallel; whichever answer arrives first wins.
+_PERMISSION_RELAY_POLL = 2.0
+_PERMISSION_RELAY_MAX_WAIT = 600.0
+
+
+def _relay_permission(params: dict[str, Any]) -> None:
+    request_id = str(params.get("request_id") or "")
+    if not request_id:
+        return
+    try:
+        import agntchat_hook as hook  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return
+    creds = _sync_binding()
+    if not creds:
+        return
+    if creds.get("_home"):
+        hook._use_home(Path(creds["_home"]))
+    tool_name = str(params.get("tool_name") or "Tool")[:60]
+    preview = params.get("input_preview")
+    tool_input = preview if isinstance(preview, dict) else {"preview": str(preview or "")[:3500]}
+    body = {
+        "toolName": tool_name,
+        "toolInput": tool_input,
+        "description": str(params.get("description") or f"Claude Code wants to run {tool_name}")[:500],
+        "conversationId": CONVERSATION_ID or None,
+    }
+    status, resp = hook._api(creds, "POST", "/api/agent/permission-requests", body)
+    if status != 200 or not isinstance(resp, dict):
+        logger.warning("Permission relay: could not create request (HTTP %s)", status)
+        return
+    verdict = _verdict_for(resp.get("status"))
+    backend_id = resp.get("requestId")
+    waited = 0.0
+    while verdict is None and backend_id and waited < _PERMISSION_RELAY_MAX_WAIT:
+        time.sleep(_PERMISSION_RELAY_POLL)
+        waited += _PERMISSION_RELAY_POLL
+        status, poll = hook._api(creds, "GET", f"/api/agent/permission-requests/{backend_id}")
+        if status == 200 and isinstance(poll, dict):
+            verdict = _verdict_for(poll.get("status"))
+    if verdict is None:
+        return  # expired or unreachable: the terminal dialog still has it
+    _write_out(
+        {
+            "jsonrpc": "2.0",
+            "method": "notifications/claude/channel/permission",
+            "params": {"request_id": request_id, "behavior": verdict},
+        }
+    )
+    logger.info("Permission relay: %s → %s", tool_name, verdict)
+
+
+def _verdict_for(status: Any) -> str | None:
+    if status == "approved":
+        return "allow"
+    if status == "denied":
+        return "deny"
+    return None
 
 
 # --- Session binding (desktop picker, #148) ---
@@ -474,12 +596,21 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
         if STANDALONE:
             # Channel: Claude Code registers a listener for our push
             # notifications and hands `instructions` to the model.
-            result["capabilities"]["experimental"] = {"claude/channel": {}}
+            result["capabilities"]["experimental"] = {
+                "claude/channel": {},
+                # Tool approvals are relayed to the owner's agntchat as the
+                # same permission prompt a bridge agent raises (#148).
+                "claude/channel/permission": {},
+            }
             result["instructions"] = CHANNEL_INSTRUCTIONS
         return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
     if method == "notifications/initialized":
         _start_channel_poller()
+        return None
+
+    if method == "notifications/claude/channel/permission_request":
+        threading.Thread(target=_relay_permission, args=(params,), daemon=True).start()
         return None
 
     if method == "tools/list":

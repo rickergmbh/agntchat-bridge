@@ -178,6 +178,7 @@ _EVENT_FOR = {
     "MessageDisplay": "assistant_message",
     "Stop": "stop",
     "Notification": "waiting",
+    "PostModelSwitch": "model_switch",
 }
 # Notification types that mean "the session is waiting on a human".
 _WAITING_NOTIFICATIONS = {"permission_prompt", "idle_prompt", "elicitation_dialog"}
@@ -370,6 +371,24 @@ def _context(cwd: Optional[str], with_git: bool) -> dict:
 
 def _tool_kind() -> str:
     return os.environ.get("AGNTCHAT_TOOL", "claude_code")
+
+
+def _session_context(event: str, payload: dict) -> dict:
+    """Model, effort and — for `waiting` — the notification type (#148). The
+    model comes from SessionStart's optional `model` or PostModelSwitch's
+    `to_model`; no other hook carries it. `effort` is on every hook."""
+    ctx: dict[str, Any] = {}
+    model = payload.get("to_model") if event == "model_switch" else payload.get("model")
+    if isinstance(model, str) and model:
+        ctx["model"] = model[:80]
+    effort = payload.get("effort")
+    if isinstance(effort, dict):
+        effort = effort.get("level")
+    if isinstance(effort, str) and effort:
+        ctx["effort"] = effort[:20]
+    if event == "waiting" and isinstance(payload.get("notification_type"), str):
+        ctx["notificationType"] = payload["notification_type"][:40]
+    return ctx
 
 
 # --- heartbeat (detached) ------------------------------------------------
@@ -800,12 +819,16 @@ def _handle_hook() -> None:
 
     body: dict[str, Any] = {"sessionId": session, "event": event, "tool": _tool_kind()}
     body.update(_context(payload.get("cwd"), with_git=event in ("session_start", "prompt")))
+    body.update(_session_context(event, payload))
     if event in ("tool_start", "tool_end") and payload.get("tool_name"):
         body["toolName"] = str(payload["tool_name"])[:60]
     if event == "session_start":
         channel = _cli_channel_active()
         if channel is not None:
             body["channel"] = channel
+        # Under the bridge's pty wrapper the conversation can type session
+        # commands into this session (#148).
+        body["pty"] = bool(os.environ.get("AGNTCHAT_SESSION_SOCK"))
 
     # Transcript mirror: what the user typed and each finished assistant
     # message. Stop deliberately carries NO text: MessageDisplay already

@@ -359,6 +359,7 @@ _CLAUDE_HOOK_EVENTS = [
     ("MessageDisplay", True),
     ("Stop", False),
     ("Notification", True),
+    ("PostModelSwitch", True),
 ]
 
 # The MCP server name registered by `claude mcp add`; `--channels`-style
