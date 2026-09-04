@@ -407,8 +407,8 @@ def test_mcp_server_channel_events(monkeypatch):
             }
         ],
     }
-    notes, to_read = server._channel_events(data, seen)
-    assert to_read == ["c1"]
+    notes, pushed = server._channel_events(data, seen)
+    assert pushed == ["m1", "m2"]
     assert [n["method"] for n in notes] == ["notifications/claude/channel"] * 3
     first = notes[0]["params"]
     assert first["content"] == "hi there"
@@ -420,8 +420,8 @@ def test_mcp_server_channel_events(monkeypatch):
     for n in notes:
         assert all(k.replace("_", "").isalnum() for k in n["params"]["meta"])
     # Already-seen messages and tasks are not pushed again.
-    again, to_read_again = server._channel_events(data, seen)
-    assert again == [] and to_read_again == []
+    again, pushed_again = server._channel_events(data, seen)
+    assert again == [] and pushed_again == []
 
 
 def test_project_binding_lookup_walks_up(tmp_path):
@@ -668,3 +668,38 @@ def test_mcp_poller_only_runs_when_the_session_is_a_channel(monkeypatch):
     assert not server._channel_flag_present("claude --output-format stream-json --resume=abc")
     assert not server._channel_flag_present("claude --channels server:other")
     assert not server._channel_flag_present("claude --channels")
+
+
+def test_pushed_messages_are_claimed_but_not_rendered_again(monkeypatch, tmp_path, capsys):
+    hook._use_home(tmp_path / "home")
+    calls = []
+    inbox = {
+        "tasks": [],
+        "unread": [
+            {
+                "conversationId": "c1",
+                "type": "session",
+                "count": 2,
+                "ownerDm": True,
+                "messages": [
+                    {"id": "m-pushed", "senderName": "James", "content": "already on the channel"},
+                    {"id": "m-new", "senderName": "James", "content": "only in the digest"},
+                ],
+            }
+        ],
+    }
+    monkeypatch.setattr(hook, "_api", lambda creds, method, path, body=None: (calls.append(path) or (200, inbox)) if path.startswith("/api/agents/me/inbox") else (200, {}))
+    monkeypatch.setattr(hook, "_load_credentials", _creds)
+    monkeypatch.setattr(hook, "_git", lambda *a: None)
+    # The poller announced m-pushed for this session.
+    hook._record_pushed("s", ["m-pushed"])
+    _run_hook(monkeypatch, {"hook_event_name": "UserPromptSubmit", "session_id": "s", "cwd": "/tmp", "prompt": "go"})
+    out = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
+    assert "only in the digest" in out and "already on the channel" not in out
+    # Still claimed server-side (claim=true), so nothing is left behind.
+    assert any(p.startswith("/api/agents/me/inbox?claim=true") for p in calls)
+    # Stale ledger entries expire.
+    data = json.loads(hook._pushed_file().read_text())
+    data["s"]["m-pushed"] -= hook._PUSHED_MAX_AGE + 1
+    hook._pushed_file().write_text(json.dumps(data))
+    assert hook._read_pushed().get("s") == {}

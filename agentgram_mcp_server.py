@@ -82,11 +82,16 @@ TOOL_DEFS_JSON = os.environ.get("AGENTGRAM_TOOL_DEFS", "[]")
 # flag (`external.claude_channels_command()`); otherwise they are dropped
 # silently and the hooks' prompt/stop injection carries the traffic.
 #
-# Inbound is a poll of `GET /api/agents/me/inbox?claim=true` (nothing on
-# the agent's user channel signals new messages without an executor). The
-# claim marks what it returns as read in the same statement, so the hooks
-# never inject a pushed message a second time, and when several sessions
-# run as one agent each message reaches exactly one of them.
+# Inbound is a poll of `GET /api/agents/me/inbox` (nothing on the agent's
+# user channel signals new messages without an executor). The poller NEVER
+# claims: Claude Code only registers a channel when the session was started
+# with the flag AND the user confirmed the development-channels dialog, and
+# there is no signal for that — a poller that claimed and pushed into a
+# channel nobody registered lost the messages (2026-09-04). So the poller
+# announces each message once and records its id in the agent home
+# (`pushed.json`); the hooks claim at the next prompt / turn end and skip
+# rendering ids that were already pushed. Live when the channel works,
+# nothing lost when it doesn't.
 _CHANNEL_POLL_SECONDS = 3.0
 # When the backend is unreachable, poll less and less often (doubling per
 # failure, capped) — a few sessions polling a struggling server every 3s
@@ -116,11 +121,11 @@ def _write_out(obj: dict[str, Any]) -> None:
 
 
 def _channel_events(data: dict[str, Any], seen: set[str]) -> tuple[list[dict[str, Any]], list[str]]:
-    """Turn one claimed inbox payload into channel notifications for
-    everything not yet pushed. Returns `(notifications, conversation_ids)`.
-    Pure — the poll loop does the I/O."""
+    """Turn one inbox payload into channel notifications for everything not
+    yet pushed. Returns `(notifications, pushed_message_ids)`. Pure — the
+    poll loop does the I/O."""
     notes: list[dict[str, Any]] = []
-    to_read: list[str] = []
+    pushed: list[str] = []
     for conv in data.get("unread") or []:
         conv_id = str(conv.get("conversationId") or "")
         fresh = [m for m in (conv.get("messages") or []) if str(m.get("id")) not in seen]
@@ -146,7 +151,7 @@ def _channel_events(data: dict[str, Any], seen: set[str]) -> tuple[list[dict[str
                     "params": {"content": content, "meta": meta},
                 }
             )
-        to_read.append(conv_id)
+            pushed.append(str(m.get("id")))
     for t in data.get("tasks") or []:
         key = f"task:{t.get('id')}"
         if key in seen:
@@ -166,7 +171,7 @@ def _channel_events(data: dict[str, Any], seen: set[str]) -> tuple[list[dict[str
                 },
             }
         )
-    return notes, to_read
+    return notes, pushed
 
 
 def _channel_poll_loop() -> None:
@@ -191,9 +196,9 @@ def _channel_poll_loop() -> None:
                 continue
             if creds.get("_home"):
                 hook._use_home(Path(creds["_home"]))
-            path = "/api/agents/me/inbox?claim=true"
+            path = "/api/agents/me/inbox"
             if _session_id:
-                path += f"&sessionId={_session_id}"
+                path += f"?sessionId={_session_id}"
             status, data = hook._api(creds, "GET", path)
             if status != 200 or not isinstance(data, dict):
                 delay = min(delay * 2, _CHANNEL_POLL_MAX_SECONDS)
@@ -201,9 +206,11 @@ def _channel_poll_loop() -> None:
                     logger.warning("Channel poll failed (HTTP %s); next in %.0fs", status, delay)
                 continue
             delay = _CHANNEL_POLL_SECONDS
-            notes, _claimed = _channel_events(data, seen)
+            notes, pushed = _channel_events(data, seen)
             for note in notes:
                 _write_out(note)
+            if pushed:
+                hook._record_pushed(_session_id, pushed)
             if len(seen) > _CHANNEL_SEEN_MAX:
                 seen.clear()
         except Exception as exc:  # noqa: BLE001

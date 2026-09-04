@@ -570,12 +570,71 @@ def _render_inbox(data: dict, *, with_tasks: bool) -> tuple[Optional[str], list[
     return "\n".join([header, *lines]), rendered
 
 
+# --- pushed-id ledger (shared with the MCP server's channel poller) -------
+#
+# The poller announces messages over the channel but never claims them; it
+# records what it pushed here. The hooks claim (server-side, on fetch) and
+# skip rendering anything already pushed, so a working channel does not
+# show the same message twice and a broken one loses nothing.
+_PUSHED_MAX_AGE = 60 * 60
+
+
+def _pushed_file() -> Path:
+    return _DIR / "pushed.json"
+
+
+def _record_pushed(session: Optional[str], message_ids: list[str]) -> None:
+    if not session or not message_ids:
+        return
+    data = _read_pushed()
+    now = time.time()
+    entry = data.setdefault(session, {})
+    for mid in message_ids:
+        entry[mid] = now
+    try:
+        _DIR.mkdir(parents=True, exist_ok=True)
+        _pushed_file().write_text(json.dumps(data))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _read_pushed() -> dict:
+    try:
+        data = json.loads(_pushed_file().read_text())
+        if not isinstance(data, dict):
+            return {}
+    except Exception:  # noqa: BLE001
+        return {}
+    cutoff = time.time() - _PUSHED_MAX_AGE
+    return {
+        s: {m: t for m, t in (v or {}).items() if isinstance(t, (int, float)) and t > cutoff}
+        for s, v in data.items()
+        if isinstance(v, dict)
+    }
+
+
+def _drop_pushed(data: dict, session: Optional[str]) -> dict:
+    """Remove messages the poller already pushed into this session."""
+    if not session:
+        return data
+    pushed = _read_pushed().get(session) or {}
+    if not pushed:
+        return data
+    unread = []
+    for conv in data.get("unread") or []:
+        msgs = [m for m in (conv.get("messages") or []) if str(m.get("id")) not in pushed]
+        if msgs or not conv.get("messages"):
+            unread.append({**conv, "messages": msgs})
+    return {**data, "unread": unread}
+
+
 def _inbox_digest(creds: dict, session: Optional[str] = None) -> Optional[str]:
-    """Prompt-time digest: tasks + the messages this call claimed."""
+    """Prompt-time digest: tasks + the messages this call claimed (minus
+    those the channel already delivered)."""
     data = _fetch_inbox(creds, session)
     if not data:
         return None
-    digest, _rendered = _render_inbox(data, with_tasks=True)
+    digest, _rendered = _render_inbox(_drop_pushed(data, session), with_tasks=True)
     return digest
 
 
@@ -588,7 +647,7 @@ def _stop_decision(creds: dict, session: Optional[str] = None) -> Optional[dict]
     data = _fetch_inbox(creds, session)
     if not data:
         return None
-    digest, rendered = _render_inbox(data, with_tasks=False)
+    digest, rendered = _render_inbox(_drop_pushed(data, session), with_tasks=False)
     if not rendered or not digest:
         return None
     return {
