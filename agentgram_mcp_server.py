@@ -95,6 +95,8 @@ _CHANNEL_POLL_MAX_SECONDS = 120.0
 _CHANNEL_SEEN_MAX = 500
 _stdout_lock = threading.Lock()
 
+MCP_SERVER_NAME = "agntchat"
+
 CHANNEL_INSTRUCTIONS = (
     "agntchat messages arrive as "
     '<channel source="agntchat" conversation_id="…" sender="…" owner_dm="true|false">. '
@@ -279,9 +281,53 @@ def _sync_binding() -> dict[str, Any] | None:
 _channel_thread: threading.Thread | None = None
 
 
+def _channel_flag_present(argv: str) -> bool:
+    """Was the Claude Code process started as a channel for us? Only then
+    does Claude Code deliver our notifications; otherwise they are dropped
+    silently — and a poller that *claims* messages for a channel nobody
+    listens to loses them (they never reach the prompt-time hook). Seen
+    2026-09-04 with app-spawned sessions."""
+    tokens = argv.split()
+    for i, tok in enumerate(tokens):
+        if tok in ("--channels", "--dangerously-load-development-channels"):
+            # Values follow as separate tokens until the next flag.
+            for val in tokens[i + 1 :]:
+                if val.startswith("-"):
+                    break
+                if val == f"server:{MCP_SERVER_NAME}":
+                    return True
+        elif tok.startswith("--channels=") or tok.startswith("--dangerously-load-development-channels="):
+            if f"server:{MCP_SERVER_NAME}" in tok.split("=", 1)[1].split(","):
+                return True
+    return False
+
+
+def _channel_active() -> bool:
+    try:
+        import agntchat_hook as hook  # noqa: PLC0415
+        import subprocess  # noqa: PLC0415
+
+        pid = hook._cli_pid()
+        if not pid:
+            return False
+        out = subprocess.run(
+            ["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True, timeout=3, check=False
+        ).stdout
+        return _channel_flag_present(out)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _start_channel_poller() -> None:
     global _channel_thread
     if not STANDALONE or _channel_thread is not None:
+        return
+    if os.name != "nt" and not _channel_active():
+        logger.info(
+            "Channel: this session was not started with --channels server:%s; "
+            "inbound arrives via the hooks (before each prompt / at turn end)",
+            MCP_SERVER_NAME,
+        )
         return
     _channel_thread = threading.Thread(target=_channel_poll_loop, name="agntchat-channel", daemon=True)
     _channel_thread.start()

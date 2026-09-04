@@ -726,11 +726,15 @@ def _handle_hook() -> None:
             # stdout would; `sessionTitle` names the session (the picker's
             # choice, applied on the first prompt).
             out: dict[str, Any] = {"hookEventName": "UserPromptSubmit"}
+            payload_out: dict[str, Any] = {"hookSpecificOutput": out}
             if digest:
                 out["additionalContext"] = digest
+                # The context is invisible in the transcript; say on screen
+                # that agntchat messages were handed to the model.
+                payload_out["systemMessage"] = "agntchat: " + digest.split("\n", 1)[-1].strip().split("\n")[0][:160]
             if title:
                 out["sessionTitle"] = title[:100]
-            sys.stdout.write(json.dumps({"hookSpecificOutput": out}) + "\n")
+            sys.stdout.write(json.dumps(payload_out) + "\n")
             sys.stdout.flush()
     elif event == "stop":
         decision = _stop_decision(creds, session)

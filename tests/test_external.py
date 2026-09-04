@@ -278,8 +278,10 @@ def test_hook_prompt_mirrors_text_and_digest_lists_messages(monkeypatch, capsys)
 
     event = calls[0][2]
     assert event["event"] == "prompt" and event["text"] == "fix the build"
-    out = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
+    raw = json.loads(capsys.readouterr().out)
+    out = raw["hookSpecificOutput"]["additionalContext"]
     assert "James: how far along?" in out
+    assert raw["systemMessage"].startswith("agntchat: ")
     assert "your owner's DM" in out and "mirrored there automatically" in out
     assert 'group "Ops"' in out and "send_message" in out
     # The inbox is claimed (marked read server-side in the same statement);
@@ -654,3 +656,15 @@ def test_session_title_is_applied_once_on_the_first_prompt(monkeypatch, tmp_path
     # Second prompt: nothing to say (no inbox, title already applied).
     _run_hook(monkeypatch, {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": "/tmp", "prompt": "more"})
     assert capsys.readouterr().out == ""
+
+
+def test_mcp_poller_only_runs_when_the_session_is_a_channel(monkeypatch):
+    monkeypatch.delenv("AGENTGRAM_TOOL_DEFS", raising=False)
+    import agentgram_mcp_server as server  # noqa: PLC0415
+
+    assert server._channel_flag_present("claude --dangerously-load-development-channels server:agntchat")
+    assert server._channel_flag_present("claude --channels server:agntchat plugin:x@y --model haiku")
+    assert server._channel_flag_present("claude --channels=server:agntchat")
+    assert not server._channel_flag_present("claude --output-format stream-json --resume=abc")
+    assert not server._channel_flag_present("claude --channels server:other")
+    assert not server._channel_flag_present("claude --channels")
