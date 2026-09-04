@@ -189,7 +189,10 @@ def _channel_poll_loop() -> None:
                 continue
             if creds.get("_home"):
                 hook._use_home(Path(creds["_home"]))
-            status, data = hook._api(creds, "GET", "/api/agents/me/inbox?claim=true")
+            path = "/api/agents/me/inbox?claim=true"
+            if _session_id:
+                path += f"&sessionId={_session_id}"
+            status, data = hook._api(creds, "GET", path)
             if status != 200 or not isinstance(data, dict):
                 delay = min(delay * 2, _CHANNEL_POLL_MAX_SECONDS)
                 if status in (0, 401, 404):

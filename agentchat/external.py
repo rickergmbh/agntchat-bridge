@@ -84,12 +84,14 @@ def bind_session(
     *,
     cwd: Optional[str] = None,
     title: Optional[str] = None,
+    conversation_id: Optional[str] = None,
     path: Optional[Path] = None,
 ) -> dict[str, Any]:
     """Point `session_id` at `agent_id` (whose credentials must already be in
     `agent_home(agent_id)`). Rewrites the bindings file atomically. `title`
     is applied by the hook on the session's first prompt (Claude Code's
-    `sessionTitle`), then dropped."""
+    `sessionTitle`), then dropped. `conversation_id` is the session
+    conversation the server linked (informational: the listing shows it)."""
     target = path or SESSIONS_FILE
     bindings = load_session_bindings(target)
     import time  # noqa: PLC0415
@@ -97,6 +99,8 @@ def bind_session(
     entry: dict[str, Any] = {"agent_id": agent_id, "cwd": cwd, "bound_at": time.time()}
     if title:
         entry["title"] = title
+    if conversation_id:
+        entry["conversation_id"] = conversation_id
     bindings[session_id] = entry
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_suffix(".json.tmp")
@@ -315,6 +319,7 @@ def list_claude_sessions(
                 "boundBy": bound_by,
                 "agentId": agent.get("agent_id") if agent else None,
                 "agentName": agent.get("display_name") if agent else None,
+                "conversationId": (entry or {}).get("conversation_id") if isinstance(entry, dict) else None,
             }
         )
     return sessions

@@ -167,7 +167,7 @@ def test_hook_ignores_unlisted_and_non_waiting_notifications(monkeypatch, capsys
 def test_hook_prompt_prints_inbox_digest(monkeypatch, capsys):
     responses = {
         "/api/agents/me/sessions/events": (200, {}),
-        "/api/agents/me/inbox?claim=true": (
+        "/api/agents/me/inbox?claim=true&sessionId=s": (
             200,
             {
                 "tasks": [{"id": "t1", "title": "Fix build", "status": "pending"}],
@@ -267,7 +267,7 @@ def test_hook_prompt_mirrors_text_and_digest_lists_messages(monkeypatch, capsys)
 
     def api(creds, method, path, body=None):
         calls.append((method, path, body))
-        if path == "/api/agents/me/inbox?claim=true":
+        if path.startswith("/api/agents/me/inbox?claim=true"):
             return 200, inbox
         return 200, {}
 
@@ -284,7 +284,7 @@ def test_hook_prompt_mirrors_text_and_digest_lists_messages(monkeypatch, capsys)
     assert 'group "Ops"' in out and "send_message" in out
     # The inbox is claimed (marked read server-side in the same statement);
     # no separate read call.
-    assert ("GET", "/api/agents/me/inbox?claim=true", None) in calls
+    assert ("GET", "/api/agents/me/inbox?claim=true&sessionId=s", None) in calls
     assert not any(p.endswith("/read") for _, p, _ in calls)
 
     # A channel event Claude Code raised as a prompt is never mirrored back —
@@ -313,7 +313,7 @@ def test_hook_stop_mirrors_final_text_and_blocks_on_unread(monkeypatch, capsys):
 
     def api(creds, method, path, body=None):
         calls.append((method, path, body))
-        return (200, inbox) if path == "/api/agents/me/inbox?claim=true" else (200, {})
+        return (200, inbox) if path.startswith("/api/agents/me/inbox?claim=true") else (200, {})
 
     monkeypatch.setattr(hook, "_api", api)
     monkeypatch.setattr(hook, "_load_credentials", _creds)
@@ -327,7 +327,7 @@ def test_hook_stop_mirrors_final_text_and_blocks_on_unread(monkeypatch, capsys):
     assert "James: and the tests?" in decision["reason"]
     # Tasks never block a stop — they would block every stop until done.
     assert "Fix build" not in decision["reason"]
-    assert ("GET", "/api/agents/me/inbox?claim=true", None) in calls
+    assert ("GET", "/api/agents/me/inbox?claim=true&sessionId=s", None) in calls
 
     # A conversation whose messages another session claimed is not a reason
     # to continue either.

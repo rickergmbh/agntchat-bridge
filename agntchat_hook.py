@@ -39,6 +39,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Optional
@@ -494,11 +495,14 @@ def _heartbeat_loop(session: str, cli_pid: int) -> None:
 # --- inbox digest --------------------------------------------------------
 
 
-def _fetch_inbox(creds: dict) -> Optional[dict]:
-    """Claim the inbox: the server marks what it returns as read in the same
-    statement, so with several sessions running as one agent each message
-    reaches exactly one of them."""
-    status, data = _api(creds, "GET", "/api/agents/me/inbox?claim=true")
+def _fetch_inbox(creds: dict, session: Optional[str] = None) -> Optional[dict]:
+    """Claim the inbox for THIS session: the server scopes the unread list
+    to the session's linked conversation (nothing for an unlinked session)
+    and marks what it returns as read in the same statement."""
+    path = "/api/agents/me/inbox?claim=true"
+    if session:
+        path += f"&sessionId={urllib.parse.quote(session)}"
+    status, data = _api(creds, "GET", path)
     return data if status == 200 and isinstance(data, dict) else None
 
 
@@ -566,22 +570,22 @@ def _render_inbox(data: dict, *, with_tasks: bool) -> tuple[Optional[str], list[
     return "\n".join([header, *lines]), rendered
 
 
-def _inbox_digest(creds: dict) -> Optional[str]:
+def _inbox_digest(creds: dict, session: Optional[str] = None) -> Optional[str]:
     """Prompt-time digest: tasks + the messages this call claimed."""
-    data = _fetch_inbox(creds)
+    data = _fetch_inbox(creds, session)
     if not data:
         return None
     digest, _rendered = _render_inbox(data, with_tasks=True)
     return digest
 
 
-def _stop_decision(creds: dict) -> Optional[dict]:
+def _stop_decision(creds: dict, session: Optional[str] = None) -> Optional[dict]:
     """End of turn: if agntchat messages arrived while the session worked,
     keep the turn going so it answers them (Claude Code caps consecutive
     continuations, and the claim marks the messages read, so this cannot
     loop on the same content). Tasks never block a stop — they would block
     every stop until done."""
-    data = _fetch_inbox(creds)
+    data = _fetch_inbox(creds, session)
     if not data:
         return None
     digest, rendered = _render_inbox(data, with_tasks=False)
@@ -715,7 +719,7 @@ def _handle_hook() -> None:
         _rm_tree(_DISPLAY / _safe_key(session))
         _forget_cli_session(session)
     elif event == "prompt":
-        digest = _inbox_digest(creds)
+        digest = _inbox_digest(creds, session)
         title = _take_session_title(session)
         if digest or title:
             # JSON on stdout: `additionalContext` reaches the model like plain
@@ -729,7 +733,7 @@ def _handle_hook() -> None:
             sys.stdout.write(json.dumps({"hookSpecificOutput": out}) + "\n")
             sys.stdout.flush()
     elif event == "stop":
-        decision = _stop_decision(creds)
+        decision = _stop_decision(creds, session)
         if decision:
             # JSON on stdout is the Stop hook's decision channel.
             sys.stdout.write(json.dumps(decision) + "\n")

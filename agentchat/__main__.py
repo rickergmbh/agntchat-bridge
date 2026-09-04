@@ -95,9 +95,17 @@ def main() -> None:
         "--title", default=None, help="Name the session (applied by the hook on its first prompt)"
     )
     bind_parser.add_argument(
+        "--conversation", default=None, help="The session conversation the server linked (#148)"
+    )
+    bind_parser.add_argument(
         "--install",
         action="store_true",
         help="Also make sure the user-scope hooks and MCP server are installed",
+    )
+
+    # identities (desktop, #148): external agents this machine holds credentials for
+    subparsers.add_parser(
+        "identities", help="List external agents with credentials saved on this machine (JSON)"
     )
 
     # rekey (desktop, #148): the agent's API key was regenerated — refresh
@@ -134,6 +142,8 @@ def main() -> None:
         _cmd_bind(args)
     elif args.command == "rekey":
         _cmd_rekey(args)
+    elif args.command == "identities":
+        _cmd_identities()
     elif args.command == "info":
         asyncio.run(_cmd_info(args))
     elif args.command == "status":
@@ -264,11 +274,32 @@ def _cmd_bind(args: argparse.Namespace) -> None:
         ),
         home,
     )
-    entry = external.bind_session(args.session, args.agent_id, cwd=args.cwd, title=args.title)
+    entry = external.bind_session(
+        args.session, args.agent_id, cwd=args.cwd, title=args.title, conversation_id=args.conversation
+    )
     steps: list[str] = []
     if args.install:
         steps = external.install_claude()
     print(json.dumps({"session": args.session, "binding": entry, "home": str(home), "steps": steps}))
+
+
+def _cmd_identities() -> None:
+    """External agents this machine can act as: the machine default plus
+    every per-session agent home with credentials."""
+    from . import external
+
+    seen: dict[str, dict[str, Any]] = {}
+    default = external._read_credentials_at(external._HOME)
+    if default:
+        seen[default["agent_id"]] = {"agentId": default["agent_id"], "displayName": default.get("display_name"), "default": True}
+    try:
+        for home in external.AGENTS_DIR.iterdir():
+            creds = external._read_credentials_at(home)
+            if creds and creds["agent_id"] not in seen:
+                seen[creds["agent_id"]] = {"agentId": creds["agent_id"], "displayName": creds.get("display_name"), "default": False}
+    except OSError:
+        pass
+    print(json.dumps(list(seen.values())))
 
 
 def _cmd_rekey(args: argparse.Namespace) -> None:
