@@ -11,6 +11,12 @@ attach a terminal later and type as usual; window resizes pass through.
 
     agntchat_session.py [--auto-confirm] -- claude --session-id … --dangerously-load-development-channels server:agntchat
 
+The desktop's terminal route runs through it too, so the confirmation is
+never left to the user. The child never sees COLORTERM: Apple Terminal and
+macOS's screen cannot render 24-bit color, and a launcher started from an
+IDE shell passes `COLORTERM=truecolor` down to them — the result is white
+blocks and invisible text wherever Claude Code paints its own colors.
+
 Standard library only.
 """
 
@@ -63,6 +69,7 @@ def _copy_winsize(master_fd: int) -> None:
 def run(argv: list[str], auto_confirm: bool) -> int:
     pid, master_fd = pty.fork()
     if pid == 0:
+        os.environ.pop("COLORTERM", None)
         os.execvp(argv[0], argv)  # noqa: S606
         return 127  # pragma: no cover
 
