@@ -51,11 +51,15 @@ except Exception as _e:  # noqa: BLE001
 #   message) and the serialized tool catalog.
 # * **Standalone / external agent (#148)**: a user's own Claude Code / Codex
 #   session loads this script via `claude mcp add` / `codex mcp add`. No
-#   bridge, so nothing is pre-resolved: credentials come from
-#   `~/.agentchat/credentials.json` (written by `python -m agentchat
-#   connect`), the tool catalog is fetched from `GET /api/me`, and the
-#   default conversation is the owner DM, resolved on first use. Detected by
-#   the ABSENCE of `AGENTGRAM_TOOL_DEFS` — the bridge always sets it.
+#   bridge, so nothing is pre-resolved: credentials come from the session's
+#   binding (or `~/.agentchat/credentials.json`), the tool catalog is
+#   fetched from `GET /api/me`, and the default conversation is the
+#   session's linked session conversation (#148) — resolved from the
+#   binding, never a DM (creating one surfaced a stray "Claude Code" DM
+#   next to every session conversation). A session with no linked
+#   conversation has no default: tools that need one must name it.
+#   Detected by the ABSENCE of `AGENTGRAM_TOOL_DEFS` — the bridge always
+#   sets it.
 
 STANDALONE = "AGENTGRAM_TOOL_DEFS" not in os.environ
 _CREDS = load_credentials() if STANDALONE else None
@@ -259,6 +263,22 @@ def _current_binding() -> dict[str, Any] | None:
     return creds
 
 
+def _bound_conversation_id() -> str | None:
+    """The session conversation this session is linked to, from the local
+    binding (the desktop records it on bind)."""
+    try:
+        from agentchat import external  # noqa: PLC0415
+        import agntchat_hook as hook  # noqa: PLC0415
+
+        global _session_id
+        if _session_id is None:
+            _session_id = external.session_for_cli_pid(hook._cli_pid())
+        entry = external.load_session_bindings().get(_session_id or "")
+        return str(entry["conversation_id"]) if isinstance(entry, dict) and entry.get("conversation_id") else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _apply_binding(creds: dict[str, Any]) -> bool:
     """Switch the process to `creds` if they name a different agent. Returns
     True when a switch happened. Resets the executor + catalog so the next
@@ -368,16 +388,15 @@ def _ensure_standalone_context() -> None:
 
     if not OWNER_ID:
         OWNER_ID = profile.get("ownerId") or ""
+    if not CONVERSATION_ID:
+        CONVERSATION_ID = _bound_conversation_id() or ""
+        if CONVERSATION_ID:
+            logger.info("Standalone: default conversation = session conversation %s", CONVERSATION_ID[:12])
+            te = get_tool_executor()
+            te._context["conversation_id"] = CONVERSATION_ID
         get_tool_executor()._context["owner_id"] = OWNER_ID
 
-    if not CONVERSATION_ID and OWNER_ID:
-        try:
-            dm = asyncio.run(executor.find_or_create_dm(OWNER_ID))
-            CONVERSATION_ID = dm.get("id") or ""
-            get_tool_executor()._context["conversation_id"] = CONVERSATION_ID
-            logger.info("Standalone: default conversation = owner DM %s", CONVERSATION_ID[:12])
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Standalone: could not resolve owner DM: %s", exc)
+    # No DM fallback here — see the module notes.
 
 # --- Permission prompt (#67) ---
 #
