@@ -265,7 +265,10 @@ def _in_backoff(cached: dict, agent_id: str, key_fp: Optional[str] = None) -> bo
     old key must not silence hooks that already hold the new one."""
     if cached.get("agent_id") != agent_id or not cached.get("failed_at"):
         return False
-    if key_fp and cached.get("key_fp") and cached["key_fp"] != key_fp:
+    # An entry without a fingerprint came from a stale writer (a long-lived
+    # MCP server still running an older copy of this module shares the
+    # file); it must never silence hooks holding a key that works.
+    if key_fp and cached.get("key_fp") != key_fp:
         return False
     failures = int(cached.get("failures") or 1)
     wait = min(_TOKEN_BACKOFF_BASE * (2 ** (failures - 1)), _TOKEN_BACKOFF_MAX)

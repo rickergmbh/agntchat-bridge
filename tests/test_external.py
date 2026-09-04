@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 import sys
 from pathlib import Path
 
@@ -760,3 +761,30 @@ def test_bind_reuses_saved_credentials_when_no_key_is_given(monkeypatch, tmp_pat
     # Unknown agent with no key: refused rather than minting anything.
     with pytest.raises(SystemExit):
         cli._cmd_bind(ns(agent_id="stranger"))
+
+
+def test_session_wrapper_detects_the_channels_dialog():
+    import agntchat_session as wrapper  # noqa: PLC0415
+
+    # Rendered with cursor positioning instead of spaces, as in a real pty log.
+    frame = (b"\x1b[2J\x1b[3;5H\x1b[31mWARNING: Loading development channels\x1b[0m"
+             b"\x1b[9;5H\xe2\x9d\xaf 1. I am using this for local development"
+             b"\x1b[10;5H2. Exit\x1b[12;5HEnter to confirm \xc2\xb7 Esc to cancel")
+    assert wrapper.dialog_pending(frame)
+    assert not wrapper.dialog_pending(b"\x1b[2J> ")
+
+    # The folder-trust prompt shares the footer but pre-selects "No, exit":
+    # it must be left to the user, never answered.
+    trust = (b"\x1b[2JQuick safety check: Is this a project you created or one you trust?"
+             b"\x1b[9;5H\xe2\x9d\xaf No, exit\x1b[10;5HYes, I trust this folder"
+             b"\x1b[12;5HEnter to confirm \xc2\xb7 Esc to cancel")
+    assert not wrapper.dialog_pending(trust)
+
+
+def test_backoff_ignores_cache_entries_without_a_key_fingerprint(tmp_path):
+    # A long-lived process running an older copy of the module wrote the
+    # shared cache without `key_fp`; current hooks must not be silenced by it.
+    hook._use_home(tmp_path / "home")
+    hook._write_token_cache({"agent_id": "a", "failed_at": time.time(), "failures": 9})
+    creds = {"agent_id": "a", "api_key": "k", "gateway_url": "u"}
+    assert not hook._in_backoff(hook._read_token_cache(), "a", hook._key_fp(creds))
