@@ -430,6 +430,42 @@ def _cli_pid() -> Optional[int]:
     return None
 
 
+_MCP_SERVER_NAME = "agntchat"
+
+
+def _channel_flag_present(argv: str) -> bool:
+    """Was this Claude Code process started as a channel for us
+    (`--channels` / `--dangerously-load-development-channels` naming
+    `server:agntchat`)? Only such a session can receive agntchat messages
+    live; every other one gets them when it next runs a turn."""
+    tokens = argv.split()
+    for i, tok in enumerate(tokens):
+        if tok in ("--channels", "--dangerously-load-development-channels"):
+            for val in tokens[i + 1 :]:
+                if val.startswith("-"):
+                    break
+                if val == f"server:{_MCP_SERVER_NAME}":
+                    return True
+        elif tok.startswith("--channels=") or tok.startswith("--dangerously-load-development-channels="):
+            if f"server:{_MCP_SERVER_NAME}" in tok.split("=", 1)[1].split(","):
+                return True
+    return False
+
+
+def _cli_channel_active() -> Optional[bool]:
+    """None when the CLI process can't be found (Windows)."""
+    pid = _cli_pid()
+    if not pid:
+        return None
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True, timeout=3, check=False
+        ).stdout
+    except Exception:  # noqa: BLE001
+        return None
+    return _channel_flag_present(out)
+
+
 def _pidfile(session: str) -> Path:
     safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in session)[:80]
     return _PIDS / f"{safe}.pid"
@@ -748,6 +784,10 @@ def _handle_hook() -> None:
     body.update(_context(payload.get("cwd"), with_git=event in ("session_start", "prompt")))
     if event in ("tool_start", "tool_end") and payload.get("tool_name"):
         body["toolName"] = str(payload["tool_name"])[:60]
+    if event == "session_start":
+        channel = _cli_channel_active()
+        if channel is not None:
+            body["channel"] = channel
 
     # Transcript mirror: what the user typed and each finished assistant
     # message. Stop deliberately carries NO text: MessageDisplay already

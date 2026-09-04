@@ -662,12 +662,13 @@ def test_mcp_poller_only_runs_when_the_session_is_a_channel(monkeypatch):
     monkeypatch.delenv("AGENTGRAM_TOOL_DEFS", raising=False)
     import agentgram_mcp_server as server  # noqa: PLC0415
 
-    assert server._channel_flag_present("claude --dangerously-load-development-channels server:agntchat")
-    assert server._channel_flag_present("claude --channels server:agntchat plugin:x@y --model haiku")
-    assert server._channel_flag_present("claude --channels=server:agntchat")
-    assert not server._channel_flag_present("claude --output-format stream-json --resume=abc")
-    assert not server._channel_flag_present("claude --channels server:other")
-    assert not server._channel_flag_present("claude --channels")
+    assert hook._channel_flag_present("claude --dangerously-load-development-channels server:agntchat")
+    assert hook._channel_flag_present("claude --channels server:agntchat plugin:x@y --model haiku")
+    assert hook._channel_flag_present("claude --channels=server:agntchat")
+    assert not hook._channel_flag_present("claude --output-format stream-json --resume=abc")
+    assert not hook._channel_flag_present("claude --channels server:other")
+    assert not hook._channel_flag_present("claude --channels")
+    assert server._channel_active in (server._channel_active,)  # importable
 
 
 def test_pushed_messages_are_claimed_but_not_rendered_again(monkeypatch, tmp_path, capsys):
@@ -703,3 +704,18 @@ def test_pushed_messages_are_claimed_but_not_rendered_again(monkeypatch, tmp_pat
     data["s"]["m-pushed"] -= hook._PUSHED_MAX_AGE + 1
     hook._pushed_file().write_text(json.dumps(data))
     assert hook._read_pushed().get("s") == {}
+
+
+def test_session_start_reports_whether_it_is_a_channel(monkeypatch):
+    calls = []
+    monkeypatch.setattr(hook, "_api", lambda creds, method, path, body=None: calls.append(body) or (200, {}))
+    monkeypatch.setattr(hook, "_load_credentials", _creds)
+    monkeypatch.setattr(hook, "_git", lambda *a: None)
+    monkeypatch.setattr(hook, "_spawn_heartbeat", lambda s: None)
+    monkeypatch.setattr(hook, "_record_cli_session", lambda s: None)
+    monkeypatch.setattr(hook, "_cli_channel_active", lambda: False)
+    _run_hook(monkeypatch, {"hook_event_name": "SessionStart", "session_id": "s", "cwd": "/tmp"})
+    assert calls[0]["event"] == "session_start" and calls[0]["channel"] is False
+    monkeypatch.setattr(hook, "_cli_channel_active", lambda: None)
+    _run_hook(monkeypatch, {"hook_event_name": "SessionStart", "session_id": "s", "cwd": "/tmp"})
+    assert "channel" not in calls[1]

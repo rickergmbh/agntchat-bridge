@@ -288,27 +288,6 @@ def _sync_binding() -> dict[str, Any] | None:
 _channel_thread: threading.Thread | None = None
 
 
-def _channel_flag_present(argv: str) -> bool:
-    """Was the Claude Code process started as a channel for us? Only then
-    does Claude Code deliver our notifications; otherwise they are dropped
-    silently — and a poller that *claims* messages for a channel nobody
-    listens to loses them (they never reach the prompt-time hook). Seen
-    2026-09-04 with app-spawned sessions."""
-    tokens = argv.split()
-    for i, tok in enumerate(tokens):
-        if tok in ("--channels", "--dangerously-load-development-channels"):
-            # Values follow as separate tokens until the next flag.
-            for val in tokens[i + 1 :]:
-                if val.startswith("-"):
-                    break
-                if val == f"server:{MCP_SERVER_NAME}":
-                    return True
-        elif tok.startswith("--channels=") or tok.startswith("--dangerously-load-development-channels="):
-            if f"server:{MCP_SERVER_NAME}" in tok.split("=", 1)[1].split(","):
-                return True
-    return False
-
-
 def _channel_active() -> bool:
     try:
         import agntchat_hook as hook  # noqa: PLC0415
@@ -320,7 +299,7 @@ def _channel_active() -> bool:
         out = subprocess.run(
             ["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True, timeout=3, check=False
         ).stdout
-        return _channel_flag_present(out)
+        return hook._channel_flag_present(out)
     except Exception:  # noqa: BLE001
         return False
 
