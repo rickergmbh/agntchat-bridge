@@ -253,9 +253,19 @@ def _write_token_cache(data: dict) -> None:
         pass
 
 
-def _in_backoff(cached: dict, agent_id: str) -> bool:
-    """A recent failed exchange for this agent is still cooling down."""
+def _key_fp(creds: dict) -> str:
+    import hashlib  # noqa: PLC0415
+
+    return hashlib.sha256(str(creds.get("api_key", "")).encode("utf-8")).hexdigest()[:16]
+
+
+def _in_backoff(cached: dict, agent_id: str, key_fp: Optional[str] = None) -> bool:
+    """A recent failed exchange for this agent AND this key is still cooling
+    down. A rotated key starts clean: the poller of a session holding the
+    old key must not silence hooks that already hold the new one."""
     if cached.get("agent_id") != agent_id or not cached.get("failed_at"):
+        return False
+    if key_fp and cached.get("key_fp") and cached["key_fp"] != key_fp:
         return False
     failures = int(cached.get("failures") or 1)
     wait = min(_TOKEN_BACKOFF_BASE * (2 ** (failures - 1)), _TOKEN_BACKOFF_MAX)
@@ -264,7 +274,8 @@ def _in_backoff(cached: dict, agent_id: str) -> bool:
 
 def _exchange_token(creds: dict) -> Optional[str]:
     cached = _read_token_cache()
-    if _in_backoff(cached, creds["agent_id"]):
+    fp = _key_fp(creds)
+    if _in_backoff(cached, creds["agent_id"], fp):
         return None
     status, data = _request(
         "POST",
@@ -275,12 +286,15 @@ def _exchange_token(creds: dict) -> Optional[str]:
     )
     token = data.get("token") if status == 200 else None
     if token:
-        _write_token_cache({"agent_id": creds["agent_id"], "token": token, "at": time.time()})
+        _write_token_cache(
+            {"agent_id": creds["agent_id"], "key_fp": fp, "token": token, "at": time.time()}
+        )
     else:
         _log(f"token exchange failed (HTTP {status})")
-        failures = (int(cached.get("failures") or 0) + 1) if cached.get("agent_id") == creds["agent_id"] else 1
+        same = cached.get("agent_id") == creds["agent_id"] and cached.get("key_fp") == fp
+        failures = (int(cached.get("failures") or 0) + 1) if same else 1
         _write_token_cache(
-            {"agent_id": creds["agent_id"], "failed_at": time.time(), "failures": failures}
+            {"agent_id": creds["agent_id"], "key_fp": fp, "failed_at": time.time(), "failures": failures}
         )
     return token
 
@@ -291,6 +305,7 @@ def _token(creds: dict, force: bool = False) -> Optional[str]:
         if (
             cached.get("agent_id") == creds["agent_id"]
             and cached.get("token")
+            and (not cached.get("key_fp") or cached.get("key_fp") == _key_fp(creds))
             and time.time() - float(cached.get("at", 0)) < _TOKEN_MAX_AGE
         ):
             return cached["token"]

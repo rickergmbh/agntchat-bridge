@@ -87,7 +87,11 @@ def main() -> None:
     )
     bind_parser.add_argument("--session", required=True, help="Claude Code session id")
     bind_parser.add_argument("--agent-id", required=True)
-    bind_parser.add_argument("--api-key", required=True)
+    bind_parser.add_argument(
+        "--api-key",
+        default=None,
+        help="The agent's key; omit to reuse the credentials this machine already holds for it",
+    )
     bind_parser.add_argument("--display-name", default="")
     bind_parser.add_argument("--gateway-url", default=DEFAULT_GATEWAY_URL)
     bind_parser.add_argument("--cwd", default=None, help="The session's working directory")
@@ -265,15 +269,35 @@ def _cmd_bind(args: argparse.Namespace) -> None:
     from .invite import ClaimResult, save_credentials
 
     home = external.agent_home(args.agent_id)
-    save_credentials(
-        ClaimResult(
-            agent_id=args.agent_id,
-            api_key=args.api_key,
-            gateway_url=args.gateway_url,
-            display_name=args.display_name or args.agent_id,
-        ),
-        home,
-    )
+    if args.api_key:
+        save_credentials(
+            ClaimResult(
+                agent_id=args.agent_id,
+                api_key=args.api_key,
+                gateway_url=args.gateway_url,
+                display_name=args.display_name or args.agent_id,
+            ),
+            home,
+        )
+    elif not external._read_credentials_at(home):
+        # Reuse the machine default when it is this agent; otherwise there is
+        # nothing to bind with — regenerating a key here would invalidate the
+        # copies every other session holds (that rotation loop silenced the
+        # identity on 2026-09-04).
+        default = external._read_credentials_at(external._HOME)
+        if default and default.get("agent_id") == args.agent_id:
+            save_credentials(
+                ClaimResult(
+                    agent_id=args.agent_id,
+                    api_key=default["api_key"],
+                    gateway_url=default.get("gateway_url") or args.gateway_url,
+                    display_name=default.get("display_name") or args.display_name or args.agent_id,
+                ),
+                home,
+            )
+        else:
+            print(json.dumps({"error": "no credentials for this agent on this machine; pass --api-key"}))
+            sys.exit(2)
     entry = external.bind_session(
         args.session, args.agent_id, cwd=args.cwd, title=args.title, conversation_id=args.conversation
     )

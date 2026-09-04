@@ -719,3 +719,44 @@ def test_session_start_reports_whether_it_is_a_channel(monkeypatch):
     monkeypatch.setattr(hook, "_cli_channel_active", lambda: None)
     _run_hook(monkeypatch, {"hook_event_name": "SessionStart", "session_id": "s", "cwd": "/tmp"})
     assert "channel" not in calls[1]
+
+
+def test_backoff_is_per_key_so_a_rotated_key_starts_clean(monkeypatch, tmp_path):
+    hook._use_home(tmp_path / "home")
+    monkeypatch.setattr(hook, "_request", lambda *a, **k: (0, {}))
+    old = {"agent_id": "a", "api_key": "old", "gateway_url": "u"}
+    assert hook._token(old) is None
+    assert hook._in_backoff(hook._read_token_cache(), "a", hook._key_fp(old))
+    calls = []
+    monkeypatch.setattr(hook, "_request", lambda *a, **k: calls.append(1) or (200, {"token": "fresh"}))
+    new = {"agent_id": "a", "api_key": "new", "gateway_url": "u"}
+    assert hook._token(new) == "fresh"  # not silenced by the old key's backoff
+    assert calls == [1]
+
+
+def test_bind_reuses_saved_credentials_when_no_key_is_given(monkeypatch, tmp_path, capsys):
+    from agentchat import __main__ as cli  # noqa: PLC0415
+    from agentchat.invite import ClaimResult, save_credentials  # noqa: PLC0415
+    import argparse  # noqa: PLC0415
+
+    machine = tmp_path / "machine"
+    monkeypatch.setattr(external, "_HOME", machine)
+    monkeypatch.setattr(external, "AGENTS_DIR", machine / "agents")
+    monkeypatch.setattr(external, "SESSIONS_FILE", machine / "sessions.json")
+    monkeypatch.setattr(external, "install_claude", lambda *a, **k: [])
+    save_credentials(ClaimResult("a1", "k-machine", "u", "A1"), machine)
+    def ns(**kw):
+        base = dict(session="s1", agent_id="a1", api_key=None, display_name="", gateway_url="u", cwd=None, title=None, conversation=None, install=False)
+        base.update(kw)
+        return argparse.Namespace(**base)
+    cli._cmd_bind(ns())
+    out = json.loads(capsys.readouterr().out)
+    assert out["binding"]["agent_id"] == "a1"
+    # Copied from the machine default, not regenerated.
+    assert json.loads((external.agent_home("a1") / "credentials.json").read_text())["api_key"] == "k-machine"
+    # A second bind keeps whatever the home holds.
+    cli._cmd_bind(ns(session="s2"))
+    assert json.loads((external.agent_home("a1") / "credentials.json").read_text())["api_key"] == "k-machine"
+    # Unknown agent with no key: refused rather than minting anything.
+    with pytest.raises(SystemExit):
+        cli._cmd_bind(ns(agent_id="stranger"))
