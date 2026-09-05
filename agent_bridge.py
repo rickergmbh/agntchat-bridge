@@ -2262,17 +2262,26 @@ def _is_final_delivery_tool(name: str) -> bool:
 
 
 def _tool_was_called(result: Any, canonical_name: str) -> bool:
-    """Return true if a native/MCP tool was called during this model run."""
+    """Return true if a native/MCP tool was called during this model run
+    AND the call succeeded.
+
+    A call the server rejected (`is_error` on the recorded tool use, set from
+    the CLI's tool_result turn) did not happen as far as the turn is
+    concerned: a refused `end_turn(no_action_needed)` — the backend refuses
+    it when a human addressed the agent directly — must not read as "the
+    model chose silence", or the prose it writes next gets dropped."""
     names: list[str] = []
 
     for tc in getattr(result, "tool_calls", []) or []:
+        if getattr(tc, "is_error", False):
+            continue
         name = getattr(tc, "name", "")
         if name:
             names.append(str(name))
 
     metadata = getattr(result, "metadata", None) or {}
     for tu in metadata.get("cli_tool_uses") or []:
-        if isinstance(tu, dict) and tu.get("name"):
+        if isinstance(tu, dict) and tu.get("name") and not tu.get("is_error"):
             names.append(str(tu["name"]))
 
     return any(_normalized_tool_name(name) == canonical_name for name in names)
@@ -2287,14 +2296,22 @@ def _tool_call_arguments(result: Any, canonical_name: str) -> dict[str, Any] | N
     arguments were not captured yields `{}`."""
     found: dict[str, Any] | None = None
 
+    # Rejected calls (`is_error`, the server's verdict from the tool_result
+    # turn) are skipped, same as in `_tool_was_called`: a refused
+    # end_turn(no_action_needed) followed by a successful end_turn(blocked)
+    # must resolve to the call that actually ended the turn.
     for tc in getattr(result, "tool_calls", []) or []:
+        if getattr(tc, "is_error", False):
+            continue
         if _normalized_tool_name(str(getattr(tc, "name", "") or "")) == canonical_name:
             args = getattr(tc, "arguments", None)
             found = dict(args) if isinstance(args, dict) else {}
 
     metadata = getattr(result, "metadata", None) or {}
     for tu in metadata.get("cli_tool_uses") or []:
-        if isinstance(tu, dict) and _normalized_tool_name(str(tu.get("name") or "")) == canonical_name:
+        if not isinstance(tu, dict) or tu.get("is_error"):
+            continue
+        if _normalized_tool_name(str(tu.get("name") or "")) == canonical_name:
             args = tu.get("arguments")
             found = dict(args) if isinstance(args, dict) else {}
 

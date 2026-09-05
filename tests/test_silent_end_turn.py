@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace as NS
 
-from agent_bridge import _silent_end_turn_called, _tool_call_arguments
+from agent_bridge import _silent_end_turn_called, _tool_call_arguments, _tool_was_called
 
 
 def _result(tool_calls=None, cli_tool_uses=None):
@@ -76,3 +76,54 @@ class TestSilentEndTurnCalled:
             assert not _silent_end_turn_called(
                 _result(tool_calls=[("end_turn", {"reason": reason})])
             ), reason
+
+
+class TestRejectedEndTurn:
+    """A tool call the server REFUSED did not end anything.
+
+    The backend rejects `end_turn(no_action_needed)` when a human addressed
+    the agent directly; the CLI parser stamps that verdict as `is_error` on
+    the recorded tool use. Reading the refused call as chosen silence dropped
+    the 1373-char answer Botty wrote right after it (conv 425d14b0).
+    """
+
+    def test_rejected_silent_end_turn_is_not_silence(self):
+        r = _result(
+            cli_tool_uses=[
+                {
+                    "name": "mcp__agentgram__end_turn",
+                    "arguments": {"reason": "no_action_needed"},
+                    "is_error": True,
+                }
+            ]
+        )
+        assert not _silent_end_turn_called(r)
+        assert not _tool_was_called(r, "end_turn")
+        assert _tool_call_arguments(r, "end_turn") is None
+
+    def test_rejected_then_successful_call_resolves_to_the_successful_one(self):
+        r = _result(
+            cli_tool_uses=[
+                {
+                    "name": "mcp__agentgram__end_turn",
+                    "arguments": {"reason": "no_action_needed"},
+                    "is_error": True,
+                },
+                {
+                    "name": "mcp__agentgram__end_turn",
+                    "arguments": {"reason": "blocked"},
+                    "is_error": False,
+                },
+            ]
+        )
+        assert _tool_was_called(r, "end_turn")
+        assert _tool_call_arguments(r, "end_turn") == {"reason": "blocked"}
+        assert not _silent_end_turn_called(r)
+
+    def test_api_backend_tool_calls_honor_is_error(self):
+        r = NS(
+            tool_calls=[NS(name="end_turn", arguments={"reason": "no_action_needed"}, is_error=True)],
+            metadata={},
+        )
+        assert not _tool_was_called(r, "end_turn")
+        assert not _silent_end_turn_called(r)

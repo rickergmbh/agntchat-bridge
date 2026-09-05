@@ -392,6 +392,28 @@ _USAGE_KEYS = (
 )
 
 
+def _mark_tool_results(tool_uses: list[dict], event: dict) -> None:
+    """Stamp `is_error` onto recorded tool uses from a CLI `user` turn.
+
+    stream-json delivers tool results as `{"type": "user", "message":
+    {"content": [{"type": "tool_result", "tool_use_id": ..., "is_error":
+    bool, ...}]}}`. Matching is by `tool_use_id` against the `id` captured at
+    `content_block_start`. Anything malformed is ignored — this is telemetry
+    the bridge reads after the run, never a reason to fail it.
+    """
+    message = event.get("message") if isinstance(event, dict) else None
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list) or not tool_uses:
+        return
+    by_id = {tu.get("id"): tu for tu in tool_uses if isinstance(tu, dict) and tu.get("id")}
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        tu = by_id.get(block.get("tool_use_id"))
+        if tu is not None:
+            tu["is_error"] = bool(block.get("is_error"))
+
+
 def _extract_cli_usage(event: dict) -> dict[str, int] | None:
     """Token counts from a stream-json ``result`` event's ``usage`` object.
 
@@ -1545,6 +1567,17 @@ class ClaudeCliBackend(ModelBackend):
                         elif inner_type == "message_start":
                             await on_progress(event)
                         continue
+
+                    # Tool results come back as `user` turns. Record the
+                    # server's verdict on each recorded tool use so the bridge
+                    # can tell a tool call that SUCCEEDED from one the server
+                    # REJECTED. The one consumer today is end_turn: the
+                    # backend refuses end_turn(no_action_needed) when a human
+                    # addressed the agent directly, and a refused end_turn
+                    # must not count as "the model chose silence" (which
+                    # drops the prose it writes next — conv 425d14b0).
+                    if event_type == "user":
+                        _mark_tool_results(_tool_uses, event)
 
                     # Forward other events (system, assistant snapshots, etc.)
                     await on_progress(event)
