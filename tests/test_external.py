@@ -863,3 +863,32 @@ def test_mcp_poller_types_commands_only_when_typeable(monkeypatch):
     notes, pushed = mcp._channel_events(data, set())
     assert [n["params"]["content"] for n in notes] == ["plain text"]
     assert pushed == ["m0"]
+
+
+def test_failed_exchange_keeps_a_token_it_already_holds(monkeypatch, tmp_path):
+    # Discarding the cached token on a failed refresh forced every process on
+    # the machine to re-authenticate at once, silencing heartbeats past the
+    # backend's 180s staleness window (#148).
+    hook._use_home(tmp_path / "home")
+    creds = {"agent_id": "a", "api_key": "k", "gateway_url": "u"}
+    monkeypatch.setattr(hook, "_request", lambda *a, **k: (200, {"token": "good"}))
+    assert hook._token(creds) == "good"
+
+    monkeypatch.setattr(hook, "_request", lambda *a, **k: (0, {}))
+    assert hook._token(creds, force=True) == "good"  # falls back to what we hold
+    cached = hook._read_token_cache()
+    assert cached["token"] == "good" and cached["failures"] == 1
+
+    # A different key's failure must not carry another key's token forward.
+    other = {"agent_id": "a", "api_key": "rotated", "gateway_url": "u"}
+    assert hook._token(other) is None
+    assert "token" not in hook._read_token_cache()
+
+
+def test_token_backoff_never_outlasts_the_staleness_window():
+    # A backoff longer than the backend's 180s window would itself kill a
+    # healthy session: the heartbeat would stay silent past the sweep.
+    assert hook._TOKEN_BACKOFF_MAX < 180
+    cached = {"agent_id": "a", "key_fp": "fp", "failed_at": 0, "failures": 99}
+    # Even at the ceiling the wait stays under the window.
+    assert hook._TOKEN_BACKOFF_BASE * 2 ** (cached["failures"] - 1) > hook._TOKEN_BACKOFF_MAX

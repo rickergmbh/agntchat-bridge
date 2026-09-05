@@ -158,7 +158,11 @@ _TOKEN_MAX_AGE = 12 * 60
 # bcrypt-heavy exchanges every few seconds is what starved the backend's
 # CPU on 2026-09-03 and kept every agent offline.
 _TOKEN_BACKOFF_BASE = 30
-_TOKEN_BACKOFF_MAX = 10 * 60
+# Must stay UNDER the backend's session staleness threshold
+# (`ExternalSessions.online_threshold_seconds/0`, 180s): a backoff longer
+# than that silences the heartbeat past the point where the server declares
+# the session lost, so the backoff itself would kill a healthy session.
+_TOKEN_BACKOFF_MAX = 120
 _HEARTBEAT_SECONDS = 60
 # Mirrored transcript text is capped here and server-side (the text
 # message limit).
@@ -297,23 +301,39 @@ def _exchange_token(creds: dict) -> Optional[str]:
         _log(f"token exchange failed (HTTP {status})")
         same = cached.get("agent_id") == creds["agent_id"] and cached.get("key_fp") == fp
         failures = (int(cached.get("failures") or 0) + 1) if same else 1
-        _write_token_cache(
-            {"agent_id": creds["agent_id"], "key_fp": fp, "failed_at": time.time(), "failures": failures}
-        )
+        entry = {
+            "agent_id": creds["agent_id"],
+            "key_fp": fp,
+            "failed_at": time.time(),
+            "failures": failures,
+        }
+        # KEEP a token we already hold. Discarding it on a failed refresh
+        # forced every process on the machine to re-authenticate at once,
+        # turning one network blip into minutes of silence — long enough for
+        # the backend to declare every session on this machine lost.
+        if same and cached.get("token"):
+            entry["token"] = cached["token"]
+            entry["at"] = cached.get("at", 0)
+        _write_token_cache(entry)
     return token
 
 
 def _token(creds: dict, force: bool = False) -> Optional[str]:
-    if not force:
-        cached = _read_token_cache()
-        if (
-            cached.get("agent_id") == creds["agent_id"]
-            and cached.get("token")
-            and (not cached.get("key_fp") or cached.get("key_fp") == _key_fp(creds))
-            and time.time() - float(cached.get("at", 0)) < _TOKEN_MAX_AGE
-        ):
-            return cached["token"]
-    return _exchange_token(creds)
+    cached = _read_token_cache()
+    usable = (
+        cached.get("agent_id") == creds["agent_id"]
+        and cached.get("token")
+        and (not cached.get("key_fp") or cached.get("key_fp") == _key_fp(creds))
+    )
+    if not force and usable and time.time() - float(cached.get("at", 0)) < _TOKEN_MAX_AGE:
+        return cached["token"]
+    token = _exchange_token(creds)
+    # The exchange failed (or is backing off) but we still hold a token the
+    # server may well accept — its JWT lifetime is longer than the refresh
+    # age. Sending it beats dropping the heartbeat; a 401 re-exchanges.
+    if token is None and usable:
+        return cached["token"]
+    return token
 
 
 def _api(creds: dict, method: str, path: str, body: Optional[dict] = None) -> tuple[int, Any]:
