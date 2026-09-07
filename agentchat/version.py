@@ -158,4 +158,16 @@ different things.
 # declined turn ("…nothing for me to add here", conv 0b86e6ed). The claude_cli
 # stream parser now keeps each tool use's parsed input so the reason is
 # readable after the run. Terminator reasons keep their text.
-BRIDGE_VERSION = "2.9.3"
+# 2.9.4 — coordination-audit wave 2 follow-ups (2026-09-06 audit, "Bridge
+# follow-ups"): every `/api/mcp` tools/call carries the caller context as
+# `params._meta.context` (complete_task/fail_task send task_id + the acting
+# conversation; search_memory its conversation), the hidden thread redirect
+# posts the canonical EndTurn JSON `{"reason": "thread_redirect", "message"}`
+# instead of prose, a routed `<dm>` keeps the remaining group text (hidden
+# redirect / failure notice only fill an otherwise-empty turn — identical to
+# the server-side router), the message dedup TTL covers the backend's
+# 1800 s claim hard cap (MESSAGE_DEDUP_TTL_SECONDS), and
+# update_task_status(complete|failed) raises before the network instead of
+# collecting the backend's 422. Not gated on by the server; the backend
+# tolerates the older wire shapes, safe to roll in either order.
+BRIDGE_VERSION = "2.9.4"

@@ -62,6 +62,41 @@ CURRENT_TASK_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
 # task open when it sees it instead of routing through fail_task.
 OPEN_SUBTASKS_MARKER = "[open_subtasks]"
 
+# Window the message dedup must cover. The backend hands a claimed gateway
+# message back to the queue after 600 s without streaming progress OR at
+# `Agentchat.Gateway.message_claim_hard_cap_seconds/0` (1800 s, chosen >= the
+# CLI backend's `outer_timeout()`), so a turn this bridge already ran can be
+# re-delivered up to 1800 s after the claim. The TTL sits above that hard cap
+# with margin so the re-delivery is still recognised as a duplicate instead
+# of running the turn twice. Keep >= the backend constant.
+MESSAGE_DEDUP_TTL_SECONDS = 1900.0
+
+# Caller-context keys the backend's `/api/mcp` JSON-RPC `tools/call` reads
+# from `params._meta.context` (mcp_controller.ex -> ToolRegistry
+# .build_caller_context/1 -- the same whitelist `/api/mcp/call` accepts in
+# `context`). The server keeps non-empty strings under these keys only, so
+# anything else is dropped here before it goes on the wire.
+MCP_CALLER_CONTEXT_KEYS = (
+    "conversation_id",
+    "source_message_id",
+    "task_id",
+    "active_conversation_id",
+    "last_seen_message_id",
+)
+
+
+def _mcp_caller_context(context: dict[str, Any] | None) -> dict[str, str]:
+    """Whitelist + drop None/empty values, mirroring the server's
+    `build_caller_context/1` so the wire shape is exactly what it keeps."""
+    if not context:
+        return {}
+    out: dict[str, str] = {}
+    for key in MCP_CALLER_CONTEXT_KEYS:
+        value = context.get(key)
+        if isinstance(value, str) and value != "":
+            out[key] = value
+    return out
+
 
 def device_name() -> str:
     """Human-readable name of the machine this bridge runs on.
@@ -308,7 +343,7 @@ class ExecutorClient:
         self._active_task_runs: dict[str, set[asyncio.Task]] = {}
         self._running = False
         self._semaphore: asyncio.Semaphore | None = None
-        self._message_dedup = MessageDedup(ttl=600.0)
+        self._message_dedup = MessageDedup(ttl=MESSAGE_DEDUP_TTL_SECONDS)
         self._profile_cache: dict[str, Any] | None = None
         self._profile_cache_at: float | None = None
         self._start_time: float = time.monotonic()
@@ -1060,6 +1095,10 @@ class ExecutorClient:
                         "silently complete a non-pulse task."
                     )
 
+            # Caller context for the MCP call: the conversation this turn is
+            # acting in (the work sub-conversation for DM tasks, else the
+            # task's own conversation).
+            acting_conv_id = task.work_conversation_id or task.conversation_id
             try:
                 await self._invoke_complete_task(
                     real_task_id,
@@ -1067,6 +1106,10 @@ class ExecutorClient:
                     summary=summary,
                     silent=silent,
                     result_data=extra,
+                    context={
+                        "conversation_id": acting_conv_id,
+                        "active_conversation_id": acting_conv_id,
+                    },
                 )
             except AgentChatError as e:
                 # The backend's open-subtask guard rejects completion while
@@ -1106,10 +1149,15 @@ class ExecutorClient:
                 error_text = (
                     f"{type(e).__name__}: {detail}" if detail else type(e).__name__
                 )
+            acting_conv_id = task.work_conversation_id or task.conversation_id
             try:
                 await self._invoke_fail_task(
                     task.task_id or task.id,
                     error_text=error_text,
+                    context={
+                        "conversation_id": acting_conv_id,
+                        "active_conversation_id": acting_conv_id,
+                    },
                 )
             except Exception:
                 logger.exception(
@@ -1153,11 +1201,15 @@ class ExecutorClient:
         summary: str | None = None,
         silent: bool = False,
         result_data: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
     ) -> None:
         """Atomic completion via MCP. Posts the agent's response in the
         work conversation AND flips the task to `complete` in one
         transaction. Use `silent=True` for PULSE_OK-style no-output
         completions.
+
+        `context` is the caller context sent as `_meta.context` (see
+        `MCP_CALLER_CONTEXT_KEYS`); `task_id` is always included.
         """
         payload: dict[str, Any] = {"task_id": task_id, "silent": silent}
         if response_text is not None:
@@ -1167,7 +1219,9 @@ class ExecutorClient:
         if result_data:
             payload["result_data"] = result_data
 
-        await self._call_platform_tool("complete_task", payload)
+        ctx = dict(context or {})
+        ctx["task_id"] = task_id
+        await self._call_platform_tool("complete_task", payload, context=ctx)
 
     async def _invoke_fail_task(
         self,
@@ -1176,6 +1230,7 @@ class ExecutorClient:
         error_text: str | None = None,
         summary: str | None = None,
         silent: bool = False,
+        context: dict[str, Any] | None = None,
     ) -> None:
         """Atomic failure via MCP. Symmetric to _invoke_complete_task."""
         payload: dict[str, Any] = {"task_id": task_id, "silent": silent}
@@ -1184,7 +1239,9 @@ class ExecutorClient:
         if summary is not None:
             payload["summary"] = summary
 
-        await self._call_platform_tool("fail_task", payload)
+        ctx = dict(context or {})
+        ctx["task_id"] = task_id
+        await self._call_platform_tool("fail_task", payload, context=ctx)
 
     async def complete_task(
         self,
@@ -1194,6 +1251,8 @@ class ExecutorClient:
         summary: str | None = None,
         silent: bool = False,
         result_data: dict[str, Any] | None = None,
+        conversation_id: str | None = None,
+        active_conversation_id: str | None = None,
     ) -> None:
         """Public API for handlers/external callers that want to mark a
         task complete directly without returning from `_task_handler`.
@@ -1201,6 +1260,12 @@ class ExecutorClient:
         Same semantics as returning the equivalent dict from a handler:
         the response is posted in the work conv AND the task flips to
         `complete` in one atomic backend transaction.
+
+        `conversation_id` / `active_conversation_id` are forwarded as the
+        MCP caller context (the conversation the caller is acting in) so
+        the backend's context-aware guards see the same thing they would
+        from an in-process tool call. The tool dispatcher auto-injects
+        `conversation_id` from its ambient context.
         """
         await self._invoke_complete_task(
             task_id,
@@ -1208,6 +1273,10 @@ class ExecutorClient:
             summary=summary,
             silent=silent,
             result_data=result_data,
+            context={
+                "conversation_id": conversation_id,
+                "active_conversation_id": active_conversation_id,
+            },
         )
 
     async def fail_task(
@@ -1217,33 +1286,66 @@ class ExecutorClient:
         error: str | None = None,
         summary: str | None = None,
         silent: bool = False,
+        conversation_id: str | None = None,
+        active_conversation_id: str | None = None,
     ) -> None:
         """Public API for marking a task failed. See complete_task for
-        the full atomic contract.
+        the full atomic contract (and the caller-context kwargs).
         """
         await self._invoke_fail_task(
             task_id,
             error_text=error,
             summary=summary,
             silent=silent,
+            context={
+                "conversation_id": conversation_id,
+                "active_conversation_id": active_conversation_id,
+            },
         )
 
-    async def _call_platform_tool(
-        self, tool_name: str, arguments: dict[str, Any]
+    async def _post_mcp_tool_call(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Invoke a platform MCP tool by name. Used by complete_task /
-        fail_task. The backend dispatches via MCP.ToolRegistry — same
-        code path as hosted agents.
+        """POST one JSON-RPC `tools/call` to `/api/mcp` and return the raw
+        body. Every `/api/mcp` poster goes through here so the caller
+        context rides along as `params._meta.context` (whitelisted by
+        `_mcp_caller_context`; omitted entirely when nothing survives).
         """
-        body = await self._post(
+        params: dict[str, Any] = {"name": tool_name, "arguments": arguments}
+        ctx = _mcp_caller_context(context)
+        if ctx:
+            params["_meta"] = {"context": ctx}
+        return await self._post(
             "/api/mcp",
             json={
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "tools/call",
-                "params": {"name": tool_name, "arguments": arguments},
+                "params": params,
             },
         )
+
+    @staticmethod
+    def _mcp_text_result(body: dict[str, Any], default: str = "") -> str:
+        """First text block of a `tools/call` result, or `default`."""
+        result = body.get("result") or {}
+        content = result.get("content") or []
+        return content[0].get("text", default) if content else default
+
+    async def _call_platform_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Invoke a platform MCP tool by name. Used by complete_task /
+        fail_task. The backend dispatches via MCP.ToolRegistry — same
+        code path as hosted agents. Raises AgentChatError on `isError`.
+        """
+        body = await self._post_mcp_tool_call(tool_name, arguments, context)
 
         result = body.get("result") or {}
         is_error = result.get("isError") is True
@@ -1697,25 +1799,25 @@ class ExecutorClient:
         scope: str = "all",
         category: str | None = None,
         conversation_id: str | None = None,
+        context: dict[str, Any] | None = None,
     ) -> str:
         """Search conversation and agent persistent memories via MCP tool.
 
-        Returns formatted search results as text.
+        Returns formatted search results as text. `conversation_id` is
+        sent both as the tool argument and as `_meta.context` so the
+        server's family-scope resolution sees the same conversation an
+        in-process call would; `context` adds any further caller context.
         """
         arguments: dict[str, Any] = {"query": query, "scope": scope}
         if category:
             arguments["category"] = category
         if conversation_id:
             arguments["conversation_id"] = conversation_id
-        data = await self._post("/api/mcp", {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": "memory_search", "arguments": arguments},
-        })
-        result = data.get("result", {})
-        content = result.get("content", [])
-        return content[0].get("text", "") if content else ""
+        ctx = dict(context or {})
+        if conversation_id:
+            ctx.setdefault("conversation_id", conversation_id)
+        data = await self._post_mcp_tool_call("memory_search", arguments, ctx)
+        return self._mcp_text_result(data)
 
     async def get_profile(self) -> dict[str, Any]:
         """Fetch the current agent's profile. Cached for 1 hour."""
@@ -2026,6 +2128,7 @@ class ExecutorClient:
         days_since_posted: int | None = None,
         page: int | None = None,
         results_per_page: int | None = None,
+        context: dict[str, Any] | None = None,
     ) -> str:
         """Search jobs via Adzuna API. Routes through backend MCP handler."""
         arguments: dict[str, Any] = {"query": query}
@@ -2049,15 +2152,8 @@ class ExecutorClient:
             arguments["page"] = page
         if results_per_page is not None:
             arguments["results_per_page"] = results_per_page
-        data = await self._post("/api/mcp", {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": "search_jobs_adzuna", "arguments": arguments},
-        })
-        result = data.get("result", {})
-        content = result.get("content", [])
-        return content[0].get("text", "") if content else "{}"
+        data = await self._post_mcp_tool_call("search_jobs_adzuna", arguments, context)
+        return self._mcp_text_result(data, default="{}")
 
     async def search_jobs_google(
         self,
@@ -2071,6 +2167,7 @@ class ExecutorClient:
         language: str | None = None,
         country: str | None = None,
         next_page_token: str | None = None,
+        context: dict[str, Any] | None = None,
     ) -> str:
         """Search jobs via SerpApi (Google Jobs). Routes through backend MCP handler."""
         arguments: dict[str, Any] = {"query": query}
@@ -2090,15 +2187,8 @@ class ExecutorClient:
             arguments["country"] = country
         if next_page_token:
             arguments["next_page_token"] = next_page_token
-        data = await self._post("/api/mcp", {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": "search_jobs_google", "arguments": arguments},
-        })
-        result = data.get("result", {})
-        content = result.get("content", [])
-        return content[0].get("text", "") if content else "{}"
+        data = await self._post_mcp_tool_call("search_jobs_google", arguments, context)
+        return self._mcp_text_result(data, default="{}")
 
     async def get_salary_data(
         self,
@@ -2106,6 +2196,7 @@ class ExecutorClient:
         *,
         country: str | None = None,
         location: str | None = None,
+        context: dict[str, Any] | None = None,
     ) -> str:
         """Get salary data via Adzuna. Routes through backend MCP handler."""
         arguments: dict[str, Any] = {"query": query}
@@ -2113,15 +2204,8 @@ class ExecutorClient:
             arguments["country"] = country
         if location:
             arguments["location"] = location
-        data = await self._post("/api/mcp", {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": "get_salary_data", "arguments": arguments},
-        })
-        result = data.get("result", {})
-        content = result.get("content", [])
-        return content[0].get("text", "") if content else "{}"
+        data = await self._post_mcp_tool_call("get_salary_data", arguments, context)
+        return self._mcp_text_result(data, default="{}")
 
     async def search_jobs_theirstack(
         self,
@@ -2149,6 +2233,7 @@ class ExecutorClient:
         include_total_results: bool | None = None,
         limit: int | None = None,
         page: int | None = None,
+        context: dict[str, Any] | None = None,
     ) -> str:
         """Search jobs via TheirStack API. Routes through backend MCP handler.
 
@@ -2203,15 +2288,8 @@ class ExecutorClient:
             arguments["limit"] = limit
         if page is not None:
             arguments["page"] = page
-        data = await self._post("/api/mcp", {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": "search_jobs_theirstack", "arguments": arguments},
-        })
-        result = data.get("result", {})
-        content = result.get("content", [])
-        return content[0].get("text", "") if content else "{}"
+        data = await self._post_mcp_tool_call("search_jobs_theirstack", arguments, context)
+        return self._mcp_text_result(data, default="{}")
 
     def get_task_inputs(
         self, task: GatewayTask, schema: Any | None = None
@@ -2236,11 +2314,29 @@ class ExecutorClient:
         completion_details: dict[str, Any] | None = None,
         silent: bool = False,
     ) -> dict[str, Any]:
-        """Update a task's status via REST (e.g., in_progress, complete).
+        """Update a task's INTERIM status via REST (accepted, in_progress,
+        blocked).
+
+        Terminal statuses are not supported here: the backend refuses
+        `complete|failed|cancelled|rejected` from an agent with 422
+        `terminal_via_complete_task` (Tasks.update_task_status/6) because
+        the response and the status flip must land in one transaction.
+        `complete` / `failed` raise ValueError before touching the network
+        — use `complete_task` / `fail_task`; any other refusal surfaces as
+        the server's 422.
 
         When silent=True, the status update happens without generating
         a status_update message in the conversation.
         """
+        if status in ("complete", "failed"):
+            alternative = "complete_task" if status == "complete" else "fail_task"
+            raise ValueError(
+                f"update_task_status cannot set status {status!r}: the backend "
+                "refuses terminal statuses from agents (422 "
+                f"terminal_via_complete_task). Call {alternative}(task_id, ...) "
+                "instead — it posts your response and flips the task in one "
+                "atomic step."
+            )
         body: dict[str, Any] = {"status": status}
         if summary:
             body["summary"] = summary

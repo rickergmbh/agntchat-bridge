@@ -1481,18 +1481,26 @@ async def _send_hidden_thread_redirect(
     The EndTurn keeps TurnQueue / loop-prevention state moving and preserves a
     "DM with ..." summary for later agents, while the backend hides internal
     message types from broadcasts and transcript listings.
+
+    The body is the backend's canonical EndTurn payload
+    (`MessageEnvelope.end_turn_payload/2`: JSON `{"reason", "message"}`) with
+    reason `thread_redirect`, so the reason is explicit on the wire — a
+    plain-text EndTurn would be summarized as "[EndTurn] Agent done" and its
+    reason would fall back to `no_action_needed`, which `end_turn` refuses
+    when a human addressed the agent.
     """
     if not targets:
         return
 
     notice = _thread_redirect_notice(targets, behavioral_config)
+    payload = json.dumps({"reason": "thread_redirect", "message": notice})
     msg_metadata = dict(metadata or {})
     msg_metadata["thread_redirect_ack_hidden"] = True
 
     try:
         await executor.send_message(
             conversation_id,
-            notice,
+            payload,
             content_type="structured",
             message_type="EndTurn",
             metadata=msg_metadata,
@@ -1508,6 +1516,67 @@ async def _send_hidden_thread_redirect(
         logger.warning("[%s] Failed to post hidden thread redirect: %s", executor_key, e)
 
 
+async def _route_dm_blocks_and_settle(
+    executor: ExecutorClient,
+    reply: str | None,
+    dm_blocks: list[dict[str, str]],
+    msg: GatewayMessage,
+    executor_key: str,
+    dm_metadata: dict[str, str],
+    directives: dict[str, Any] | None,
+    redirect_metadata: dict[str, Any],
+    behavioral_config: dict[str, Any] | None,
+    log_label: str = "",
+) -> str | None:
+    """Route parsed <dm> blocks, then decide what lands in the group conversation.
+
+    `reply` is the text left after `_parse_dm_blocks` stripped the tags. The
+    outcome mirrors the backend's server-side router
+    (`Messaging.route_dm_blocks/6`) exactly, so a bridge agent leaves the same
+    thing behind as a WS/SDK agent whose tag the chokepoint routed:
+
+      * text remained after stripping the tags -> it IS the turn; it is
+        returned to post as-is (the DM ROUTING directive promises only that
+        "the tag is stripped from your group message"), with no hidden
+        redirect — whether or not the blocks routed;
+      * nothing remained and >= 1 block routed -> the hidden
+        `EndTurn(thread_redirect)` is posted so the turn queue advances and
+        later agents see "[Continuing in DM with ...]"; returns None;
+      * nothing remained and nothing routed -> the visible
+        "[Could not start agent thread with ...]" so the failure isn't silent.
+
+    Returns the text to post in the group conversation, or None when the
+    hidden redirect was posted instead.
+    """
+    delegate_agents = (directives or {}).get("familyAgents") or []
+    routed_targets = await _route_dm_blocks(
+        executor, dm_blocks, msg.conversation_members,
+        msg.conversation_id, msg.message_id or None, executor_key, dm_metadata,
+        family_agents=delegate_agents,
+    )
+    logger.info(
+        "[%s] Routed %d/%d DM block(s)%s",
+        executor_key, len(routed_targets), len(dm_blocks), log_label,
+    )
+
+    remaining = (reply or "").strip()
+    if remaining:
+        return remaining
+
+    if routed_targets:
+        await _send_hidden_thread_redirect(
+            executor,
+            msg.conversation_id,
+            routed_targets,
+            executor_key,
+            metadata=redirect_metadata,
+            behavioral_config=behavioral_config,
+            last_seen_message_id=msg.latest_seen_message_id or msg.message_id or None,
+        )
+        return None
+
+    targets = ", ".join(b["target"] for b in dm_blocks)
+    return f"[Could not start agent thread with {targets}]"
 
 
 def _generate_task_title(content: str, max_len: int = 80) -> str:
@@ -5040,31 +5109,14 @@ def run_single_agent(
             if reply:
                 reply, tu_dm_blocks = _parse_dm_blocks(reply)
                 if tu_dm_blocks:
-                    delegate_agents = (directives or {}).get("familyAgents") or []
-                    routed_targets = await _route_dm_blocks(
-                        executor, tu_dm_blocks, msg.conversation_members,
-                        msg.conversation_id, msg.message_id or None, executor_key, tu_msg_meta_dm,
-                        family_agents=delegate_agents,
+                    # Remaining text (tags stripped) stays the group reply;
+                    # the hidden redirect / failure notice only fill an
+                    # otherwise-empty turn — same rule as the server router.
+                    reply = await _route_dm_blocks_and_settle(
+                        executor, reply, tu_dm_blocks, msg, executor_key,
+                        tu_msg_meta_dm, directives, msg_meta_out, behavioral_config,
+                        log_label=" [tool_use]",
                     )
-                    logger.info(
-                        "[%s] Routed %d/%d DM block(s) [tool_use]",
-                        executor_key, len(routed_targets), len(tu_dm_blocks),
-                    )
-
-                    if routed_targets:
-                        await _send_hidden_thread_redirect(
-                            executor,
-                            msg.conversation_id,
-                            routed_targets,
-                            executor_key,
-                            metadata=msg_meta_out,
-                            behavioral_config=behavioral_config,
-                            last_seen_message_id=msg.latest_seen_message_id or msg.message_id or None,
-                        )
-                        reply = None
-                    else:
-                        targets = ", ".join(b["target"] for b in tu_dm_blocks)
-                        reply = f"[Could not start agent thread with {targets}]"
 
             # Re-apply the empty-reply guard AFTER parsing. The check at the raw
             # result.text only catches a model that returned nothing at all. But
@@ -5355,37 +5407,16 @@ def run_single_agent(
 
         reply, dm_blocks = _parse_dm_blocks(reply or "")
         if dm_blocks:
-            # Include familyAgents from directives so DMs can target
-            # connected cross-owner agents not yet in the conversation
-            delegate_agents = (directives or {}).get("familyAgents") or []
-            routed_targets = await _route_dm_blocks(
-                executor, dm_blocks, msg.conversation_members,
-                msg.conversation_id, msg.message_id or None, executor_key, msg_meta_dm,
-                family_agents=delegate_agents,
+            msg_meta_redirect: dict[str, str] = dict(msg_meta_dm)
+            msg_meta_redirect["stream_id"] = _msg_stream_id
+            # Remaining text (tags stripped) stays the group reply; the hidden
+            # redirect / failure notice only fill an otherwise-empty turn —
+            # same rule as the server router (familyAgents from directives let
+            # DMs target connected cross-owner agents not yet in the conv).
+            reply = await _route_dm_blocks_and_settle(
+                executor, reply, dm_blocks, msg, executor_key,
+                msg_meta_dm, directives, msg_meta_redirect, behavioral_config,
             )
-            logger.info("[%s] Routed %d/%d DM block(s)", executor_key, len(routed_targets), len(dm_blocks))
-
-            if routed_targets:
-                msg_meta_redirect: dict[str, str] = {}
-                if result and result.model:
-                    msg_meta_redirect["model"] = result.model
-                if effective_backend:
-                    msg_meta_redirect["backend"] = effective_backend
-                msg_meta_redirect["stream_id"] = _msg_stream_id
-
-                await _send_hidden_thread_redirect(
-                    executor,
-                    msg.conversation_id,
-                    routed_targets,
-                    executor_key,
-                    metadata=msg_meta_redirect,
-                    behavioral_config=behavioral_config,
-                    last_seen_message_id=msg.latest_seen_message_id or msg.message_id or None,
-                )
-                reply = None
-            else:
-                targets = ", ".join(b["target"] for b in dm_blocks)
-                reply = f"[Could not start agent thread with {targets}]"
 
         # Outgoing-filler suppression ("nothing to add", "staying quiet")
         # moved SERVER-SIDE (Agentchat.Messaging.FillerSuppression, H4) so

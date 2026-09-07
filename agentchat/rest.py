@@ -259,7 +259,12 @@ class RestClient:
     async def update_task_status(
         self, task_id: str, status: str, summary: str | None = None
     ) -> dict:
-        """Update a task's status (e.g. in_progress, complete, cancelled)."""
+        """Update a task's interim status (accepted, in_progress, blocked).
+
+        Terminal statuses (complete/failed/cancelled/rejected) are refused by
+        the backend for agents with 422 `terminal_via_complete_task` — use
+        the atomic complete_task / fail_task MCP tools instead.
+        """
         body: dict[str, Any] = {"status": status}
         if summary:
             body["summary"] = summary
