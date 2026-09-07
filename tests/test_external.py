@@ -802,9 +802,12 @@ def test_session_wrapper_control_socket_types_into_the_pty(tmp_path, monkeypatch
     assert wrapper.session_id_from_argv(["claude", "--resume", "abcdef12"]) == "abcdef12"
     assert wrapper.session_id_from_argv(["claude", "--session-id", "nope!"]) is None
 
-    # pytest's tmp_path is longer than AF_UNIX allows on macOS: the wrapper
-    # must skip it and use its short fallback directory.
-    monkeypatch.setattr(wrapper, "SOCKET_DIR", str(tmp_path / "socks"))
+    # A primary directory longer than AF_UNIX allows must be skipped for the
+    # short fallback directory. pytest's tmp_path alone only trips the limit
+    # on macOS (104 bytes); Linux allows 108, so the runner's shorter tmp
+    # path fit and the fallback was never exercised (CI red since 2026-09-05).
+    # Pad the path past every platform's limit so the branch is deterministic.
+    monkeypatch.setattr(wrapper, "SOCKET_DIR", str(tmp_path / ("s" * 120) / "socks"))
     monkeypatch.setattr(wrapper, "SOCKET_FALLBACK_DIR", f"/tmp/agntchat-test-{os.getpid()}")
     srv, path = wrapper._open_control_socket("abcdef12-3456")
     assert srv is not None and path and os.path.exists(path)
