@@ -76,6 +76,14 @@ logger = logging.getLogger("agentchat.backends.claude_cli")
 _DEFAULT_CLI_PATH = "claude"
 _DEFAULT_TIMEOUT = 900  # 15 minutes — complex tasks need time
 _COMPUTER_USE_TIMEOUT = 1800  # 30 minutes — computer use chains many slow driver calls
+# Permission prompts (#67) block the CLI turn — no stream output — for up to
+# the MCP server's poll ceiling (`agentgram_mcp_server._PERMISSION_MAX_WAIT`,
+# 330 s = backend Permissions.@ttl_seconds 300 s + slack). `_timeout` is the
+# per-readline cap, so a shorter configured timeout would kill the turn
+# mid-prompt and the verdict (allow/deny/expired) would never reach the
+# model. Floor above the ceiling with margin whenever the prompt tool is
+# wired; tests/test_permission_prompt.py pins the relationship.
+_PERMISSION_PROMPT_TIMEOUT = 420
 _STREAM_LIMIT = 10 * 1024 * 1024  # 10 MB — CLI can emit large JSON lines
 
 # Failure text that means "this machine has no usable Claude credential",
@@ -584,6 +592,11 @@ class ClaudeCliBackend(ModelBackend):
         if self._computer_use_mode == "local":
             self._timeout = max(self._timeout, _COMPUTER_USE_TIMEOUT)
 
+        # Same FLOOR shape for permission prompts: while skip-permissions is
+        # OFF every gated call can park the turn on the owner for up to the
+        # prompt ceiling, and the turn timeout must outlast it.
+        self._apply_permission_prompt_floor()
+
         # CLI connection (auth/runtime). The server profile is authoritative;
         # `_isolated_env` translates this into the mutually-exclusive
         # CLAUDE_CODE_USE_BEDROCK / _VERTEX switches the `claude` CLI reads.
@@ -775,6 +788,24 @@ class ClaudeCliBackend(ModelBackend):
                 self._skip_permissions,
             )
             self._skip_permissions = enabled
+            # Turning the gate back on re-wires the permission-prompt tool
+            # for the next spawn — the floor must travel with it.
+            self._apply_permission_prompt_floor()
+
+    def _permission_prompt_wired(self) -> bool:
+        """True when the next spawn routes gated calls through the
+        AgentGram permission-prompt tool (mirrors `_build_command`'s
+        `want_permission_prompt`)."""
+        return (not self._skip_permissions) and bool(self._mcp_server_script)
+
+    def _apply_permission_prompt_floor(self) -> None:
+        """Raise `_timeout` to `_PERMISSION_PROMPT_TIMEOUT` while the
+        permission-prompt tool is wired. A FLOOR like the computer-use one:
+        a longer explicit timeout still wins, and it is never lowered when
+        the gate is later skipped — a too-short timeout only reintroduces
+        the cut-off-mid-prompt bug."""
+        if self._permission_prompt_wired():
+            self._timeout = max(self._timeout, _PERMISSION_PROMPT_TIMEOUT)
 
     def set_computer_use(
         self, enabled: bool, allowed_apps: list[str] | None = None

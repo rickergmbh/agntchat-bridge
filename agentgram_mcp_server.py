@@ -531,10 +531,24 @@ def _ensure_standalone_context() -> None:
 
 PERMISSION_PROMPT_TOOL = "permission_prompt"
 # Poll cadence + ceiling. The ceiling tracks the backend's request TTL
-# (Permissions.ttl_seconds = 300s) with a little slack; a stale row reads as
-# expired server-side, so we deny once it does.
+# (Permissions.@ttl_seconds = 300s) with a little slack; a stale row reads as
+# `expired` server-side, so the wait ends once it does. The CLI backend floors
+# its run timeout above this ceiling (`claude_cli._PERMISSION_PROMPT_TIMEOUT`)
+# so a pending prompt is never cut off by the turn timeout before its verdict
+# lands — keep the two in step (pinned by tests/test_permission_prompt.py).
 _PERMISSION_POLL_INTERVAL = 2.0
 _PERMISSION_MAX_WAIT = 330.0
+
+# Model-facing outcomes. The CLI's permission-prompt contract only knows
+# allow/deny, so an expired request still travels as `deny` on the wire —
+# the MESSAGE is what tells the model that nobody answered (vs. an owner
+# who said no). A denial must not be retried; an expiry may be asked again.
+PERMISSION_DENIED_MESSAGE = "The owner denied this action."
+PERMISSION_EXPIRED_MESSAGE = (
+    "Permission request expired without an answer — the owner did not "
+    "respond in time. This is not a denial: you may ask again later, or "
+    "continue with what you can do without this permission."
+)
 
 # --- Executor setup (reuses SDK's ExecutorClient + ToolExecutor) ---
 
@@ -728,6 +742,15 @@ def _deny(message: str) -> dict[str, Any]:
     return {"behavior": "deny", "message": message}
 
 
+def _expired() -> dict[str, Any]:
+    """No verdict arrived (server-side expiry or the local wait ceiling).
+
+    Wire behavior is still ``deny`` — the CLI has no third outcome — but
+    the message is the distinct "nobody answered" text, not a refusal.
+    """
+    return _deny(PERMISSION_EXPIRED_MESSAGE)
+
+
 async def handle_permission_prompt(arguments: dict[str, Any]) -> dict[str, Any]:
     """Relay a CLI permission request to the backend and await the decision.
 
@@ -782,12 +805,20 @@ async def handle_permission_prompt(arguments: dict[str, Any]) -> dict[str, Any]:
             return _allow(tool_input)
         if status == "denied":
             logger.info("permission_prompt: %s denied by owner", gated_tool)
-            return _deny("The owner denied this action.")
+            return _deny(PERMISSION_DENIED_MESSAGE)
         if status == "expired":
-            logger.info("permission_prompt: %s expired", gated_tool)
-            return _deny("Permission request expired without a response.")
+            logger.info("permission_prompt: %s expired server-side", gated_tool)
+            return _expired()
 
-    return _deny("Permission request timed out without a response.")
+    # The backend's TTL should have flipped the row to `expired` before we
+    # get here; reaching the local ceiling means the server was unreachable
+    # or slow. Either way nobody answered — same outcome as expiry.
+    logger.info(
+        "permission_prompt: %s — no decision within %.0fs (local ceiling)",
+        gated_tool,
+        _PERMISSION_MAX_WAIT,
+    )
+    return _expired()
 
 
 def main() -> None:

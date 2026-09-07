@@ -104,3 +104,60 @@ class TestToolDispatch:
             )
         assert result == {"status": "in_progress"}
         patch_.assert_awaited_once()
+
+
+class TestRestClient:
+    """The low-level `RestClient.update_task_status` carries the same guard
+    (same message) — parity with the executor SDK so a bridge path that
+    reaches the REST client directly is refused before the network too."""
+
+    @pytest.fixture
+    def rest(self):
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        from agentchat.rest import RestClient  # noqa: PLC0415
+
+        token_manager = MagicMock()
+        token_manager.ensure_fresh = AsyncMock(return_value="tok")
+        token_manager.get_token = AsyncMock(return_value="tok")
+        return RestClient("https://agentchat.test", token_manager)
+
+    @pytest.mark.asyncio
+    async def test_complete_raises_before_network(self, rest):
+        with patch.object(rest, "_patch", new=AsyncMock()) as patch_:
+            with pytest.raises(ValueError, match="complete_task"):
+                await rest.update_task_status("task-1", "complete")
+        patch_.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_failed_raises_before_network(self, rest):
+        with patch.object(rest, "_patch", new=AsyncMock()) as patch_:
+            with pytest.raises(ValueError, match="fail_task"):
+                await rest.update_task_status("task-1", "failed", summary="x")
+        patch_.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_same_message_as_the_executor_sdk(self, rest, executor):
+        with patch.object(rest, "_patch", new=AsyncMock()), patch.object(
+            executor, "_patch", new=AsyncMock()
+        ):
+            with pytest.raises(ValueError) as rest_exc:
+                await rest.update_task_status("task-1", "complete")
+            with pytest.raises(ValueError) as sdk_exc:
+                await executor.update_task_status("task-1", "complete")
+        assert str(rest_exc.value) == str(sdk_exc.value)
+
+    @pytest.mark.asyncio
+    async def test_interim_status_goes_to_the_server(self, rest):
+        with patch.object(rest, "_patch", new=AsyncMock(return_value={"ok": True})) as patch_:
+            out = await rest.update_task_status("task-1", "in_progress", summary="working")
+        assert out == {"ok": True}
+        patch_.assert_awaited_once_with(
+            "/api/tasks/task-1/status", json={"status": "in_progress", "summary": "working"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_other_statuses_let_the_server_decide(self, rest):
+        with patch.object(rest, "_patch", new=AsyncMock(return_value={})) as patch_:
+            await rest.update_task_status("task-1", "rejected")
+        patch_.assert_awaited_once()

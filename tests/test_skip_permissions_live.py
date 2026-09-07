@@ -48,3 +48,55 @@ def test_base_set_skip_permissions_is_noop():
         pass
 
     assert ModelBackend.set_skip_permissions(_Dummy(), True) is None
+
+
+# --- Permission-prompt timeout floor (#67, audit 07-tool-surface) ---
+#
+# With skip-permissions OFF every gated call parks the CLI turn on the owner
+# for up to the MCP server's poll ceiling with no stream output. `_timeout`
+# is the per-readline cap, so it must outlast that wait or the verdict never
+# reaches the model. Same FLOOR shape as the computer-use one: applied when
+# the prompt tool is wired, longer explicit timeouts win, never lowered.
+
+
+def test_gate_on_floors_the_timeout_at_boot():
+    from agentchat.backends.claude_cli import _PERMISSION_PROMPT_TIMEOUT
+
+    backend = ClaudeCliBackend(timeout=60, dangerously_skip_permissions=False)
+    assert backend._mcp_server_script is not None  # the tool is wired
+    assert backend._timeout == _PERMISSION_PROMPT_TIMEOUT
+
+
+def test_gate_off_keeps_the_configured_timeout():
+    backend = ClaudeCliBackend(timeout=60, dangerously_skip_permissions=True)
+    assert backend._timeout == 60
+
+
+def test_longer_explicit_timeout_wins_over_the_floor():
+    from agentchat.backends.claude_cli import _PERMISSION_PROMPT_TIMEOUT
+
+    backend = ClaudeCliBackend(
+        timeout=_PERMISSION_PROMPT_TIMEOUT + 1000, dangerously_skip_permissions=False
+    )
+    assert backend._timeout == _PERMISSION_PROMPT_TIMEOUT + 1000
+
+
+def test_live_toggle_off_applies_the_floor_and_on_never_lowers_it():
+    from agentchat.backends.claude_cli import _PERMISSION_PROMPT_TIMEOUT
+
+    backend = ClaudeCliBackend(timeout=60, dangerously_skip_permissions=True)
+    assert backend._timeout == 60
+
+    backend.set_skip_permissions(False)  # gate re-enabled → prompt tool wired
+    assert backend._timeout == _PERMISSION_PROMPT_TIMEOUT
+
+    backend.set_skip_permissions(True)  # a floor is never lowered
+    assert backend._timeout == _PERMISSION_PROMPT_TIMEOUT
+
+
+def test_floor_needs_the_prompt_tool_to_be_wired():
+    """No MCP server script → no permission-prompt tool → no floor."""
+    backend = ClaudeCliBackend(timeout=60, dangerously_skip_permissions=True)
+    backend._mcp_server_script = None
+    backend.set_skip_permissions(False)
+    assert backend._timeout == 60

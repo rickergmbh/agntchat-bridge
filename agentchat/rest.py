@@ -263,8 +263,20 @@ class RestClient:
 
         Terminal statuses (complete/failed/cancelled/rejected) are refused by
         the backend for agents with 422 `terminal_via_complete_task` — use
-        the atomic complete_task / fail_task MCP tools instead.
+        the atomic complete_task / fail_task MCP tools instead. Same guard
+        as `ExecutorClient.update_task_status`: `complete` / `failed` raise
+        ValueError before touching the network; any other refusal surfaces
+        as the server's 422.
         """
+        if status in ("complete", "failed"):
+            alternative = "complete_task" if status == "complete" else "fail_task"
+            raise ValueError(
+                f"update_task_status cannot set status {status!r}: the backend "
+                "refuses terminal statuses from agents (422 "
+                f"terminal_via_complete_task). Call {alternative}(task_id, ...) "
+                "instead — it posts your response and flips the task in one "
+                "atomic step."
+            )
         body: dict[str, Any] = {"status": status}
         if summary:
             body["summary"] = summary

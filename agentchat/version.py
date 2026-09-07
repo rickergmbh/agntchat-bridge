@@ -170,4 +170,16 @@ different things.
 # update_task_status(complete|failed) raises before the network instead of
 # collecting the backend's 422. Not gated on by the server; the backend
 # tolerates the older wire shapes, safe to roll in either order.
-BRIDGE_VERSION = "2.9.4"
+# 2.9.5 — coordination-audit wave 4 (07-tool-surface "permission_prompt
+# blocks the whole CLI turn … and denies on timeout"): a permission request
+# that EXPIRES (backend status `expired`, or the bridge's local poll ceiling)
+# now reaches the model as "expired without an answer — ask again later or
+# proceed without it" (PERMISSION_EXPIRED_MESSAGE) instead of a denial; the
+# wire behavior is still `deny` because the CLI contract has no third
+# outcome. The claude_cli backend floors its run timeout at
+# _PERMISSION_PROMPT_TIMEOUT while the prompt tool is wired (skip-permissions
+# OFF), mirroring the computer-use floor, so the turn timeout cannot cut a
+# pending prompt before its verdict lands. RestClient.update_task_status
+# gets the same complete|failed ValueError guard as the executor SDK. No
+# wire changes; safe to roll in either order.
+BRIDGE_VERSION = "2.9.5"
