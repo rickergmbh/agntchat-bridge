@@ -143,3 +143,15 @@ class Conversation:
         if self.inserted_at:
             d["insertedAt"] = self.inserted_at
         return d
+
+
+def dm_peer_body(peer_id: "str | list[str]") -> dict:
+    """Wire shape for `POST /api/conversations/dm`: `peerId` for one peer,
+    `peerIds` for a shared multi-agent thread. Used by both the REST client
+    and the executor SDK so they never drift."""
+    if isinstance(peer_id, (list, tuple)):
+        peers = [p for p in peer_id if p]
+        if len(peers) == 1:
+            return {"peerId": peers[0]}
+        return {"peerIds": list(peers)}
+    return {"peerId": peer_id}

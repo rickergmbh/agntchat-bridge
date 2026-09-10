@@ -1315,9 +1315,11 @@ def _parse_dm_blocks(reply: str) -> tuple[str, list[dict[str, str]]]:
 
     Returns the reply with DM tags stripped and the list of DM blocks. The
     optional `topic` attribute lets the model open a distinct concurrent
-    thread for a separate subject — same (pair, source, topic) reuses the
-    same thread, different topic opens a new one. The caller is responsible
-    for posting any hidden turn-queue redirect signal.
+    thread for a separate subject — same (members, source, topic) reuses
+    the same thread, different topic opens a new one. `target` may name
+    several agents comma-separated (`target="A, B"`); it is kept raw here
+    and split by `_split_dm_targets` at routing time. The caller is
+    responsible for posting any hidden turn-queue redirect signal.
     """
     dm_blocks: list[dict[str, str]] = []
     remaining = reply
@@ -1391,6 +1393,23 @@ def _human_expects_reply(directives: dict[str, Any]) -> bool:
     return False
 
 
+def _split_dm_targets(target: str) -> list[str]:
+    """`"A, B"` -> `["A", "B"]`: trimmed, empties dropped, case-insensitive dedup.
+
+    Mirrors the server's `OutputEnvelope.split_dm_targets` so a tag naming
+    several agents opens ONE thread with all of them on every transport.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for part in target.split(","):
+        name = part.strip()
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        out.append(name)
+    return out
+
+
 def _find_member_by_name(
     name: str, members: list[dict[str, Any]]
 ) -> dict[str, Any] | None:
@@ -1421,7 +1440,11 @@ async def _route_dm_blocks(
     """Route DM blocks to private conversations. Returns target names that were sent.
 
     Searches conversation_members first, then falls back to family_agents
-    (which includes connected cross-owner agents from directives).
+    (which includes connected cross-owner agents from directives). A block
+    whose `target` names several agents opens ONE thread with all of them;
+    every name must resolve, or the block is skipped — a partial thread
+    would leave the model believing an absent agent is in the room (same
+    rule as the server router, `Messaging.route_dm_block`).
     """
     sent_targets: list[str] = []
     for block in dm_blocks:
@@ -1430,17 +1453,28 @@ async def _route_dm_blocks(
         topic = block.get("topic") or None
         goal = block.get("goal") or None
 
-        member = _find_member_by_name(target_name, conversation_members)
-        if not member and family_agents:
-            member = _find_member_by_name(target_name, family_agents)
-        if not member:
-            logger.warning("[%s] DM target '%s' not found in members or delegates", executor_key, target_name)
+        target_ids: list[str] = []
+        missing: list[str] = []
+        for name in _split_dm_targets(target_name):
+            member = _find_member_by_name(name, conversation_members)
+            if not member and family_agents:
+                member = _find_member_by_name(name, family_agents)
+            if member:
+                target_ids.append(member["participantId"])
+            else:
+                missing.append(name)
+        if missing or not target_ids:
+            logger.warning(
+                "[%s] DM target(s) %s not found in members or delegates; skipping block for '%s'",
+                executor_key, missing or [target_name], target_name,
+            )
             continue
 
-        target_id = member["participantId"]
+        # One peer keeps the historical positional call; several post `peerIds`.
+        peers: str | list[str] = target_ids[0] if len(target_ids) == 1 else target_ids
         try:
             dm_conv = await executor.find_or_create_dm(
-                target_id,
+                peers,
                 source_conversation_id=source_conversation_id,
                 source_message_id=source_message_id,
                 topic=topic,

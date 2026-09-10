@@ -182,4 +182,12 @@ different things.
 # pending prompt before its verdict lands. RestClient.update_task_status
 # gets the same complete|failed ValueError guard as the executor SDK. No
 # wire changes; safe to roll in either order.
-BRIDGE_VERSION = "2.9.5"
+# 2.9.6 — multi-agent threads: a `<dm target="A, B">` tag names several
+# agents for ONE thread. `_route_dm_blocks` splits the target, resolves every
+# name (an unresolvable one skips the whole block — no partial thread, same
+# rule as the server router) and calls `find_or_create_dm` with a peer list,
+# which the SDK posts as `peerIds`. The backend accepts `peerId` and
+# `peerIds`, so older bridges keep working; a 2.9.6 bridge against an older
+# backend would 422 on `peerIds` only for multi-target tags. Roll backend
+# first.
+BRIDGE_VERSION = "2.9.6"

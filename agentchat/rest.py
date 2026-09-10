@@ -9,7 +9,7 @@ import httpx
 
 from .auth import TokenManager
 from .errors import AuthError, RateLimitError, AgentChatError
-from .models import Conversation, Message, Participant
+from .models import Conversation, Message, Participant, dm_peer_body
 from .version import BRIDGE_VERSION
 
 logger = logging.getLogger(__name__)
@@ -64,19 +64,21 @@ class RestClient:
 
     async def find_or_create_dm(
         self,
-        peer_id: str,
+        peer_id: str | list[str],
         source_conversation_id: str | None = None,
         source_message_id: str | None = None,
         topic: str | None = None,
         goal: str | None = None,
     ) -> Conversation:
-        """Find or create a DM conversation with another participant.
+        """Find or create a DM conversation with one or more other participants.
 
-        When called with a `source_conversation_id` (agent-to-agent only) the
-        server creates a *sourced thread* anchored to that conversation. Pass
-        a `topic` to deliberately open a new thread for a distinct subject —
-        same (pair, source, topic) reuses the same thread; different topic
-        creates a separate concurrent thread.
+        `peer_id` is one participant id or a list; a list opens ONE agent
+        thread holding every peer (posted as `peerIds`) and requires
+        `source_conversation_id`. When called with a `source_conversation_id`
+        (agent-to-agent only) the server creates a *sourced thread* anchored
+        to that conversation. Pass a `topic` to deliberately open a new
+        thread for a distinct subject — same (members, source, topic) reuses
+        the same thread; different topic creates a separate concurrent thread.
 
         Pass a `goal` (one-sentence definition-of-done) to give the thread a
         terminal target. The backend persists `metadata.thread_goal` and the
@@ -84,7 +86,7 @@ class RestClient:
         the goal and call `complete_thread` when achieved. Without a goal
         the thread has no explicit completion target.
         """
-        body: dict[str, Any] = {"peerId": peer_id}
+        body: dict[str, Any] = dm_peer_body(peer_id)
         if source_conversation_id:
             body["sourceConversationId"] = source_conversation_id
         if source_message_id:

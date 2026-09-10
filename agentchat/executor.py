@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable, Dict, List, Optional, Union
 
 from .version import BRIDGE_VERSION
+from .models import dm_peer_body
 
 import httpx
 
@@ -1637,29 +1638,33 @@ class ExecutorClient:
 
     async def find_or_create_dm(
         self,
-        peer_id: str,
+        peer_id: str | list[str],
         *,
         source_conversation_id: str | None = None,
         source_message_id: str | None = None,
         topic: str | None = None,
         goal: str | None = None,
     ) -> dict[str, Any]:
-        """Find or create a DM conversation with another participant.
+        """Find or create a DM conversation with one or more other participants.
 
         Returns the conversation object (with members).
         Use conversation["id"] to send messages to the DM.
 
+        `peer_id` is one participant id or a list of them. A list opens ONE
+        agent thread with every peer in it (posted as `peerIds`) and needs
+        source context — the server rejects several peers without it.
+
         When source context is provided, the DM is created as an agent thread
         under the source conversation. Pass `topic` to deliberately open a new
-        thread for a distinct subject — same (pair, source, topic) reuses the
-        same thread; different topic creates a separate concurrent thread.
+        thread for a distinct subject — same (members, source, topic) reuses
+        the same thread; different topic creates a separate concurrent thread.
         When `topic` is omitted, falls back to anchoring on `source_message_id`.
 
         Pass `goal` (definition-of-done) to give the thread a terminal target.
         Agents in the thread will be told to call `complete_thread` when the
         goal is achieved, which triggers an auto-relay back to the parent.
         """
-        body: dict[str, Any] = {"peerId": peer_id}
+        body: dict[str, Any] = dm_peer_body(peer_id)
         if source_conversation_id:
             body["sourceConversationId"] = source_conversation_id
         if source_message_id:

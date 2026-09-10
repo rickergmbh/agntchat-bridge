@@ -28,6 +28,7 @@ from agent_bridge import (
 
 MEMBERS = [
     {"displayName": "Bob", "participantId": "bob-id"},
+    {"displayName": "Carol", "participantId": "carol-id"},
     {"displayName": "Me", "participantId": "me-id"},
 ]
 
@@ -162,6 +163,44 @@ class TestSettle:
         assert out is None
         (end_turn,) = _end_turn_calls(ex)
         assert json.loads(end_turn.args[1])["message"] == "[Continuing in DM with Bob]"
+
+
+class TestMultiTarget:
+    """`target="A, B"` is ONE thread with everyone in it (bridge 2.9.6)."""
+
+    @pytest.mark.asyncio
+    async def test_comma_target_opens_one_thread_with_a_peer_list(self):
+        ex = _executor()
+        reply, blocks = _parse_dm_blocks('<dm target="Bob, Carol">three-way</dm>')
+        assert blocks[0]["target"] == "Bob, Carol"  # kept raw at parse time
+        out = await _settle(ex, reply, blocks)
+        assert out is None
+        ex.find_or_create_dm.assert_awaited_once()
+        assert ex.find_or_create_dm.await_args.args == (["bob-id", "carol-id"],)
+        ex.send_message.assert_any_await("dm-1", "three-way", metadata={"model": "m"})
+        (end_turn,) = _end_turn_calls(ex)
+        assert json.loads(end_turn.args[1])["message"] == "[Continuing in DM with Bob, Carol]"
+
+    @pytest.mark.asyncio
+    async def test_dedups_and_trims_names_case_insensitively(self):
+        ex = _executor()
+        out = await _settle(ex, "", [{"target": " bob ,Carol, BOB ", "content": "x"}])
+        assert out is None
+        assert ex.find_or_create_dm.await_args.args == (["bob-id", "carol-id"],)
+
+    @pytest.mark.asyncio
+    async def test_one_unresolvable_name_skips_the_whole_block(self):
+        ex = _executor()
+        out = await _settle(ex, "", [{"target": "Bob, Nobody", "content": "x"}])
+        assert out == "[Could not start agent thread with Bob, Nobody]"
+        ex.find_or_create_dm.assert_not_awaited()
+        ex.send_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_single_name_still_calls_with_a_bare_id(self):
+        ex = _executor()
+        await _settle(ex, "", [{"target": "Bob", "content": "x"}])
+        assert ex.find_or_create_dm.await_args.args == ("bob-id",)
 
 
 class TestHiddenRedirectPayload:
