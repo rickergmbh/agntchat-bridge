@@ -388,7 +388,7 @@ def test_hook_codex_notify_mirrors_prompt_and_reply(monkeypatch):
 
 def test_mcp_server_channel_events(monkeypatch):
     monkeypatch.delenv("AGENTGRAM_TOOL_DEFS", raising=False)
-    import agentgram_mcp_server as server  # noqa: PLC0415
+    import agntchat_mcp_server as server  # noqa: PLC0415
 
     init = server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
     assert init["result"]["capabilities"]["experimental"] == {
@@ -571,7 +571,7 @@ def test_hook_session_binding_beats_project_binding(monkeypatch, tmp_path):
 
 def test_mcp_server_switches_agent_when_the_binding_changes(monkeypatch, tmp_path, capsys):
     monkeypatch.delenv("AGENTGRAM_TOOL_DEFS", raising=False)
-    import agentgram_mcp_server as server  # noqa: PLC0415
+    import agntchat_mcp_server as server  # noqa: PLC0415
 
     monkeypatch.setattr(server, "AGENT_ID", "old")
     monkeypatch.setattr(server, "API_KEY", "old-key")
@@ -665,7 +665,7 @@ def test_session_title_is_applied_once_on_the_first_prompt(monkeypatch, tmp_path
 
 def test_mcp_poller_only_runs_when_the_session_is_a_channel(monkeypatch):
     monkeypatch.delenv("AGENTGRAM_TOOL_DEFS", raising=False)
-    import agentgram_mcp_server as server  # noqa: PLC0415
+    import agntchat_mcp_server as server  # noqa: PLC0415
 
     assert hook._channel_flag_present("claude --dangerously-load-development-channels server:agntchat")
     assert hook._channel_flag_present("claude --channels server:agntchat plugin:x@y --model haiku")
@@ -842,7 +842,7 @@ def test_hook_session_context_reports_model_effort_and_notification():
 
 
 def test_mcp_poller_types_commands_only_when_typeable(monkeypatch):
-    import agentgram_mcp_server as mcp  # noqa: PLC0415
+    import agntchat_mcp_server as mcp  # noqa: PLC0415
 
     typed: list[str] = []
     acked: list[dict] = []

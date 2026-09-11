@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""AgentGram MCP Server — exposes AgentGram tools as native MCP tools.
+"""agntchat MCP server — exposes agntchat platform tools as native MCP tools.
+
+The MCP server KEY this registers under is still `agentgram` (tools arrive as
+`mcp__agentgram__*`, and `--permission-prompt-tool
+mcp__agentgram__permission_prompt` matches on it). That key is a wire
+identifier shared with the CLI, the bridge's prefix stripping and the
+backend — renaming it is a protocol change, not a rebrand.
 
 Runs as a stdio MCP server spawned by Claude Code CLI. Implements the
 minimal JSON-RPC 2.0 protocol (initialize, tools/list, tools/call).

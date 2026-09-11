@@ -72,7 +72,7 @@ _PROC_SHUTDOWN_GRACE = 5.0  # seconds we'll wait for a doomed proc to die
 # Env-var name the MCP `env_vars` override forwards the agent API key under.
 # Held in Codex's process env (out of argv) and passed through to the MCP
 # server, which reads AGENTGRAM_API_KEY — so the forwarded name must match
-# what agentgram_mcp_server.py expects. See _mcp_overrides.
+# what agntchat_mcp_server.py expects. See _mcp_overrides.
 _MCP_API_KEY_ENV = "AGENTGRAM_API_KEY"
 
 
@@ -253,7 +253,7 @@ class CodexCliBackend(ModelBackend):
             logger.warning(
                 "MCP server script not found — codex_cli agents will run "
                 "WITHOUT AgentGram platform tools (send_message, create_task, …). "
-                "Check that agentgram_mcp_server.py is reachable from the bridge dir."
+                "Check that agntchat_mcp_server.py is reachable from the bridge dir."
             )
 
         # MCP routing context lives in backends.MCP_CONTEXT (a contextvar),
@@ -292,10 +292,10 @@ class CodexCliBackend(ModelBackend):
 
     @staticmethod
     def _find_mcp_server() -> str | None:
-        """Locate the canonical agentgram_mcp_server.py shipped in the bridge root."""
+        """Locate the canonical agntchat_mcp_server.py shipped in the bridge root."""
         p = os.path.realpath(
             os.path.join(
-                os.path.dirname(__file__), "..", "..", "agentgram_mcp_server.py"
+                os.path.dirname(__file__), "..", "..", "agntchat_mcp_server.py"
             )
         )
         if os.path.isfile(p):

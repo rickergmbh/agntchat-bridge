@@ -68,7 +68,7 @@ different things.
 # online and kept getting handed tasks. Structural probe only (no network,
 # so an instance-role-only machine now reads unauthenticated — the safe
 # direction). Not gated on by the server; the roll is safe in either order.
-# 2.7.2 — audit hardening: missing agentgram_mcp_server.py is a hard error
+# 2.7.2 — audit hardening: missing agntchat_mcp_server.py is a hard error
 # for claude_cli tool use (no silent XML-loop degrade), the stale repo
 # scripts/ fallback paths were removed from every script lookup, WS event
 # handlers hold strong task refs (GC could silently drop events parked on
@@ -190,4 +190,13 @@ different things.
 # `peerIds`, so older bridges keep working; a 2.9.6 bridge against an older
 # backend would 422 on `peerIds` only for multi-target tags. Roll backend
 # first.
-BRIDGE_VERSION = "2.9.6"
+# 2.9.7 — rebrand leftover: agentgram_mcp_server.py is now
+# agntchat_mcp_server.py. Pure rename — the MCP server key stays
+# `agentgram`, so tool names (`mcp__agentgram__*`) and
+# --permission-prompt-tool are unchanged on the wire. Listed for
+# fleet-roll tracking only: the file is looked up by name
+# (find_sibling_script / external.MCP_SERVER_SCRIPT) and is a hard error
+# when missing, so a half-rolled checkout — new package code beside the
+# old filename — fails claude_cli tool use. Roll the whole bridge dir
+# together; nothing is gated on by the server.
+BRIDGE_VERSION = "2.9.7"

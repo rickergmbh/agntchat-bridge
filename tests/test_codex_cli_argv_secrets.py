@@ -27,7 +27,7 @@ def _backend() -> CodexCliBackend:
     )
     # Pretend the MCP server script resolved so overrides are emitted even on
     # a machine where it isn't on the expected path.
-    b._mcp_server_script = "/tmp/agentgram_mcp_server.py"
+    b._mcp_server_script = "/tmp/agntchat_mcp_server.py"
     return b
 
 

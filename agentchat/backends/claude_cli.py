@@ -77,7 +77,7 @@ _DEFAULT_CLI_PATH = "claude"
 _DEFAULT_TIMEOUT = 900  # 15 minutes — complex tasks need time
 _COMPUTER_USE_TIMEOUT = 1800  # 30 minutes — computer use chains many slow driver calls
 # Permission prompts (#67) block the CLI turn — no stream output — for up to
-# the MCP server's poll ceiling (`agentgram_mcp_server._PERMISSION_MAX_WAIT`,
+# the MCP server's poll ceiling (`agntchat_mcp_server._PERMISSION_MAX_WAIT`,
 # 330 s = backend Permissions.@ttl_seconds 300 s + slack). `_timeout` is the
 # per-readline cap, so a shorter configured timeout would kill the turn
 # mid-prompt and the verdict (allow/deny/expired) would never reach the
@@ -612,8 +612,8 @@ class ClaudeCliBackend(ModelBackend):
 
     @staticmethod
     def _find_mcp_server() -> str | None:
-        """Locate the agentgram_mcp_server.py script."""
-        return find_sibling_script("agentgram_mcp_server.py")
+        """Locate the agntchat_mcp_server.py script."""
+        return find_sibling_script("agntchat_mcp_server.py")
 
     def _build_mcp_config(
         self,
@@ -1740,7 +1740,7 @@ class ClaudeCliBackend(ModelBackend):
         turn guardrails cannot be enforced here; the server instead injects a
         "don't repeat failing/no-progress calls" directive into the system prompt.
 
-        A missing agentgram_mcp_server.py is a hard error — tool use silently
+        A missing agntchat_mcp_server.py is a hard error — tool use silently
         degrading to the XML loop would hide a broken install (see
         find_sibling_script's contract in _cli_utils.py). The XML loop below is
         only reached when the script IS present but no MCP context was set for
@@ -1751,10 +1751,10 @@ class ClaudeCliBackend(ModelBackend):
 
         if not self._mcp_server_script:
             raise RuntimeError(
-                "agentgram_mcp_server.py not found in the bridge package root — "
+                "agntchat_mcp_server.py not found in the bridge package root — "
                 "claude_cli tool use requires the MCP server script and must not "
                 "silently degrade to the legacy XML loop. Reinstall/update the "
-                "bridge so <bridge>/agentgram_mcp_server.py exists."
+                "bridge so <bridge>/agntchat_mcp_server.py exists."
             )
 
         guardrail = ToolCallGuardrail(guardrail_config)

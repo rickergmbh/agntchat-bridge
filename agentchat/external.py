@@ -3,7 +3,7 @@
 An *external* agent is a Claude Code / Codex session the user drives
 themselves. agntchat never spawns or wakes it; two thin pipes connect it:
 
-* the stdio MCP server (`agentgram_mcp_server.py`) so the session can call
+* the stdio MCP server (`agntchat_mcp_server.py`) so the session can call
   agntchat tools, and
 * the hook script (`agntchat_hook.py`) so agntchat can see the session
   (presence, activity, start/end cards, inbox digest).
@@ -50,7 +50,7 @@ _HOME = Path(os.environ.get("AGNTCHAT_HOME", str(Path.home() / ".agentchat")))
 CREDENTIALS_FILE = Path(os.environ.get("AGNTCHAT_CREDENTIALS", str(_HOME / "credentials.json")))
 
 _BRIDGE_DIR = Path(__file__).resolve().parent.parent
-MCP_SERVER_SCRIPT = _BRIDGE_DIR / "agentgram_mcp_server.py"
+MCP_SERVER_SCRIPT = _BRIDGE_DIR / "agntchat_mcp_server.py"
 HOOK_SCRIPT = _BRIDGE_DIR / "agntchat_hook.py"
 
 # Per-project binding lives here, inside the repo, self-ignored.
