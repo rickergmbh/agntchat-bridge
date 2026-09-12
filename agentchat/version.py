@@ -199,4 +199,16 @@ different things.
 # when missing, so a half-rolled checkout — new package code beside the
 # old filename — fails claude_cli tool use. Roll the whole bridge dir
 # together; nothing is gated on by the server.
-BRIDGE_VERSION = "2.9.7"
+# 2.9.8 — executor deregistration is scoped to the process that registered
+# it. The executor row is keyed on {agent_id, executor_key}, so every bridge
+# for an agent shares one row; a dying bridge's DELETE therefore evicted
+# whichever bridge currently held it. Observed 2026-09-12: quitting the
+# installed desktop app while a second instance was starting knocked the
+# agent offline ~3 s after it came online (two WS disconnects, then a
+# re-register). Each run now mints an `instance_id` (ExecutorClient), sends
+# it at registration, and passes it back on the DELETE; the server answers
+# {"superseded": true} and leaves the row alone when it no longer matches.
+# Not gated on by the server — a DELETE with no token is honoured exactly as
+# before, so an older bridge keeps its old behaviour and the roll is safe in
+# either order.
+BRIDGE_VERSION = "2.9.8"

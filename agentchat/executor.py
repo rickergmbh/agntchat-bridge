@@ -31,6 +31,7 @@ import os
 import signal
 import socket
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable, Dict, List, Optional, Union
 
@@ -318,6 +319,15 @@ class ExecutorClient:
         self._token_manager = TokenManager(base_url, agent_id, api_key)
         self._executor_key = executor_key
         self._display_name = display_name or executor_key
+        # Identifies THIS process among every bridge that has ever held this
+        # agent's executor row. The row's id is derived from
+        # (agent_id, executor_key), so it is stable across restarts and two
+        # bridges for the same agent address the same row: when one app
+        # instance is quitting while another has already started, the dying
+        # one's deregister used to delete the live one's registration and
+        # knock the agent offline seconds after it came up. The server
+        # compares this token on deregister and ignores a superseded one.
+        self._instance_id = uuid.uuid4().hex
         self._capabilities = capabilities or []
         self._max_concurrent = max_concurrent
         self._poll_timeout = poll_timeout
@@ -916,11 +926,24 @@ class ExecutorClient:
                 pass
             self._ws_transport = None
 
-        # Deregister executor so backend marks agent offline immediately
+        # Deregister executor so backend marks agent offline immediately.
+        # Scoped to this process's instance token: if another bridge has
+        # since registered against the same row, the server keeps it online
+        # and answers "superseded" instead of letting our shutdown mark the
+        # live one offline.
         if self._executor_id:
             try:
-                await self._delete(f"/api/gateway/executors/{self._executor_id}")
-                logger.info("Executor %s deregistered", self._executor_id)
+                result = await self._delete(
+                    f"/api/gateway/executors/{self._executor_id}",
+                    params={"instance_id": self._instance_id},
+                )
+                if (result or {}).get("superseded"):
+                    logger.info(
+                        "Executor %s now held by a newer bridge — left online",
+                        self._executor_id,
+                    )
+                else:
+                    logger.info("Executor %s deregistered", self._executor_id)
             except Exception:
                 logger.debug("Failed to deregister executor (may already be cleaned up)")
 
@@ -973,6 +996,7 @@ class ExecutorClient:
                 "connection_type": "long_poll",
                 "max_concurrent": self._max_concurrent,
                 "backend_health": health,
+                "instance_id": self._instance_id,
                 "metadata": {
                     "device_name": device_name(),
                     "bridge_version": BRIDGE_VERSION,
